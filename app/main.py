@@ -6,26 +6,30 @@ from app.config import settings
 from app.api import documents, rag, conversations, admin, embed
 from app.utils.logger import logger
 
+# app/main.py 中的 lifespan 函数需要更新
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info(f"{settings.APP_NAME} 启动中...")
     
-    # 暂时注释掉 Milvus 初始化（等 Docker 启动后再打开）
-    # from app.services.vector_service import vector_service
-    # from app.services.embedding_service import embedding_service
-    # from app.services.rag_service import rag_service
+    # 初始化服务
+    from app.services.vector_service import vector_service
+    from app.services.embedding_service import embedding_service
+    from app.services.rag_service import rag_service
     
-    # vector_service.create_collection_if_not_exists("public_documents", is_private=False)
-    # vector_service.create_collection_if_not_exists("private_documents", is_private=True)
-    # vector_service.create_collection_if_not_exists("conversations", is_private=True)
+    # 初始化 embedding_service
+    await embedding_service.initialize()
+    
+    vector_service.create_collection_if_not_exists("public_documents", is_private=False)
+    vector_service.create_collection_if_not_exists("private_documents", is_private=True)
+    vector_service.create_collection_if_not_exists("conversations", is_private=True)
     
     logger.info(f"{settings.APP_NAME} 启动完成")
     
     yield
     
-    # await embedding_service.close()
-    # await rag_service.close()
+    await embedding_service.close()
+    await rag_service.close()
     logger.info(f"{settings.APP_NAME} 已关闭")
 
 app = FastAPI(

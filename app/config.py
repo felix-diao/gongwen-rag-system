@@ -1,5 +1,10 @@
 from pydantic_settings import BaseSettings
 from typing import Optional
+import os
+
+# 在导入配置之前就设置离线模式
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_HUB_OFFLINE'] = '1'
 
 class Settings(BaseSettings):
     # 应用配置
@@ -24,9 +29,8 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = "your-api-key"
     LLM_MODEL: str = "gongwen-llm-v1"
     
-    # Embedding 模型配置
-    EMBEDDING_API_URL: str = "http://localhost:8001/v1/embeddings"
-    EMBEDDING_MODEL: str = "gongwen-embed-v1"
+    # Embedding 模型配置 - 使用本地缓存的模型
+    EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"
     
     # JWT 配置
     SECRET_KEY: str = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
