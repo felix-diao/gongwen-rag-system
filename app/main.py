@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
-from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm, meeting
+from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm
 from app.utils.logger import logger
 
 # app/main.py 中的 lifespan 函数需要更新
@@ -59,7 +59,6 @@ app.include_router(conversations.router)
 app.include_router(knowledge.router)
 app.include_router(translate.router)
 app.include_router(llm.router)
-app.include_router(meeting.router)
 
 @app.get("/health")
 def health_check():
