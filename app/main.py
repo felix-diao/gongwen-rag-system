@@ -1,10 +1,12 @@
 # app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from app.config import settings
 from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm
 from app.utils.logger import logger
+import os
 
 # app/main.py 中的 lifespan 函数需要更新
 @asynccontextmanager
@@ -41,6 +43,13 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs"
 )
+
+# 上传目录
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# 挂载静态目录
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads") 
 
 app.add_middleware(
     CORSMiddleware,
