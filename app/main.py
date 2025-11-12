@@ -51,6 +51,21 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # 挂载静态目录
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads") 
 
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./generated_documents")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+app.mount("/generated_documents", StaticFiles(directory=DOWNLOAD_DIR), name="generated_documents")
+
+PDF_DIR = os.getenv("PDF_DIR", "./pdf")
+os.makedirs(PDF_DIR, exist_ok=True)
+
+app.mount("/pdf", StaticFiles(directory=PDF_DIR), name="pdf")
+
+TXT_DIR = os.getenv("TXT_DIR", "./txt")
+os.makedirs(TXT_DIR, exist_ok=True)
+
+app.mount("/txt", StaticFiles(directory=TXT_DIR), name="txt")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

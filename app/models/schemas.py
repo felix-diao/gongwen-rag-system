@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import datetime
 
 class DocumentCreate(BaseModel):
@@ -168,8 +168,7 @@ class Token(BaseModel):
     token_type: str = "bearer"
 
 
-from typing import Optional, Literal,Generic,TypeVar
-from datetime import datetime
+from typing import Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -190,6 +189,13 @@ class DocumentOptimizeRequest(BaseModel):
     context: Optional[dict] = None
 
 
+class DocumentExportRequest(BaseModel):
+    content: str
+    title: str
+    format: Literal['pdf', 'docx', 'txt'] = 'pdf'
+    options: Optional[dict] = None
+
+
 class BaseData(BaseModel):
     """所有 data 模型的基类"""
     pass
@@ -205,7 +211,18 @@ class DocumentData(BaseData):
     content: str
     wordCount: int
     generatedAt: datetime
+    docxPath: str | None = None
+    pdfPath: str | None = None
+
+
+class DocumentExportData(BaseData):
+    url: str
+    filename: str
+    size: int
+    expiresAt: datetime
 
 # 文档优化接口的数据结构（只保留 content）
 class DocumentDataOptimize(BaseData):
     content: str
+    docxPath: str | None = None
+    pdfPath: str | None = None
