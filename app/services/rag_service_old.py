@@ -1,19 +1,16 @@
-# app/services/rag_service.py
-
 from typing import List, Dict, Optional
+import httpx
 from app.services.vector_service import vector_service
 from app.services.embedding_service import embedding_service
 from app.services.conversation_service import conversation_service
-from app.services.llm_service import llm_service 
 from app.config import settings
 from app.utils.logger import logger
 
-
 class RAGService:
-    """RAG 检索增强生成服务（解耦版）"""
+    """RAG 检索增强生成服务"""
     
     def __init__(self):
-        self.llm_service = llm_service
+        self.llm_client = httpx.AsyncClient(timeout=60.0)
         self.public_weight = settings.PUBLIC_WEIGHT
         self.private_weight = settings.PRIVATE_WEIGHT
         self.conv_weight = settings.CONVERSATION_WEIGHT
@@ -31,10 +28,8 @@ class RAGService:
     ) -> Dict:
         """RAG 主流程"""
         
-        # 1. 向量化查询
         query_vector = await embedding_service.embed_query(query)
         
-        # 2. 多源检索
         candidates = await self._multi_source_retrieve(
             user_id=user_id,
             query=query,
@@ -51,22 +46,19 @@ class RAGService:
                 "metadata": {"retrieval_count": 0}
             }
         
-        # 3. 重排序（可选）
         if rerank and len(candidates) > top_k:
             candidates = await self._rerank(query, candidates, rerank_model, top_k)
         else:
             candidates = candidates[:top_k]
         
-        # 4. 构建上下文
         context = self._build_context(candidates, context_token_limit)
         
-        # 5. 使用 LLM Service 生成答案（解耦后的调用）
-        answer = await self.llm_service.generate_with_context(
+        answer = await self._generate_answer(
             query=query,
-            context=context
+            context=context,
+            model=generator or settings.LLM_MODEL
         )
         
-        # 6. 格式化返回结果
         sources = self._format_sources(candidates)
         
         return {
@@ -91,7 +83,6 @@ class RAGService:
         """多源检索：公共库 + 私有库 + 历史会话"""
         all_candidates = []
         
-        # 检索公共文档库
         try:
             public_candidates = vector_service.search(
                 collection_name="public_documents",
@@ -110,7 +101,6 @@ class RAGService:
         except Exception as e:
             logger.error(f"公共库检索失败: {e}")
         
-        # 检索私有文档库
         try:
             partition_name = f"user_{user_id}"
             private_candidates = vector_service.search(
@@ -131,7 +121,6 @@ class RAGService:
         except Exception as e:
             logger.error(f"私有库检索失败: {e}")
         
-        # 检索历史会话
         if include_conversations:
             try:
                 conv_candidates = await conversation_service.search_conversations(
@@ -151,7 +140,6 @@ class RAGService:
             except Exception as e:
                 logger.error(f"历史会话检索失败: {e}")
         
-        # 按加权分数排序
         all_candidates.sort(key=lambda x: x["weighted_score"], reverse=True)
         
         return all_candidates
@@ -163,47 +151,35 @@ class RAGService:
         model: str,
         top_k: int
     ) -> List[Dict]:
-        """
-        重排序（如果 DeepSeek 不支持 rerank，这里会失败并使用原始排序）
-        注意：DeepSeek API 可能不支持 /rerank 端点
-        """
+        """重排序"""
         try:
-            # 尝试使用重排序（如果不支持会捕获异常）
-            import httpx
+            pairs = []
+            for candidate in candidates:
+                text = candidate.get("chunk_content") or candidate.get("answer", "")
+                pairs.append([query, text])
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                pairs = []
-                for candidate in candidates:
-                    text = candidate.get("chunk_content") or candidate.get("answer", "")
-                    pairs.append([query, text])
+            response = await self.llm_client.post(
+                f"{settings.LLM_API_URL.replace('/chat/completions', '/rerank')}",
+                json={
+                    "model": model,
+                    "query": query,
+                    "passages": [p[1] for p in pairs]
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                scores = result.get("scores", [])
                 
-                rerank_url = settings.LLM_API_URL.replace('/chat/completions', '/rerank')
+                for i, candidate in enumerate(candidates):
+                    if i < len(scores):
+                        candidate["rerank_score"] = scores[i]
                 
-                response = await client.post(
-                    rerank_url,
-                    json={
-                        "model": model,
-                        "query": query,
-                        "passages": [p[1] for p in pairs]
-                    },
-                    headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"}
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    scores = result.get("scores", [])
-                    
-                    for i, candidate in enumerate(candidates):
-                        if i < len(scores):
-                            candidate["rerank_score"] = scores[i]
-                    
-                    candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
-                    logger.info("重排序完成")
-                else:
-                    logger.warning(f"重排序接口返回 {response.status_code}，使用原始排序")
+                candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+                logger.info("重排序完成")
             
         except Exception as e:
-            logger.warning(f"重排序失败: {e}，使用原始排序（这是正常的，DeepSeek 不支持 rerank）")
+            logger.error(f"重排序失败: {e}，使用原始排序")
         
         return candidates[:top_k]
     
@@ -213,13 +189,11 @@ class RAGService:
         total_tokens = 0
         
         for i, candidate in enumerate(candidates):
-            # 区分历史会话和文档
             if candidate["source_type"] == "conversation":
                 text = f"历史问答：\nQ: {candidate.get('query', '')}\nA: {candidate.get('answer', '')}"
             else:
                 text = f"文档片段（{candidate.get('doc_type', '未知类型')} - {candidate.get('title', '无标题')}）：\n{candidate.get('chunk_content', '')}"
             
-            # 估算 token 数量（简单估算：1个字符约1.5个token）
             estimated_tokens = len(text) * 1.5
             
             if total_tokens + estimated_tokens > token_limit:
@@ -230,6 +204,55 @@ class RAGService:
         
         return "\n".join(context_parts)
     
+    async def _generate_answer(self, query: str, context: str, model: str) -> str:
+        """调用 LLM 生成答案"""
+        
+        system_prompt = """你是一位专业的公文助手，擅长分析和解答各类公文相关问题。
+
+任务要求：
+1. 基于提供的参考资料回答用户问题
+2. 回答要准确、专业、规范，符合公文写作要求
+3. 如果参考资料不足以回答问题，请如实说明
+4. 引用参考资料时，请注明来源（如：根据参考资料1...）
+5. 对于公文格式、规范等问题，给出明确的指导
+
+回答风格：
+- 语言正式、严谨
+- 条理清晰、逻辑严密
+- 重点突出、简洁明了"""
+
+        user_prompt = f"""参考资料：
+{context}
+
+用户问题：{query}
+
+请基于以上参考资料，回答用户问题。"""
+
+        try:
+            response = await self.llm_client.post(
+                settings.LLM_API_URL,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 2000
+                },
+                headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"}
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            answer = result["choices"][0]["message"]["content"]
+            
+            logger.info("答案生成成功")
+            return answer
+            
+        except Exception as e:
+            logger.error(f"答案生成失败: {e}")
+            return "抱歉，生成答案时出现错误，请稍后重试。"
     
     def _format_sources(self, candidates: List[Dict]) -> List[Dict]:
         """格式化来源信息"""
@@ -259,6 +282,9 @@ class RAGService:
             sources.append(source)
         
         return sources
-
+    
+    async def close(self):
+        """关闭客户端"""
+        await self.llm_client.aclose()
 
 rag_service = RAGService()

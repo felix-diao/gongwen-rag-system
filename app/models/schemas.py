@@ -81,6 +81,13 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
+class UserRegister(BaseModel):
+    """用户注册"""
+    username: str
+    password: str
+    department: Optional[str] = None
+
+    
 class Token(BaseModel):
     """Token 响应"""
     access_token: str

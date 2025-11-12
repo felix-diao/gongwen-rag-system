@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # 分块配置
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
+
+    # 腾讯会议配置
+    TENCENT_MEETING_APP_ID: str = ""
+    TENCENT_MEETING_SDK_ID: str = ""
+    TENCENT_MEETING_SECRET_ID: str = ""
+    TENCENT_MEETING_SECRET_KEY: str = ""
+    TENCENT_MEETING_API_URL: str = "https://api.meeting.qq.com/v1"
     
     class Config:
         env_file = ".env"

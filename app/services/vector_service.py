@@ -67,6 +67,10 @@ class VectorService:
             fields = [
                 FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=64, is_primary=True),
                 FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=64),
+                # 新增：知识库关联字段
+                FieldSchema(name="base_id", dtype=DataType.INT64, default_value=0),
+                FieldSchema(name="item_id", dtype=DataType.INT64, default_value=0),
+                
                 FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=256),
                 FieldSchema(name="doc_type", dtype=DataType.VARCHAR, max_length=64),
                 FieldSchema(name="filename", dtype=DataType.VARCHAR, max_length=512),

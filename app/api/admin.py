@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import timedelta
 from app.models.database import get_db, User
-from app.models.schemas import UserLogin, Token
+from app.models.schemas import UserLogin, UserRegister, Token
 from app.utils.auth import (
     verify_password, 
     get_password_hash, 
@@ -16,24 +16,22 @@ router = APIRouter(prefix="/api/auth", tags=["认证管理"])
 
 @router.post("/register")
 def register(
-    username: str,
-    password: str,
-    department: str = None,
+    register_data: UserRegister,
     db: Session = Depends(get_db)
 ):
     """用户注册"""
-    existing_user = db.query(User).filter(User.username == username).first()
+    existing_user = db.query(User).filter(User.username == register_data.username).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="用户名已存在")
     
     user_id = f"user_{uuid.uuid4().hex[:16]}"
-    hashed_password = get_password_hash(password)
+    hashed_password = get_password_hash(register_data.password)
     
     db_user = User(
         user_id=user_id,
-        username=username,
+        username=register_data.username,
         hashed_password=hashed_password,
-        department=department,
+        department=register_data.department,
         role="user"
     )
     
