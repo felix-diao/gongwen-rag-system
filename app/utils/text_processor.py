@@ -1,6 +1,9 @@
 from typing import List, Dict
 import re
+import logging
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 class TextProcessor:
     """文本处理工具"""
@@ -11,6 +14,7 @@ class TextProcessor:
     
     def extract_text(self, file_path: str) -> str:
         """从文件提取文本"""
+        logger.info(f"开始解析文件: {file_path}")
         if file_path.endswith('.txt'):
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read()
@@ -19,7 +23,9 @@ class TextProcessor:
             try:
                 from docx import Document
                 doc = Document(file_path)
-                return '\n'.join([para.text for para in doc.paragraphs])
+                text = '\n'.join([para.text for para in doc.paragraphs])
+                logger.info(f"解析文件成功: {file_path} (docx)")
+                return text
             except ImportError:
                 raise ValueError("需要安装 python-docx: pip install python-docx")
         
@@ -28,11 +34,14 @@ class TextProcessor:
                 import PyPDF2
                 with open(file_path, 'rb') as f:
                     reader = PyPDF2.PdfReader(f)
-                    return '\n'.join([page.extract_text() for page in reader.pages])
+                    text = '\n'.join([page.extract_text() for page in reader.pages])
+                    logger.info(f"解析文件成功: {file_path} (pdf)")
+                    return text
             except ImportError:
                 raise ValueError("需要安装 PyPDF2: pip install PyPDF2")
         
         else:
+            logger.warning(f"不支持的文件格式: {file_path}")
             raise ValueError(f"不支持的文件格式: {file_path}")
     
     def split_text(self, text: str) -> List[Dict]:

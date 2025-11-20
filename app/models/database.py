@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey
+from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey,DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -104,35 +104,78 @@ class KnowledgeItem(Base):
     document = relationship("Document", foreign_keys=[doc_id])
 
 
-# ========== 新增：腾讯会议表 ==========
+    # 会议信息表
 class Meeting(Base):
-    """会议表"""
     __tablename__ = "meetings"
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 主键ID
+    id = Column(Integer, primary_key=True, index=True)
+    # 会议标题
+    title = Column(String, index=True)
+    # 会议日期时间
+    date = Column(DateTime)
+    # 会议地点
+    location = Column(String)
+    # 主持人
+    host = Column(String)
+    # 参会人员（JSON字符串或逗号分隔的姓名）
+    participants = Column(Text)
+    # 会议内容文本
+    content_text = Column(Text)
+    # 会议链接
+    meeting_url = Column(String)
+    # 会议状态（pending、created、minutes_generated）
+    status = Column(String, default="created")
+    # 创建者ID
+    creator_id = Column(String(64), index=True)
+    # 创建时间
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # 更新时间
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # 腾讯会议信息
-    meeting_id = Column(String(64), unique=True, nullable=False, index=True)  # 腾讯会议ID
-    meeting_code = Column(String(32), nullable=False)  # 会议号
-    subject = Column(String(256), nullable=False)  # 会议主题
-    join_url = Column(Text, nullable=False)  # 加入链接
+    # 关联会议文件和纪要（逻辑关联，无外键约束）
+    # files = relationship("MeetingFile", back_populates="meeting")
+    # minutes = relationship("MeetingMinutes", back_populates="meeting")
+
+# 会议文件表
+class MeetingFile(Base):
+    __tablename__ = "meeting_files"
     
-    # 会议时间
-    meeting_type = Column(Integer, default=0)  # 0:预约会议 1:快速会议
-    start_time = Column(Integer)  # Unix 时间戳
-    end_time = Column(Integer)
+    # 主键ID
+    id = Column(Integer, primary_key=True, index=True)
+    # 关联的会议ID（逻辑关联，无外键约束）
+    meeting_id = Column(Integer)
+    # 文件名
+    filename = Column(String)
+    # 文件存储路径
+    file_path = Column(String)
+    # 文件类型（pdf、docx等）
+    file_type = Column(String)
+    # 上传时间
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
     
-    # 会议设置
-    settings = Column(Text)  # JSON 格式存储会议设置
+    # 建立与会议的关联关系（逻辑关联，无外键约束）
+    # meeting = relationship("Meeting", back_populates="files")
+
+# 会议纪要表
+class MeetingMinutes(Base):
+    __tablename__ = "meeting_minutes"
     
-    # 关联用户
-    user_id = Column(String(64), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    # 主键ID
+    id = Column(Integer, primary_key=True, index=True)
+    # 关联的会议ID（逻辑关联，无外键约束）
+    meeting_id = Column(Integer)
+    # 纪要标题
+    title = Column(String)
+    # 纪要内容
+    content = Column(Text)
+    # 创建时间
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # 更新时间
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # 状态
-    status = Column(String(32), default="active")  # active/cancelled/ended
-    
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # 建立与会议的关联关系（逻辑关联，无外键约束）
+    # meeting = relationship("Meeting", back_populates="minutes")
 
 # 创建所有表
 Base.metadata.create_all(bind=engine)

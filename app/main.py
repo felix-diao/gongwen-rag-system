@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from app.config import settings
-from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm
+from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm, meeting, meeting_minute
 from app.utils.logger import logger
 import os
 
@@ -77,6 +77,8 @@ app.add_middleware(
 app.include_router(admin.router)
 app.include_router(documents.router)
 app.include_router(document.router)
+app.include_router(meeting.router)
+#app.include_router(meeting_minute.router)
 app.include_router(embed.router)
 app.include_router(rag.router)
 app.include_router(conversations.router)
