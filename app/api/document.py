@@ -75,7 +75,7 @@ class OfficialDocumentGenerator:
     
     def add_header_elements(self, data):
         """添加版头要素（红线以上）"""
-        print("份号")
+        # print("份号")
         # 1. 份号（如有）
         if data.get('份号'):
             p = self.doc.add_paragraph()
@@ -83,7 +83,7 @@ class OfficialDocumentGenerator:
             run = p.add_run(data['份号'].zfill(6))
             self._set_font(run, 'FZFangSong-Z02', 16)  # 3号
         
-        print("密级和保密期限")
+        # print("密级和保密期限")
         # 2. 密级和保密期限（如有）
         if data.get('密级'):
             p = self.doc.add_paragraph()
@@ -93,7 +93,7 @@ class OfficialDocumentGenerator:
                 secret_text += f"★{data['保密期限']}"
             run = p.add_run(secret_text)
             self._set_font(run, 'FZHei-B01', 16, bold=True)
-        print("紧急程度")
+        # print("紧急程度")
         # 3. 紧急程度（如有）
         if data.get('紧急程度'):
             p = self.doc.add_paragraph()
@@ -104,7 +104,7 @@ class OfficialDocumentGenerator:
         # 添加空行（版头到发文机关标志的距离）
         self.doc.add_paragraph()
         
-        print("发文机关标志")
+        # print("发文机关标志")
         # 4. 发文机关标志（红头）
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -119,7 +119,7 @@ class OfficialDocumentGenerator:
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        print("发文字号")
+        # print("发文字号")
         # 发文字号居中
         run = p.add_run(data['发文字号'])
         self._set_font(run, 'FZFangSong-Z02', 16)
@@ -545,17 +545,17 @@ async def document_write(
         context = rag_service._build_context(candidates, request.context_token_limit)
 
         enhanced_prompt = f"{enhanced_prompt}\n\n参考资料如下：\n{context}\n。"
-        print(f"enhanced_prompt: {enhanced_prompt}")
+        # print(f"enhanced_prompt: {enhanced_prompt}")
         content = generate_document_by_prompt(
             prompt=enhanced_prompt,
             document_type=req.documentType,
             tone=req.tone or "formal",
             language=req.language or "zh",
         )
-        print(f"content: {content}")
+        # print(f"content: {content}")
         lines = content.splitlines()
         new_s = "\n".join(lines[1:-1])
-        print(f"str2json: {new_s}")
+        # print(f"str2json: {new_s}")
         try:
             document_payload = json.loads(new_s)
             lines = []
@@ -702,7 +702,7 @@ async def document_optimize(
             optimization_type=req.optimizationType,
             custom_instruction=req.customInstruction
         )
-
+        # print(f"optimized_text: {optimized_text}")
         lines = optimized_text.splitlines()
         new_s = "\n".join(lines[1:-1])
         try:
@@ -738,6 +738,7 @@ async def document_optimize(
 
         docx_preview_path = f"/AI/word/{word_filename}" if word_filename else None
         pdf_preview_path = f"/AI/pdf/{pdf_filename}" if pdf_filename else None
+        # print(str_result)
         return StandardResponse(
             success=True,
             data=DocumentDataOptimize(
@@ -748,6 +749,7 @@ async def document_optimize(
             message="OK"
         )
     except Exception as e:
+        print(f"优化失败：{e}")
         return StandardResponse(
             success=False,
             data=DocumentDataOptimize(content=""),
