@@ -1,0 +1,143 @@
+{
+  "info": {
+    "_postman_id": "meetings-collection-001",
+    "name": "Gongwen RAG - Meetings & Minutes APIs",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Postman collection for Meetings and Meeting Minutes endpoints. Variables: {{base_url}} (default http://localhost:8080), {{token}} (bearer token)."
+  },
+  "item": [
+    {
+      "name": "Create Meeting",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"产品评审会\",\n  \"date\": \"2025-11-21T14:00:00\",\n  \"location\": \"会议室A\",\n  \"host\": \"张三\",\n  \"participants\": \"张三,李四,王五\",\n  \"content_text\": \"初步讨论需求...\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{base_url}}/api/meetings/" }
+      }
+    },
+    {
+      "name": "Get My Meetings",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": { "raw": "{{base_url}}/api/meetings/mine" }
+      }
+    },
+    {
+      "name": "Get Meeting Detail",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Update Meeting",
+      "request": {
+        "method": "PUT",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": { "mode": "raw", "raw": "{\n  \"location\": \"会议室B\"\n}", "options": { "raw": { "language": "json" } } },
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Delete Meeting",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Upload Meeting Files",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "uploaded_files", "type": "file", "src": "" }
+          ]
+        },
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id/files", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "List Meeting Files",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id/files", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Get Meeting File Detail",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id/files/:file_id", "variable": [ { "key": "meeting_id", "value": "123" }, { "key": "file_id", "value": "7" } ] }
+      }
+    },
+    {
+      "name": "Download Meeting File",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id/files/:file_id/download", "variable": [ { "key": "meeting_id", "value": "123" }, { "key": "file_id", "value": "7" } ] }
+      }
+    },
+    {
+      "name": "Delete Meeting File",
+      "request": {
+        "method": "DELETE",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": { "raw": "{{base_url}}/api/meetings/:meeting_id/files/:file_id", "variable": [ { "key": "meeting_id", "value": "123" }, { "key": "file_id", "value": "7" } ] }
+      }
+    },
+    {
+      "name": "Generate Minutes (sync or async)",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "body": { "mode": "raw", "raw": "{\n  \"file_ids\": [1,2]\n}", "options": { "raw": { "language": "json" } } },
+        "url": { "raw": "{{base_url}}/api/minutes/:meeting_id/generate", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Get Minutes",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": { "raw": "{{base_url}}/api/minutes/:meeting_id", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Update Minutes",
+      "request": {
+        "method": "PUT",
+        "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "body": { "mode": "raw", "raw": "{\n  \"title\": \"会议纪要: 产品评审会\",\n  \"content\": \"更新后的纪要内容...\"\n}", "options": { "raw": { "language": "json" } } },
+        "url": { "raw": "{{base_url}}/api/minutes/:meeting_id", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    },
+    {
+      "name": "Delete Minutes",
+      "request": {
+        "method": "DELETE",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": { "raw": "{{base_url}}/api/minutes/:meeting_id", "variable": [ { "key": "meeting_id", "value": "123" } ] }
+      }
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8080" },
+    { "key": "token", "value": "" }
+  ]
+}

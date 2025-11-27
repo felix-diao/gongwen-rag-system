@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Generic, TypeVar
 from datetime import datetime
+
+# ========== 文档相关 Schema ==========
 
 class DocumentCreate(BaseModel):
     """创建文档请求"""
@@ -106,6 +108,8 @@ class KnowledgeItemBatchMove(BaseModel):
     item_ids: List[int] = Field(..., min_length=1, description="知识项 ID 列表")
     target_base_id: int = Field(..., ge=1, description="目标知识库 ID")
 
+# ========== 向量化和检索 Schema ==========
+
 class EmbedRequest(BaseModel):
     """向量化请求"""
     model: str = "gongwen-embed-v1"
@@ -137,6 +141,8 @@ class RAGRequest(BaseModel):
     context_token_limit: int = 3000
     include_conversations: bool = True
 
+# ========== 会话相关 Schema ==========
+
 class ConversationCreate(BaseModel):
     """创建会话"""
     user_id: str
@@ -150,79 +156,246 @@ class ConversationFeedback(BaseModel):
     liked: Optional[bool] = None
     weight_delta: Optional[float] = None
 
+# ========== 用户认证相关 Schema ==========
+
 class UserLogin(BaseModel):
     """用户登录"""
-    username: str
-    password: str
+    username: str = Field(..., min_length=1, description="用户名")
+    password: str = Field(..., min_length=1, description="密码")
+
 
 class UserRegister(BaseModel):
     """用户注册"""
-    username: str
-    password: str
-    department: Optional[str] = None
+    username: str = Field(..., min_length=3, max_length=50, description="用户名，3-50个字符")
+    password: str = Field(..., min_length=8, max_length=72, description="密码，至少8位")
+    department: Optional[str] = Field(None, max_length=128, description="部门")
 
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        """验证用户名"""
+        v = v.strip()
+        if not v:
+            raise ValueError('用户名不能为空或只包含空格')
+        
+        # 可选：限制用户名格式（只允许字母、数字、下划线、中文）
+        # import re
+        # if not re.match(r'^[\w\u4e00-\u9fa5]+$', v):
+        #     raise ValueError('用户名只能包含字母、数字、下划线和中文')
+        
+        # 不允许纯数字用户名
+        if v.isdigit():
+            raise ValueError('用户名不能为纯数字')
+        
+        return v
     
+    @field_validator('password')
+    @classmethod
+    def validate_password_strength(cls, v):
+        """
+        验证密码强度
+        要求：
+        - 长度至少8位
+        - 必须包含大写字母
+        - 必须包含小写字母
+        - 必须包含数字
+        """
+        if len(v) < 8:
+            raise ValueError('密码长度至少8位')
+        
+        if not any(char.isdigit() for char in v):
+            raise ValueError('密码必须包含至少一个数字')
+        
+        if not any(char.isalpha() for char in v):
+            raise ValueError('密码必须包含至少一个字母')
+        
+        if not any(char.isupper() for char in v):
+            raise ValueError('密码必须包含至少一个大写字母')
+        
+        if not any(char.islower() for char in v):
+            raise ValueError('密码必须包含至少一个小写字母')
+        
+        # 可选：检查常见弱密码
+        weak_passwords = [
+            '12345678', 'Password1', 'Qwerty123', 'Abc12345',
+            'Test1234', 'Admin123', 'User1234'
+        ]
+        if v in weak_passwords:
+            raise ValueError('密码过于简单，请使用更复杂的密码')
+        
+        return v
+    
+    @field_validator('department')
+    @classmethod
+    def validate_department(cls, v):
+        """验证部门"""
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+        return v
+
+
+class PasswordChange(BaseModel):
+    """修改密码请求模型"""
+    old_password: str = Field(..., min_length=1, description="旧密码")
+    new_password: str = Field(..., min_length=8, max_length=72, description="新密码")
+    confirm_password: str = Field(..., min_length=8, max_length=72, description="确认新密码")
+    
+    @field_validator('new_password')
+    @classmethod
+    def validate_password_strength(cls, v):
+        """
+        验证密码强度
+        要求：
+        - 长度至少8位
+        - 必须包含大写字母
+        - 必须包含小写字母
+        - 必须包含数字
+        """
+        if len(v) < 8:
+            raise ValueError('密码长度至少8位')
+        
+        if not any(char.isdigit() for char in v):
+            raise ValueError('密码必须包含至少一个数字')
+        
+        if not any(char.isalpha() for char in v):
+            raise ValueError('密码必须包含至少一个字母')
+        
+        if not any(char.isupper() for char in v):
+            raise ValueError('密码必须包含至少一个大写字母')
+        
+        if not any(char.islower() for char in v):
+            raise ValueError('密码必须包含至少一个小写字母')
+        
+        # 可选：检查常见弱密码
+        weak_passwords = [
+            '12345678', 'Password1', 'Qwerty123', 'Abc12345',
+            'Test1234', 'Admin123', 'User1234'
+        ]
+        if v in weak_passwords:
+            raise ValueError('密码过于简单，请使用更复杂的密码')
+        
+        return v
+    
+    @field_validator('confirm_password')
+    @classmethod
+    def passwords_match(cls, v, info):
+        """验证两次密码是否一致"""
+        if 'new_password' in info.data and v != info.data['new_password']:
+            raise ValueError('两次输入的密码不一致')
+        return v
+
+
 class Token(BaseModel):
     """Token 响应"""
     access_token: str
     token_type: str = "bearer"
 
 
-from typing import Generic, TypeVar
+# ========== 通用响应 Schema ==========
 
 T = TypeVar("T")
-
-class DocumentWriteRequest(BaseModel):
-    """AI 公文写作接口请求体"""
-    prompt: str
-    documentType: str  # 'article' | 'report' | 'summary' | 'email'
-    tone: str | None = None  # 'professional' | 'casual' | 'formal'
-    language: str | None = None  # e.g. 'zh', 'en'
-    title: str | None = None  # 文章标题
-    requirement: str | None = None  # 提出的需求
-
-
-class DocumentOptimizeRequest(BaseModel):
-    content: str
-    optimizationType: Literal['grammar', 'style', 'clarity', 'logic', 'format', 'tone', 'all'] = 'all'
-    customInstruction: Optional[str] = None
-    context: Optional[dict] = None
-
-
-class DocumentExportRequest(BaseModel):
-    content: str
-    title: str
-    format: Literal['pdf', 'docx', 'txt'] = 'pdf'
-    options: Optional[dict] = None
-
 
 class BaseData(BaseModel):
     """所有 data 模型的基类"""
     pass
 
+
 class StandardResponse(BaseModel, Generic[T]):
+    """标准响应格式"""
     success: bool
     data: Optional[T]
     message: str
 
 
-# 具体接口的 data 结构
+class PasswordChangeResponse(BaseData):
+    """修改密码响应"""
+    message: str
+    user_id: str
+    username: str
+    changed_at: datetime
+
+
+class LogoutResponse(BaseData):
+    """退出登录响应"""
+    message: str
+    user_id: str
+    username: str
+    logout_at: datetime
+
+
+class RegisterResponse(BaseData):
+    """注册响应"""
+    user_id: str
+    username: str
+    department: Optional[str] = None
+
+
+# ========== AI 文档处理 Schema ==========
+
+class DocumentWriteRequest(BaseModel):
+    """AI 公文写作接口请求体"""
+    prompt: str = Field(..., description="写作提示")
+    documentType: str = Field(..., description="文档类型：article/report/summary/email")
+    tone: Optional[str] = Field(None, description="语气：professional/casual/formal")
+    language: Optional[str] = Field(None, description="语言：zh/en")
+    title: Optional[str] = Field(None, description="文章标题")
+    requirement: Optional[str] = Field(None, description="具体需求")
+
+
+class DocumentOptimizeRequest(BaseModel):
+    """文档优化请求"""
+    content: str = Field(..., description="待优化的内容")
+    optimizationType: Literal['grammar', 'style', 'clarity', 'logic', 'format', 'tone', 'all'] = Field(
+        default='all', 
+        description="优化类型"
+    )
+    customInstruction: Optional[str] = Field(None, description="自定义优化指令")
+    context: Optional[dict] = Field(None, description="上下文信息")
+
+
+class DocumentExportRequest(BaseModel):
+    """文档导出请求"""
+    content: str = Field(..., description="文档内容")
+    title: str = Field(..., description="文档标题")
+    format: Literal['pdf', 'docx', 'txt'] = Field(default='pdf', description="导出格式")
+    options: Optional[dict] = Field(None, description="导出选项")
+
+
 class DocumentData(BaseData):
+    """文档生成响应数据"""
     content: str
     wordCount: int
     generatedAt: datetime
-    docxPath: str | None = None
-    pdfPath: str | None = None
+    docxPath: Optional[str] = None
+    pdfPath: Optional[str] = None
+    aiRate: Optional[float] = None
+
+
+class DocumentDataOptimize(BaseData):
+    """文档优化响应数据"""
+    content: str
+    docxPath: Optional[str] = None
+    pdfPath: Optional[str] = None
+    aiRate: Optional[float] = None
 
 
 class DocumentExportData(BaseData):
+    """文档导出响应数据"""
     url: str
     filename: str
     size: int
     expiresAt: datetime
+    
 
-# 文档优化接口的数据结构（只保留 content）
-class DocumentDataOptimize(BaseData):
+
+# ========== AI-rate Schema ==========
+class AIRateRequest(BaseModel):
+    """请求体：传入公文/文本内容以评估 AI 生成概率"""
     content: str
-    docxPath: str | None = None
-    pdfPath: str | None = None
+
+
+class AIRateResponse(BaseData):
+    """响应体：仅返回 AI 生成概率（0-100）"""
+    ai_rate: float

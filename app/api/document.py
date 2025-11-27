@@ -1,4 +1,5 @@
 # app/routers/document.py
+# app/routers/document.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.services.document_service import DocumentService
 from app.models.schemas import (
@@ -32,6 +33,8 @@ import platform
 import os
 import re
 from typing import Optional, Dict, Any
+from app.models.schemas import AIRateRequest, AIRateResponse
+from app.services.ai_rate_service import compute_ai_rate
 
 router = APIRouter(prefix="/api/document", tags=["生成公文"])
 
@@ -552,12 +555,23 @@ async def document_write(
             tone=req.tone or "formal",
             language=req.language or "zh",
         )
-        # print(f"content: {content}")
-        lines = content.splitlines()
-        new_s = "\n".join(lines[1:-1])
+        content = content.strip()
+        if content.startswith("```"):
+            # 去掉第一行 ``` 开头的标记
+            print("start with ``` ")
+            content = "\n".join(content.splitlines()[1:])
+        if content.endswith("```"):
+            # 去掉最后一行 ```
+            print("end with ``` ")
+            content = "\n".join(content.splitlines()[:-1])
+        content = content.strip()
+
+        print(f"content: {content}")
+        # lines = content.splitlines()
+        # new_s = "\n".join(lines[1:-1])
         # print(f"str2json: {new_s}")
         try:
-            document_payload = json.loads(new_s)
+            document_payload = json.loads(content)
             lines = []
             for v in document_payload.values():
                 if isinstance(v, list):
@@ -569,6 +583,8 @@ async def document_write(
         except json.JSONDecodeError as exc:
             raise ValueError(f"解析生成内容失败：{exc}")
 
+        
+        ai_rate = compute_ai_rate(content) if content else None
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         docx_dir = Path(os.getenv("DOWNLOAD_DIR", "./generated_documents"))
         pdf_dir = Path(os.getenv("PDF_DIR", "./pdf"))
@@ -597,7 +613,8 @@ async def document_write(
                 wordCount=len(document_string),
                 generatedAt=datetime.now(timezone.utc),
                 docxPath=docx_preview_path,
-                pdfPath=pdf_preview_path
+                pdfPath=pdf_preview_path,
+                aiRate=ai_rate
             ),
             message="文档生成成功",
         )
@@ -650,6 +667,7 @@ async def document_export(req: DocumentExportRequest):
                 )
             file_path = Path(pdf_result)
             url = f"/AI/pdf/{file_path.name}"
+            print(f"pdf_path: {pdf_path}")
         elif req.format == "txt":
             txt_dir.mkdir(parents=True, exist_ok=True)
             file_path = txt_dir / f"{base_name}.txt"
@@ -718,6 +736,8 @@ async def document_optimize(
         except json.JSONDecodeError as exc:
             raise ValueError(f"解析生成内容失败：{exc}")
 
+
+        ai_rate = compute_ai_rate(str_result) if str_result else None
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         docx_dir = Path(os.getenv("DOWNLOAD_DIR", "./generated_documents"))
         pdf_dir = Path(os.getenv("PDF_DIR", "./pdf"))
@@ -739,12 +759,15 @@ async def document_optimize(
         docx_preview_path = f"/AI/word/{word_filename}" if word_filename else None
         pdf_preview_path = f"/AI/pdf/{pdf_filename}" if pdf_filename else None
         # print(str_result)
+        print(f"pdf_preview_path: {pdf_preview_path}")
+        print(f"docx_preview_path: {docx_preview_path}")
         return StandardResponse(
             success=True,
             data=DocumentDataOptimize(
                 content=str_result,
                 docxPath=docx_preview_path,
-                pdfPath=pdf_preview_path
+                pdfPath=pdf_preview_path,
+                aiRate=ai_rate
             ),
             message="OK"
         )
@@ -756,6 +779,14 @@ async def document_optimize(
             message=f"优化失败：{e}",
         )
 
+@router.post("/ai-rate", response_model=AIRateResponse)
+async def document_ai_rate(req: AIRateRequest):
+    """Estimate AI-generation likelihood for given text content (0-100).
+
+    Delegates the actual computation to `app.services.ai_rate_service.compute_ai_rate`.
+    """
+    ai_rate = compute_ai_rate(req.content)
+    return AIRateResponse(ai_rate=ai_rate)
 
 
 # # 使用示例

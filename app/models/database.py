@@ -177,6 +177,23 @@ class MeetingMinutes(Base):
     # 建立与会议的关联关系（逻辑关联，无外键约束）
     # meeting = relationship("Meeting", back_populates="minutes")
 
+
+# 会议音频表
+class MeetingAudio(Base):
+    __tablename__ = "meeting_audios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True)
+    filename = Column(String)
+    file_path = Column(String)
+    file_type = Column(String)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    transcript_text = Column(Text)
+    language = Column(String(20), default="zh")
+    status = Column(String(20), default="pending")  # pending/processing/completed/failed
+    error_msg = Column(Text)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # 创建所有表
 Base.metadata.create_all(bind=engine)
 

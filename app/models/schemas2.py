@@ -71,6 +71,27 @@ class MeetingFileInDB(MeetingFileBase):
         orm_mode = True
 
 
+# 会议音频模型
+class MeetingAudioBase(BaseModel):
+    meeting_id: int
+    filename: str
+    file_type: str
+
+class MeetingAudioCreate(MeetingAudioBase):
+    file_path: str
+
+class MeetingAudioInDB(MeetingAudioBase):
+    id: int
+    uploaded_at: datetime
+    transcript_text: Optional[str] = None
+    language: Optional[str] = "zh"
+    status: Optional[str] = "pending"
+    error_msg: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
 
 # 会议纪要基础模型
 class MeetingMinutesBase(BaseModel):

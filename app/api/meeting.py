@@ -15,6 +15,10 @@ from app.models import schemas2
 from app.services.meeting_service import MeetingService, FileService
 from app.models.database import get_db
 from app.utils.auth import get_current_user
+from fastapi import UploadFile
+from app.services import transcription_service
+from app.models import database
+from app.models import schemas2
 
 # 创建路由实例，设置前缀和标签
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
@@ -105,8 +109,6 @@ def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
     return {"message": "会议及相关文件已删除"}
 
 
-
-
 # 上传会议文件接口（支持一次上传多个文件）
 @router.post("/{meeting_id}/files", response_model=List[schemas2.MeetingFileInDB])
 def upload_meeting_file(
@@ -114,7 +116,7 @@ def upload_meeting_file(
     uploaded_files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
-    """接收浏览器上传的多个文件，保存到仓库根目录下的 `meeting_files/{meeting_id}/` 下，并记录数据库。
+    """接收浏览器上传的多个文件，保存到仓库根目录下的 `meeting_files/{meeting_id}/uploads` 下，并记录数据库。
 
     返回值为已保存的文件记录列表。
     """
@@ -134,9 +136,9 @@ def upload_meeting_file(
         logger.warning(f"上传文件时未找到会议，会议ID: {meeting_id}")
         raise HTTPException(status_code=404, detail="会议未找到")
 
-    # 计算存储目录：仓库根目录下的 meeting_files/{meeting_id}
+    # 计算存储目录：仓库根目录下的 meeting_files/{meeting_id}/uploads
     repo_root = Path(__file__).resolve().parents[2]
-    storage_dir = repo_root / "meeting_files" / str(meeting_id)
+    storage_dir = repo_root / "meeting_files" / str(meeting_id) / "uploads"
     storage_dir.mkdir(parents=True, exist_ok=True)
 
     saved_records = []
@@ -173,6 +175,9 @@ def upload_meeting_file(
 
     return saved_records
 
+
+
+
 # 会议文件详情接口
 @router.get("/{meeting_id}/files/{file_id}", response_model=schemas2.MeetingFileInDB)
 def get_meeting_file_detail(meeting_id: int, file_id: int, db: Session = Depends(get_db)):
@@ -184,7 +189,6 @@ def get_meeting_file_detail(meeting_id: int, file_id: int, db: Session = Depends
     if not db_file or db_file.meeting_id != meeting_id:
         raise HTTPException(status_code=404, detail="文件未找到")
     return db_file
-
 
 
 # 列出某会议下的所有文件（与上传端点同一路径，不同方法）
@@ -262,4 +266,106 @@ def delete_meeting_file(
     return {"message": "文件删除成功"}
 
 
-# 会议纪要相关路由已移至单独模块 `app.api.meeting_minute`
+# 上传会议音频接口（一次可上传一个或多个）
+@router.post("/{meeting_id}/audio", response_model=List[schemas2.MeetingAudioInDB])
+def upload_meeting_audio(
+    meeting_id: int,
+    uploaded_files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传一个或多个会议音频，保存到 `meeting_files/{meeting_id}/audio`，并在后台转写为文字保存到转写表。"""
+    logger.info(f"上传会议音频，会议ID: {meeting_id}，文件数量: {len(uploaded_files)}")
+
+    # 验证会议是否存在
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        logger.warning(f"上传音频时未找到会议，会议ID: {meeting_id}")
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    # 允许的音频后缀
+    allowed_exts = {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg'}
+
+    # 存储目录
+    repo_root = Path(__file__).resolve().parents[2]
+    storage_dir = repo_root / "meeting_files" / str(meeting_id) / "audio"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_records = []
+    for idx, uploaded_file in enumerate(uploaded_files):
+        safe_name = Path(uploaded_file.filename).name
+        ext = Path(safe_name).suffix.lower()
+        if ext not in allowed_exts:
+            logger.warning(f"不允许的音频类型: {safe_name}")
+            raise HTTPException(status_code=400, detail=f"不支持的音频格式: {ext}")
+
+        timestamp = int(time.time())
+        stored_name = f"{timestamp}_{idx}_{safe_name}"
+        dest_path = storage_dir / stored_name
+
+        try:
+            with dest_path.open("wb") as out_file:
+                shutil.copyfileobj(uploaded_file.file, out_file)
+        finally:
+            try:
+                uploaded_file.file.close()
+            except Exception:
+                pass
+
+        # 写入数据库会议音频记录
+        audio_record = database.MeetingAudio(
+            meeting_id=meeting_id,
+            filename=safe_name,
+            file_path=str(dest_path),
+            file_type=uploaded_file.content_type or "audio/*",
+        )
+        db.add(audio_record)
+        db.commit()
+        db.refresh(audio_record)
+
+        # 后台转写
+        try:
+            transcription_service.transcribe_audio_background(audio_record.id, meeting_id, str(dest_path))
+        except Exception:
+            logger.exception("启动后台转写失败")
+
+        saved_records.append(audio_record)
+
+    return saved_records
+
+# 获取所有会议音频
+@router.get("/{meeting_id}/audio", response_model=List[schemas2.MeetingAudioInDB])
+def list_meeting_audio(meeting_id: int, db: Session = Depends(get_db)):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+    audios = db.query(database.MeetingAudio).filter(database.MeetingAudio.meeting_id == meeting_id).all()
+    return audios
+
+# 删除会议音频
+@router.delete("/{meeting_id}/audio/{audio_id}")
+def delete_meeting_audio(meeting_id: int, audio_id: int, db: Session = Depends(get_db)):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    audio = db.query(database.MeetingAudio).filter(database.MeetingAudio.id == audio_id).first()
+    if not audio or audio.meeting_id != meeting_id:
+        raise HTTPException(status_code=404, detail="音频未找到")
+
+    # 删除文件
+    try:
+        p = Path(audio.file_path)
+        if p.exists():
+            p.unlink()
+    except Exception as e:
+        logger.warning(f"删除音频文件出错: {e}")
+
+    # 删除数据库记录
+    try:
+        db.delete(audio)
+        db.commit()
+    except Exception as e:
+        logger.exception(f"删除音频记录失败: {e}")
+        raise HTTPException(status_code=500, detail="删除失败")
+
+    return {"message": "音频已删除"}
