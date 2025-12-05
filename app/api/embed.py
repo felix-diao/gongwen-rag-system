@@ -5,7 +5,7 @@ from app.utils.auth import get_current_user
 
 router = APIRouter(prefix="/api/embed", tags=["向量化"])
 
-@router.post("/", response_model=EmbedResponse)
+@router.post("", response_model=EmbedResponse)
 async def embed_texts(
     request: EmbedRequest,
     current_user: dict = Depends(get_current_user)

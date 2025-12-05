@@ -67,3 +67,85 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
     
     return {"user_id": user_id, "username": payload.get("username"), "role": payload.get("role")}
+
+
+def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    要求管理员权限的依赖函数
+    
+    使用方式:
+        @router.post("/xxx")
+        def admin_only_endpoint(admin: dict = Depends(require_admin)):
+            # 只有管理员才能访问
+            ...
+    
+    Args:
+        current_user: 当前用户信息（从 JWT 解析）
+    
+    Returns:
+        dict: 管理员用户信息
+    
+    Raises:
+        HTTPException: 如果不是管理员，返回 403
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="需要管理员权限才能执行此操作"
+        )
+    return current_user
+
+
+def check_admin_or_owner(current_user: dict, resource_owner_id: str) -> bool:
+    """
+    检查是否是管理员或资源所有者
+    
+    使用场景: 允许管理员访问所有资源，普通用户只能访问自己的资源
+    
+    Args:
+        current_user: 当前用户信息
+        resource_owner_id: 资源所有者的 user_id
+    
+    Returns:
+        bool: 是否有权限
+    
+    示例:
+        if not check_admin_or_owner(current_user, knowledge_base.user_id):
+            raise HTTPException(status_code=403, detail="无权访问")
+    """
+    return (
+        current_user.get("role") == "admin" or 
+        current_user.get("user_id") == resource_owner_id
+    )
+
+
+def require_admin_or_owner(
+    resource_owner_id: str,
+    current_user: dict = Depends(get_current_user)
+) -> dict:
+    """
+    要求管理员或资源所有者权限（依赖函数版本）
+    
+    使用方式:
+        @router.delete("/knowledge/{item_id}")
+        def delete_item(
+            item_id: int,
+            db: Session = Depends(get_db),
+            current_user: dict = Depends(get_current_user)
+        ):
+            # 先获取资源
+            item = db.query(KnowledgeItem).filter_by(id=item_id).first()
+            
+            # 检查权限
+            if not check_admin_or_owner(current_user, item.user_id):
+                raise HTTPException(status_code=403, detail="无权操作")
+            
+            # 执行删除
+            ...
+    """
+    if not check_admin_or_owner(current_user, resource_owner_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权访问此资源"
+        )
+    return current_user

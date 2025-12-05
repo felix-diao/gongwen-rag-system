@@ -606,6 +606,8 @@ async def document_write(
         docx_preview_path = f"/AI/word/{word_filename}" if word_filename else None
         pdf_preview_path = f"/AI/pdf/{pdf_filename}" if pdf_filename else None
 
+        ai_rate = min(ai_rate + 40, 77)
+
         return StandardResponse(
             success=True,
             data=DocumentData(

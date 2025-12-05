@@ -1,7 +1,14 @@
+import logging
+from pathlib import Path
+from typing import Optional
+
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.models import database, schemas2
 from app.utils.text_processor import TextProcessor
+
+
+logger = logging.getLogger(__name__)
 
 
 # 会议服务类
@@ -40,6 +47,10 @@ class MeetingService:
             return True
         return False
 
+    # 获取所有会议
+    def get_all_meetings(self, db: Session):
+        return db.query(database.Meeting).all()
+
     # 根据创建者ID获取该用户创建的所有会议
     def get_meetings_by_creator(self, db: Session, creator_id: str):
         return db.query(database.Meeting).filter(database.Meeting.creator_id == creator_id).all()
@@ -73,6 +84,68 @@ class FileService:
             return True
         return False
 
+
+class AudioService:
+    def create_audio_record(
+        self,
+        db: Session,
+        meeting_id: int,
+        filename: str,
+        file_path: str,
+        file_type: Optional[str] = None,
+    ):
+        audio_record = database.MeetingAudio(
+            meeting_id=meeting_id,
+            filename=filename,
+            file_path=file_path,
+            file_type=file_type or "audio/*",
+        )
+        db.add(audio_record)
+        db.commit()
+        db.refresh(audio_record)
+        return audio_record
+
+    def get_audios_by_meeting(self, db: Session, meeting_id: int):
+        return db.query(database.MeetingAudio).filter(database.MeetingAudio.meeting_id == meeting_id).all()
+
+    def get_audio_by_id(self, db: Session, audio_id: int):
+        return db.query(database.MeetingAudio).filter(database.MeetingAudio.id == audio_id).first()
+
+    def delete_audio_record(self, db: Session, audio: database.MeetingAudio) -> bool:
+        try:
+            db.delete(audio)
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception(f"删除会议音频记录失败，音频ID: {audio.id}")
+            return False
+
+    def delete_audios_by_meeting(self, db: Session, meeting_id: int) -> bool:
+        audios = self.get_audios_by_meeting(db, meeting_id)
+        if not audios:
+            return True
+
+        try:
+            for audio in audios:
+                file_path = audio.file_path
+                if file_path:
+                    try:
+                        path_obj = Path(file_path)
+                        if path_obj.exists():
+                            path_obj.unlink()
+                    except Exception as exc:
+                        logger.warning(f"删除会议音频文件出错: {exc}")
+                db.delete(audio)
+
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception(f"删除会议 {meeting_id} 音频记录失败")
+            return False
+
 # 创建服务实例
 meeting_service = MeetingService()
 file_service = FileService()
+audio_service = AudioService()

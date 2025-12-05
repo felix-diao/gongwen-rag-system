@@ -2,6 +2,7 @@ from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP,
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
+from sqlalchemy import Column, Date
 from app.config import settings
 
 Base = declarative_base()
@@ -59,6 +60,8 @@ class KnowledgeBase(Base):
     description = Column(Text)
     user_id = Column(String(64), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
     
+    is_public = Column(Boolean, default=False) 
+
     # 统计信息
     item_count = Column(Integer, default=0)
     total_size = Column(Integer, default=0)  # 总大小（字节）
@@ -157,25 +160,37 @@ class MeetingFile(Base):
     # 建立与会议的关联关系（逻辑关联，无外键约束）
     # meeting = relationship("Meeting", back_populates="files")
 
-# 会议纪要表
-class MeetingMinutes(Base):
-    __tablename__ = "meeting_minutes"
-    
-    # 主键ID
+class MeetingSummary(Base):
+    __tablename__ = "meeting_summaries"
+
     id = Column(Integer, primary_key=True, index=True)
-    # 关联的会议ID（逻辑关联，无外键约束）
-    meeting_id = Column(Integer)
-    # 纪要标题
-    title = Column(String)
-    # 纪要内容
-    content = Column(Text)
-    # 创建时间
+    meeting_id = Column(Integer, unique=True, index=True, nullable=False)
+    summary_text = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    # 更新时间
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # 建立与会议的关联关系（逻辑关联，无外键约束）
-    # meeting = relationship("Meeting", back_populates="minutes")
+
+
+class MeetingActionItem(Base):
+    __tablename__ = "meeting_action_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    description = Column(Text, nullable=False)
+    owner = Column(String)
+    due_date = Column(Date)
+    status = Column(String, default="pending")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MeetingDecisionItem(Base):
+    __tablename__ = "meeting_decision_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    description = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 # 会议音频表
@@ -193,6 +208,26 @@ class MeetingAudio(Base):
     status = Column(String(20), default="pending")  # pending/processing/completed/failed
     error_msg = Column(Text)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PromptTemplate(Base):
+    """Prompt 模板表"""
+    __tablename__ = "prompt_templates"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(100), nullable=False, index=True)
+    category = Column(String(50), nullable=False, index=True)
+    description = Column(Text)
+    content = Column(Text, nullable=False)
+    variables = Column(ARRAY(String), default=[])  # 保持与你的风格一致，使用 ARRAY
+    is_active = Column(Boolean, default=True, index=True)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # 关联关系
+    user = relationship("User", foreign_keys=[user_id])
+
 
 # 创建所有表
 Base.metadata.create_all(bind=engine)

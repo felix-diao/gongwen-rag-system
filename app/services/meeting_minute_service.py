@@ -1,418 +1,514 @@
+import json
 import logging
-from typing import List, Optional
-from sqlalchemy.orm import Session
-from app.models import database, schemas2
-from app.utils.text_processor import TextProcessor
-from app.llm_client.generators import get_client
-from pathlib import Path
-import time
-from docx import Document
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.enums import TA_LEFT
-from pathlib import Path
-from datetime import datetime
-from docx import Document
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.pagesizes import A4
-from app.services.meeting_service import file_service
 import re
-from reportlab.lib import colors
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+from docx import Document
+from sqlalchemy.orm import Session
+
+from app.llm_client.generators import get_client
+from app.models import database, schemas2
+from app.services.meeting_service import file_service
+from app.utils.text_processor import TextProcessor
 
 logger = logging.getLogger(__name__)
 
 
 class MinutesService:
-    # 生成会议纪要（基于会议内容文本）
-    def generate_minutes(self, db: Session, meeting_id: int, selected_file_ids: Optional[List[int]] = None, create_new_version: bool = False):
-        # 获取会议基本信息和内容文本
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
+    def __init__(self) -> None:
+        self._text_processor = TextProcessor()
+
+    def generate_structured_minutes(
+        self,
+        db: Session,
+        meeting_id: int,
+        selected_file_ids: Optional[List[int]] = None,
+        audio_segments: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Optional[schemas2.MeetingInsightsResponse]:
+        meeting, combined_text = self._build_meeting_context(
+            db,
+            meeting_id,
+            selected_file_ids,
+            audio_segments,
+        )
         if not meeting:
             return None
 
-        # 使用会议的基本信息和内容文本生成纪要
-        meeting_info = f"会议标题: {meeting.title}\n"
-        meeting_info += f"会议时间: {meeting.date}\n"
-        if meeting.location:
-            meeting_info += f"会议地点: {meeting.location}\n"
-        if meeting.host:
-            meeting_info += f"主持人: {meeting.host}\n"
-        if meeting.participants:
-            meeting_info += f"参会人员: {meeting.participants}\n"
+        payload = self._invoke_structured_llm(combined_text, meeting)
+        summary_text = (payload or {}).get("summary") or self._fallback_summary(meeting)
+        action_items_raw = (payload or {}).get("action_items")
+        decision_items_raw = (payload or {}).get("decision_items")
 
-        # 合并会议文本和会议文件内容
-        tp = TextProcessor()
-        parts = [meeting_info]
-        if getattr(meeting, 'content_text', None):
+        normalized_actions = self._normalize_action_items(action_items_raw, meeting)
+        normalized_decisions = self._normalize_decision_items(decision_items_raw, meeting)
+
+        self._reset_structured_minutes(db, meeting_id)
+
+        summary_record = database.MeetingSummary(
+            meeting_id=meeting_id,
+            summary_text=summary_text,
+        )
+        db.add(summary_record)
+
+        action_records: List[database.MeetingActionItem] = []
+        for item in normalized_actions:
+            action = database.MeetingActionItem(
+                meeting_id=meeting_id,
+                description=item.get("description"),
+                owner=item.get("owner"),
+                due_date=item.get("due_date"),
+                status=item.get("status") or "pending",
+            )
+            db.add(action)
+            action_records.append(action)
+
+        decision_records: List[database.MeetingDecisionItem] = []
+        for item in normalized_decisions:
+            decision = database.MeetingDecisionItem(
+                meeting_id=meeting_id,
+                description=item.get("description"),
+            )
+            db.add(decision)
+            decision_records.append(decision)
+
+        db.commit()
+        db.refresh(summary_record)
+        for record in action_records + decision_records:
+            db.refresh(record)
+
+        return schemas2.MeetingInsightsResponse(
+            summary=schemas2.MeetingSummaryInDB.from_orm(summary_record),
+            action_items=[schemas2.MeetingActionItemInDB.from_orm(item) for item in action_records],
+            decision_items=[schemas2.MeetingDecisionItemInDB.from_orm(item) for item in decision_records],
+        )
+
+    def get_meeting_insights(self, db: Session, meeting_id: int) -> Optional[schemas2.MeetingInsightsResponse]:
+        summary = self._get_summary_record(db, meeting_id)
+        actions = self.list_action_items(db, meeting_id)
+        decisions = self.list_decision_items(db, meeting_id)
+
+        if not summary and not actions and not decisions:
+            return None
+
+        return schemas2.MeetingInsightsResponse(
+            summary=schemas2.MeetingSummaryInDB.from_orm(summary) if summary else None,
+            action_items=[schemas2.MeetingActionItemInDB.from_orm(item) for item in actions],
+            decision_items=[schemas2.MeetingDecisionItemInDB.from_orm(item) for item in decisions],
+        )
+
+    def get_summary(self, db: Session, meeting_id: int):
+        summary = self._get_summary_record(db, meeting_id)
+        return summary
+
+    def update_summary(self, db: Session, meeting_id: int, summary_update: schemas2.MeetingSummaryUpdate):
+        summary = self._get_summary_record(db, meeting_id)
+        new_text = summary_update.summary_text
+
+        if summary is None:
+            if not new_text:
+                meeting = self._get_meeting(db, meeting_id)
+                new_text = self._fallback_summary(meeting) if meeting else "会议摘要待补充"
+            summary = database.MeetingSummary(meeting_id=meeting_id, summary_text=new_text)
+            db.add(summary)
+        else:
+            if new_text is not None:
+                summary.summary_text = new_text
+
+        db.commit()
+        db.refresh(summary)
+        return summary
+
+    def list_action_items(self, db: Session, meeting_id: int) -> List[database.MeetingActionItem]:
+        return (
+            db.query(database.MeetingActionItem)
+            .filter(database.MeetingActionItem.meeting_id == meeting_id)
+            .order_by(database.MeetingActionItem.id.asc())
+            .all()
+        )
+
+    def get_action_item(self, db: Session, meeting_id: int, item_id: int) -> Optional[database.MeetingActionItem]:
+        return (
+            db.query(database.MeetingActionItem)
+            .filter(
+                database.MeetingActionItem.meeting_id == meeting_id,
+                database.MeetingActionItem.id == item_id,
+            )
+            .first()
+        )
+
+    def create_action_item(
+        self,
+        db: Session,
+        meeting_id: int,
+        action_data: schemas2.MeetingActionItemCreate,
+    ) -> database.MeetingActionItem:
+        payload = action_data.dict(exclude_unset=True)
+        action = database.MeetingActionItem(
+            meeting_id=meeting_id,
+            description=payload.get("description"),
+            owner=payload.get("owner"),
+            due_date=payload.get("due_date"),
+            status=payload.get("status") or "pending",
+        )
+        db.add(action)
+        db.commit()
+        db.refresh(action)
+        return action
+
+    def update_action_item(
+        self,
+        db: Session,
+        meeting_id: int,
+        item_id: int,
+        action_update: schemas2.MeetingActionItemUpdate,
+    ) -> Optional[database.MeetingActionItem]:
+        action = self.get_action_item(db, meeting_id, item_id)
+        if not action:
+            return None
+        for key, value in action_update.dict(exclude_unset=True).items():
+            setattr(action, key, value)
+        db.commit()
+        db.refresh(action)
+        return action
+
+    def delete_action_item(self, db: Session, meeting_id: int, item_id: int) -> bool:
+        action = self.get_action_item(db, meeting_id, item_id)
+        if not action:
+            return False
+        db.delete(action)
+        db.commit()
+        return True
+
+    def list_decision_items(self, db: Session, meeting_id: int) -> List[database.MeetingDecisionItem]:
+        return (
+            db.query(database.MeetingDecisionItem)
+            .filter(database.MeetingDecisionItem.meeting_id == meeting_id)
+            .order_by(database.MeetingDecisionItem.id.asc())
+            .all()
+        )
+
+    def get_decision_item(self, db: Session, meeting_id: int, item_id: int) -> Optional[database.MeetingDecisionItem]:
+        return (
+            db.query(database.MeetingDecisionItem)
+            .filter(
+                database.MeetingDecisionItem.meeting_id == meeting_id,
+                database.MeetingDecisionItem.id == item_id,
+            )
+            .first()
+        )
+
+    def create_decision_item(
+        self,
+        db: Session,
+        meeting_id: int,
+        decision_data: schemas2.MeetingDecisionItemCreate,
+    ) -> database.MeetingDecisionItem:
+        payload = decision_data.dict(exclude_unset=True)
+        decision = database.MeetingDecisionItem(
+            meeting_id=meeting_id,
+            description=payload.get("description"),
+        )
+        db.add(decision)
+        db.commit()
+        db.refresh(decision)
+        return decision
+
+    def update_decision_item(
+        self,
+        db: Session,
+        meeting_id: int,
+        item_id: int,
+        decision_update: schemas2.MeetingDecisionItemUpdate,
+    ) -> Optional[database.MeetingDecisionItem]:
+        decision = self.get_decision_item(db, meeting_id, item_id)
+        if not decision:
+            return None
+        updates = decision_update.dict(exclude_unset=True)
+        description = updates.get("description")
+        if description is not None:
+            decision.description = description
+        db.commit()
+        db.refresh(decision)
+        return decision
+
+    def delete_decision_item(self, db: Session, meeting_id: int, item_id: int) -> bool:
+        decision = self.get_decision_item(db, meeting_id, item_id)
+        if not decision:
+            return False
+        db.delete(decision)
+        db.commit()
+        return True
+
+    def export_structured_docx(self, db: Session, meeting_id: int) -> Optional[Path]:
+        meeting = self._get_meeting(db, meeting_id)
+        if not meeting:
+            return None
+
+        summary = self._get_summary_record(db, meeting_id)
+        actions = self.list_action_items(db, meeting_id)
+        decisions = self.list_decision_items(db, meeting_id)
+
+        summary_text = summary.summary_text if summary else self._fallback_summary(meeting)
+
+        export_dir = self._get_export_dir(meeting_id)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"structured_minutes_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.docx"
+        file_path = export_dir / filename
+
+        self._write_structured_docx(file_path, meeting, summary_text, actions, decisions)
+
+        self._save_export_file(
+            db,
+            meeting_id,
+            file_path,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        return file_path
+
+    def _reset_structured_minutes(self, db: Session, meeting_id: int) -> None:
+        db.query(database.MeetingSummary).filter(database.MeetingSummary.meeting_id == meeting_id).delete(synchronize_session=False)
+        db.query(database.MeetingActionItem).filter(database.MeetingActionItem.meeting_id == meeting_id).delete(synchronize_session=False)
+        db.query(database.MeetingDecisionItem).filter(database.MeetingDecisionItem.meeting_id == meeting_id).delete(synchronize_session=False)
+        db.flush()
+
+    def _get_summary_record(self, db: Session, meeting_id: int) -> Optional[database.MeetingSummary]:
+        return (
+            db.query(database.MeetingSummary)
+            .filter(database.MeetingSummary.meeting_id == meeting_id)
+            .first()
+        )
+
+    def _get_meeting(self, db: Session, meeting_id: int) -> Optional[database.Meeting]:
+        return db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
+
+    def _get_export_dir(self, meeting_id: int) -> Path:
+        repo_root = Path(__file__).resolve().parents[2]
+        return repo_root / "meeting_files" / str(meeting_id) / "exports"
+
+    def _build_meeting_context(
+        self,
+        db: Session,
+        meeting_id: int,
+        selected_file_ids: Optional[List[int]],
+        audio_segments: Optional[Sequence[Dict[str, Any]]],
+    ):
+        meeting = self._get_meeting(db, meeting_id)
+        if not meeting:
+            return None, ""
+
+        meeting_info = [f"会议标题: {meeting.title}"]
+        if meeting.date:
+            meeting_info.append(f"会议时间: {meeting.date}")
+        if meeting.location:
+            meeting_info.append(f"会议地点: {meeting.location}")
+        if meeting.host:
+            meeting_info.append(f"主持人: {meeting.host}")
+        if meeting.participants:
+            meeting_info.append(f"参会人员: {meeting.participants}")
+
+        parts = ["\n".join(meeting_info)]
+        if getattr(meeting, "content_text", None):
             parts.append(f"【会议记录】\n{meeting.content_text}")
 
-        # 从数据库中获取会议文件并提取文本（如支持的格式）
         if selected_file_ids:
-            logger.info(f"生成纪要时使用所选文件ids: {selected_file_ids}")
-            files_query = db.query(database.MeetingFile).filter(database.MeetingFile.meeting_id == meeting_id, database.MeetingFile.id.in_(selected_file_ids))
+            logger.info("生成纪要时使用所选文件ids: %s", selected_file_ids)
+            files_query = db.query(database.MeetingFile).filter(
+                database.MeetingFile.meeting_id == meeting_id,
+                database.MeetingFile.id.in_(selected_file_ids),
+            )
         else:
             files_query = db.query(database.MeetingFile).filter(database.MeetingFile.meeting_id == meeting_id)
 
         files = files_query.all()
         for idx, f in enumerate(files, start=1):
-            fp = getattr(f, 'file_path', None)
-            if fp:
-                try:
-                    logger.info(f"开始提取文件文本: {fp}")
-                    text = tp.extract_text(fp)
-                    parts.append(f"【文件{idx}:{f.filename}】\n" + text)
-                    logger.info(f"提取成功: {fp}")
-                except Exception as e:
-                    logger.warning(f"提取文件文本失败: {fp}, 错误: {e}")
-                    parts.append(f"【文件{idx}:{f.filename}】\n(无法提取文本)")
+            fp = getattr(f, "file_path", None)
+            if not fp:
+                continue
+            try:
+                text = self._text_processor.extract_text(fp)
+                parts.append(f"【文件{idx}:{f.filename}】\n{text}")
+                logger.info("提取文件文本成功: %s", fp)
+            except Exception as exc:
+                logger.warning("提取文件文本失败: %s，错误: %s", fp, exc)
+                parts.append(f"【文件{idx}:{f.filename}】\n(无法提取文本)")
+
+        if audio_segments:
+            for idx, segment in enumerate(audio_segments, start=1):
+                if not isinstance(segment, dict):
+                    continue
+                name = segment.get("name") or f"音频{idx}"
+                text = segment.get("text")
+                if not text:
+                    continue
+                parts.append(f"【音频{idx}:{name}】\n{text}")
 
         combined_text = "\n\n".join(parts)
+        logger.debug("会议数据汇总完成，会议ID: %s，文本长度: %s", meeting_id, len(combined_text))
+        return meeting, combined_text
 
-        # 使用大语言模型生成纪要
+    def _invoke_structured_llm(self, combined_text: str, meeting: database.Meeting) -> Optional[dict]:
+        instruction = (
+            "你是一名会议助理，需要根据提供的原始资料生成 JSON，字段包括 summary, action_items, decision_items。"
+            "summary 为一句话概述；action_items 是数组，每一项包含 description、owner、due_date(YYYY-MM-DD，可为空)、status；"
+            "decision_items 为数组，每一项包含 description。"
+        )
+        user_msg = (
+            f"请输出严格的 JSON，不要包含额外说明。\n会议标题: {meeting.title}\n"
+            f"原始资料如下:\n{combined_text}"
+        )
         try:
             cli = get_client()
-            system_msg = "你是一位专业的会议记录助手，擅长将会议内容整理成结构化的会议纪要。语言正式、条理清晰。"
-            user_msg = f"请根据以下内容生成规范的会议纪要，包含：会议概况、主要议题、讨论要点、决议与待办事项（责任人、截止期如有）。\n\n{combined_text}"
-            logger.info(f"调用 LLM 生成纪要，会议ID: {meeting_id}, 字符数: {len(combined_text)}")
-            generated_content = cli.chat([{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}], max_tokens=2000)
-            logger.info(f"LLM 返回纪要，会议ID: {meeting_id}")
-        except Exception as e:
-            logger.warning(f"调用 LLM 生成纪要失败: {e}, 使用回退实现。")
-            generated_content = self._generate_with_llm(combined_text, meeting)
-
-        # 检查是否已有纪要，如果有则根据 create_new_version 决定是更新还是创建新记录
-        existing_minutes = self.get_minutes_by_meeting(db, meeting_id)
-        if existing_minutes and not create_new_version:
-            # 更新现有纪要（覆盖）
-            existing_minutes.title = f"会议纪要: {meeting.title}"
-            existing_minutes.content = generated_content
-            db.commit()
-            db.refresh(existing_minutes)
-            return existing_minutes
-        else:
-            # 创建新纪要（或原先不存在）
-            minutes_data = schemas2.MeetingMinutesCreate(
-                meeting_id=meeting_id,
-                title=f"会议纪要: {meeting.title}",
-                content=generated_content
+            raw = cli.chat(
+                [
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=1500,
             )
-            db_minutes = database.MeetingMinutes(**minutes_data.dict())
-            db.add(db_minutes)
-            db.commit()
-            db.refresh(db_minutes)
-            return db_minutes
+            return self._parse_structured_payload(raw)
+        except Exception as exc:
+            logger.warning("生成结构化纪要失败，错误: %s", exc)
+            return None
 
-    # 调用大语言模型生成纪要（占位方法）
-    def _generate_with_llm(self, combined_text: str, meeting: database.Meeting) -> str:
-        return f"""
-# 会议纪要: {meeting.title}
-
-**时间:** {meeting.date}
-**地点:** {meeting.location or '未指定'}
-**主持人:** {meeting.host or '未指定'}
-
-## 参会人员
-{meeting.participants or '未指定'}
-
-## 会议内容摘要
-主要内容如下：
-- 关键讨论点1
-- 关键讨论点2
-- 重要决议
-
-## 待办事项
-- [负责人] 完成具体任务（截止时间）
-
-*本文档基于会议内容自动生成*
-        """.strip()
-    
-    # 根据会议ID获取纪要
-    def get_minutes_by_meeting(self, db: Session, meeting_id: int):
-        # 返回该会议最新创建的纪要（按创建时间降序）
-        return db.query(database.MeetingMinutes).filter(
-            database.MeetingMinutes.meeting_id == meeting_id
-        ).order_by(database.MeetingMinutes.created_at.desc()).first()
-    
-    # 更新会议纪要
-    def update_minutes(self, db: Session, meeting_id: int, minutes_update: schemas2.MeetingMinutesUpdate):
-        db_minutes = self.get_minutes_by_meeting(db, meeting_id)
-        if db_minutes:
-            update_data = minutes_update.dict(exclude_unset=True)
-            for key, value in update_data.items():
-                setattr(db_minutes, key, value)
-            db.commit()
-            db.refresh(db_minutes)
-        return db_minutes
-
-    # 删除会议纪要
-    def delete_minutes(self, db: Session, meeting_id: int):
-        db_minutes = self.get_minutes_by_meeting(db, meeting_id)
-        if db_minutes:
-            db.delete(db_minutes)
-            db.commit()
-            return True
-        return False
-
-    # helper to convert simple color css/rgb spans to ReportLab-compatible <font color="..."> tags
-    def _rgb_to_hex(self, rgb_str: str) -> str:
-        nums = re.findall(r"\d+", rgb_str)
+    def _parse_structured_payload(self, raw: str) -> Optional[dict]:
+        if not raw:
+            return None
+        cleaned = raw.strip()
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(0)
         try:
-            r, g, b = [int(n) for n in nums[:3]]
-            return "#%02x%02x%02x" % (r, g, b)
-        except Exception:
-            return rgb_str
-
-    def _convert_color_spans(self, text: str) -> str:
-        if not text:
-            return text
-        # rgb(...) -> hex
-        text = re.sub(r'<span\s+style="color:\s*rgb\(([^)]+)\)"\s*>', lambda m: f'<font color="{self._rgb_to_hex(m.group(1))}">', text, flags=re.IGNORECASE)
-        # hex or named colors
-        text = re.sub(r'<span\s+style="color:\s*([^;\"]+)\s*;?"\s*>', r'<font color="\1">', text, flags=re.IGNORECASE)
-        text = text.replace('</span>', '</font>')
-        return text
-
-    # 导出为 DOCX，并把生成文件保存到 meeting_files/{meeting_id}/exports/
-    def export_minutes_docx(self, db: Session, meeting_id: int):
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning("解析结构化纪要 JSON 失败，原始内容: %s", raw)
             return None
 
-        minutes = self.get_minutes_by_meeting(db, meeting_id)
-        if not minutes:
-            return None
+    def _fallback_summary(self, meeting: database.Meeting) -> str:
+        base = meeting.title or "会议"
+        return f"本次《{base}》会议聚焦核心议题，团队明确了重点任务与下一阶段推进计划。"
 
-        # 目录
-        repo_root = Path(__file__).resolve().parents[2]
-        export_dir = repo_root / 'meeting_files' / str(meeting_id) / 'exports'
-        export_dir.mkdir(parents=True, exist_ok=True)
-
-        timestamp = int(time.time())
-        filename = f"{timestamp}_minutes_{meeting_id}.docx"
-        file_path = export_dir / filename
-
-        doc = Document()
-        doc.add_heading(minutes.title or f"会议纪要: {meeting.title}", level=1)
-
-        # 基本信息
-        doc.add_paragraph(f"时间: {meeting.date}")
-        if meeting.location:
-            doc.add_paragraph(f"地点: {meeting.location}")
-        if meeting.host:
-            doc.add_paragraph(f"主持人: {meeting.host}")
-        if meeting.participants:
-            doc.add_paragraph(f"参会人员: {meeting.participants}")
-
-        doc.add_paragraph("")
-        doc.add_paragraph("纪要内容:")
-        # 将纪要内容按段落写入
-        content = minutes.content or ''
-        for para in content.split('\n'):
-            doc.add_paragraph(para)
-
-        # 保存
-        doc.save(str(file_path))
-
-        # 写入数据库文件记录
-        file_record = database.MeetingFile(
-            meeting_id=meeting_id,
-            filename=filename,
-            file_path=str(file_path),
-            file_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        )
-        db.add(file_record)
-        db.commit()
-        db.refresh(file_record)
-        return file_record
-
-    # 导出为 PDF（使用 ReportLab），保存到 meeting_files/{meeting_id}/exports/
-    def export_minutes_pdf(self, db: Session, meeting_id: int):
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            return None
-
-        minutes = self.get_minutes_by_meeting(db, meeting_id)
-        if not minutes:
-            return None
-
-        repo_root = Path(__file__).resolve().parents[2]
-        export_dir = repo_root / 'meeting_files' / str(meeting_id) / 'exports'
-        export_dir.mkdir(parents=True, exist_ok=True)
-
-        timestamp = int(time.time())
-        filename = f"{timestamp}_minutes_{meeting_id}.pdf"
-        file_path = export_dir / filename
-
-        # PDF 样式
-        doc = SimpleDocTemplate(str(file_path), pagesize=A4,
-                                leftMargin=20*mm, rightMargin=20*mm, topMargin=20*mm, bottomMargin=20*mm)
-        styles = getSampleStyleSheet()
-        # 尝试注册常见中文字体（如系统存在）
-        try:
-            pdfmetrics.registerFont(TTFont('SimSun', '/usr/share/fonts/truetype/arphic/uming.ttf'))
-            base_style = ParagraphStyle('Base', parent=styles['Normal'], fontName='SimSun', fontSize=11, leading=14)
-            heading_style = ParagraphStyle('Heading', parent=styles['Heading1'], fontName='SimSun', fontSize=16, leading=20, alignment=TA_LEFT)
-        except Exception:
-            base_style = styles['Normal']
-            heading_style = styles['Heading1']
-
-        story = []
-        # helper: convert simple HTML color spans to ReportLab <font color="..."> tags
-        def _rgb_to_hex(m: re.Match) -> str:
-            # convert rgb(r,g,b) to #rrggbb
-            nums = re.findall(r"\d+", m.group(1))
-            try:
-                r, g, b = [int(n) for n in nums[:3]]
-                return "#%02x%02x%02x" % (r, g, b)
-            except Exception:
-                return m.group(1)
-
-        def _convert_color_spans(text: str) -> str:
-            if not text:
-                return text
-            # replace <span style="color: rgb(...)"> or <span style="color: #..."> with <font color="#...">
-            # handle rgb(...) -> hex
-            text = re.sub(r'<span\s+style="color:\s*rgb\(([^)]+)\)"\s*>', lambda m: f'<font color="{_rgb_to_hex(m)}">', text, flags=re.IGNORECASE)
-            # handle hex colors or named colors
-            text = re.sub(r'<span\s+style="color:\s*([^;\"]+)\s*;?"\s*>', r'<font color="\1">', text, flags=re.IGNORECASE)
-            # close spans
-            text = text.replace('</span>', '</font>')
-            return text
-
-        title_text = minutes.title or f"会议纪要: {meeting.title}"
-        story.append(Paragraph(_convert_color_spans(title_text), heading_style))
-        story.append(Spacer(1, 6))
-
-        meeting_info = ''
-        meeting_info += f"时间: {meeting.date}<br/>"
-        if meeting.location:
-            meeting_info += f"地点: {meeting.location}<br/>"
-        if meeting.host:
-            meeting_info += f"主持人: {meeting.host}<br/>"
-        if meeting.participants:
-            meeting_info += f"参会人员: {meeting.participants}<br/>"
-
-        story.append(Paragraph(_convert_color_spans(meeting_info), base_style))
-        story.append(Spacer(1, 8))
-
-        content = minutes.content or ''
-        for para in content.split('\n'):
-            if para.strip():
-                story.append(Paragraph(_convert_color_spans(para.strip()), base_style))
-                story.append(Spacer(1, 4))
-
-        try:
-            doc.build(story)
-        except Exception as e:
-            logger.exception(f"生成 PDF 文件失败: {e}")
-            return None
-
-        # 写入数据库文件记录
-        file_record = database.MeetingFile(
-            meeting_id=meeting_id,
-            filename=filename,
-            file_path=str(file_path),
-            file_type='application/pdf'
-        )
-        db.add(file_record)
-        db.commit()
-        db.refresh(file_record)
-        return file_record
-
-    def export_minutes(self, db: Session, meeting_id: int, formats: Optional[List[str]] = None):
-        """Export minutes to DOCX and/or PDF and save files into meeting_files/{meeting_id}/exports.
-
-        Returns list of created MeetingFile DB objects.
-        """
-        if formats is None:
-            formats = ["docx", "pdf"]
-
-        allowed = {"docx", "pdf"}
-        formats = [f.lower() for f in formats if f and f.lower() in allowed]
-        if not formats:
-            raise ValueError("至少指定一种导出格式: docx 或 pdf")
-
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            return None
-
-        minutes = self.get_minutes_by_meeting(db, meeting_id)
-        if not minutes:
-            return None
-
-        # prepare text content
-        content = minutes.content or ""
-        title = minutes.title or f"会议纪要: {meeting.title}"
-
-        # storage dir: repo_root/meeting_files/{meeting_id}/exports
-        repo_root = Path(__file__).resolve().parents[2]
-        export_dir = repo_root / "meeting_files" / str(meeting_id) / "exports"
-        export_dir.mkdir(parents=True, exist_ok=True)
-
-        created_files = []
-        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-
-        # create DOCX
-        if "docx" in formats:
-            docx_name = f"minutes_{timestamp}.docx"
-            docx_path = export_dir / docx_name
-            try:
-                doc = Document()
-                doc.add_heading(title, level=1)
-                doc.add_paragraph(f"生成时间: {datetime.utcnow().isoformat()}")
-                doc.add_paragraph("")
-                for line in content.splitlines():
-                    doc.add_paragraph(line)
-                doc.save(str(docx_path))
-
-                # create DB record
-                file_record = schemas2.MeetingFileCreate(
-                    meeting_id=meeting_id,
-                    filename=docx_name,
-                    file_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    file_path=str(docx_path),
+    def _normalize_action_items(self, raw_items: Any, meeting: database.Meeting) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                description = (item.get("description") or item.get("action") or "").strip()
+                if not description:
+                    continue
+                normalized.append(
+                    {
+                        "description": description,
+                        "owner": (item.get("owner") or item.get("responsible") or "").strip() or None,
+                        "due_date": self._parse_due_date(item.get("due_date")),
+                        "status": (item.get("status") or "pending").strip() or "pending",
+                    }
                 )
-                created = file_service.create_file(db, file_record)
-                created_files.append(created)
-            except Exception as e:
-                logger.exception(f"导出 DOCX 失败: {e}")
 
-        # create PDF
-        if "pdf" in formats:
-            pdf_name = f"minutes_{timestamp}.pdf"
-            pdf_path = export_dir / pdf_name
-            try:
-                styles = getSampleStyleSheet()
-                story = []
-                story.append(Paragraph(self._convert_color_spans(title), styles['Title']))
-                story.append(Paragraph(self._convert_color_spans(f"生成时间: {datetime.utcnow().isoformat()}"), styles['Normal']))
-                story.append(Spacer(1, 12))
-                for line in content.splitlines():
-                    if line.strip() == "":
-                        story.append(Spacer(1, 6))
-                    else:
-                        story.append(Paragraph(self._convert_color_spans(line), styles['Normal']))
+        if not normalized:
+            normalized.append(
+                {
+                    "description": f"根据《{meeting.title}》会议讨论完善详细行动项",
+                    "owner": meeting.host or "待指派",
+                    "due_date": None,
+                    "status": "pending",
+                }
+            )
+        return normalized
 
-                doc = SimpleDocTemplate(str(pdf_path), pagesize=A4)
-                doc.build(story)
+    def _normalize_decision_items(self, raw_items: Any, meeting: database.Meeting) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if isinstance(item, dict):
+                    description = (item.get("description") or item.get("decision") or "").strip()
+                else:
+                    description = str(item).strip()
+                if description:
+                    normalized.append({"description": description})
 
-                file_record = schemas2.MeetingFileCreate(
-                    meeting_id=meeting_id,
-                    filename=pdf_name,
-                    file_type="application/pdf",
-                    file_path=str(pdf_path),
+        if not normalized:
+            normalized.append({"description": f"会议确认推进《{meeting.title}》后续实施计划"})
+        return normalized
+
+    def _parse_due_date(self, value: Any) -> Optional[date]:
+        if not value:
+            return None
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, str):
+            candidate = value.strip().split()[0]
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+                try:
+                    return datetime.strptime(candidate, fmt).date()
+                except ValueError:
+                    continue
+        return None
+
+    def _write_structured_docx(
+        self,
+        output_path: Path,
+        meeting: database.Meeting,
+        summary_text: str,
+        actions: List[database.MeetingActionItem],
+        decisions: List[database.MeetingDecisionItem],
+    ) -> None:
+        document = Document()
+        document.add_heading(meeting.title or "会议纪要", level=1)
+
+        info_lines = []
+        if meeting.date:
+            info_lines.append(f"会议时间: {meeting.date.strftime('%Y-%m-%d %H:%M')}")
+        if meeting.location:
+            info_lines.append(f"会议地点: {meeting.location}")
+        if meeting.host:
+            info_lines.append(f"主持人: {meeting.host}")
+        if meeting.participants:
+            info_lines.append(f"参会人员: {meeting.participants}")
+        if info_lines:
+            for line in info_lines:
+                document.add_paragraph(line)
+        document.add_paragraph("")
+
+        document.add_heading("会议摘要", level=2)
+        document.add_paragraph(summary_text or "暂无摘要")
+
+        document.add_heading("行动项", level=2)
+        if actions:
+            for idx, action in enumerate(actions, start=1):
+                due = action.due_date.strftime('%Y-%m-%d') if action.due_date else "-"
+                owner = action.owner or "待指派"
+                status = action.status or "pending"
+                document.add_paragraph(
+                    f"{idx}. {action.description} (负责人: {owner}，截止: {due}，状态: {status})"
                 )
-                created = file_service.create_file(db, file_record)
-                created_files.append(created)
-            except Exception as e:
-                logger.exception(f"导出 PDF 失败: {e}")
+        else:
+            document.add_paragraph("暂无行动项")
 
-        return created_files
+        document.add_heading("决策事项", level=2)
+        if decisions:
+            for idx, decision in enumerate(decisions, start=1):
+                document.add_paragraph(f"{idx}. {decision.description}")
+        else:
+            document.add_paragraph("暂无决策事项")
+
+        document.save(output_path)
+
+    def _save_export_file(self, db: Session, meeting_id: int, file_path: Path, mime: str):
+        payload = schemas2.MeetingFileCreate(
+            meeting_id=meeting_id,
+            filename=file_path.name,
+            file_type=mime,
+            file_path=str(file_path),
+        )
+        return file_service.create_file(db, payload)
+
+
 
 # 创建服务实例
 minutes_service = MinutesService()

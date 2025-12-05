@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, List, Literal, Generic, TypeVar
 from datetime import datetime
+import re
 
 # ========== 文档相关 Schema ==========
 
@@ -41,6 +42,7 @@ class KnowledgeBaseBase(BaseModel):
     name: str = Field(..., max_length=100)
     key: Optional[str] = Field(default=None, max_length=50)
     description: Optional[str] = None
+    is_public: bool = Field(default=False, description="是否为公有知识库")
 
 
 class KnowledgeBaseCreate(KnowledgeBaseBase):
@@ -53,6 +55,7 @@ class KnowledgeBaseUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=100)
     key: Optional[str] = Field(default=None, max_length=50)
     description: Optional[str] = None
+    is_public: Optional[bool] = None
 
 
 class KnowledgeBaseResponse(BaseModel):
@@ -63,6 +66,8 @@ class KnowledgeBaseResponse(BaseModel):
     name: str
     key: Optional[str] = None
     description: Optional[str] = None
+    is_public: bool  # ⭐ 新增
+    user_id: str  # ⭐ 添加创建者ID
     item_count: Optional[int] = 0
     total_size: Optional[int] = 0
     created_at: datetime
@@ -178,11 +183,6 @@ class UserRegister(BaseModel):
         if not v:
             raise ValueError('用户名不能为空或只包含空格')
         
-        # 可选：限制用户名格式（只允许字母、数字、下划线、中文）
-        # import re
-        # if not re.match(r'^[\w\u4e00-\u9fa5]+$', v):
-        #     raise ValueError('用户名只能包含字母、数字、下划线和中文')
-        
         # 不允许纯数字用户名
         if v.isdigit():
             raise ValueError('用户名不能为纯数字')
@@ -215,6 +215,9 @@ class UserRegister(BaseModel):
         if not any(char.islower() for char in v):
             raise ValueError('密码必须包含至少一个小写字母')
         
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
+            raise ValueError('密码必须包含至少一个特殊符号(!@#$%^&*等)')
+
         # 可选：检查常见弱密码
         weak_passwords = [
             '12345678', 'Password1', 'Qwerty123', 'Abc12345',
@@ -268,6 +271,9 @@ class PasswordChange(BaseModel):
         if not any(char.islower() for char in v):
             raise ValueError('密码必须包含至少一个小写字母')
         
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
+            raise ValueError('密码必须包含至少一个特殊符号(!@#$%^&*等)')
+
         # 可选：检查常见弱密码
         weak_passwords = [
             '12345678', 'Password1', 'Qwerty123', 'Abc12345',
@@ -387,8 +393,198 @@ class DocumentExportData(BaseData):
     filename: str
     size: int
     expiresAt: datetime
-    
 
+
+# ========== Prompt 模板相关 Schema ==========
+
+class PromptTemplateBase(BaseModel):
+    """Prompt 模板基础字段"""
+    name: str = Field(..., min_length=1, max_length=100, description="模板名称")
+    category: str = Field(..., description="分类")
+    description: Optional[str] = Field(None, max_length=500, description="描述")
+    content: str = Field(..., min_length=1, max_length=5000, description="Prompt内容")
+    variables: List[str] = Field(default_factory=list, description="变量列表")
+    
+    @field_validator('category')
+    @classmethod
+    def validate_category(cls, v):
+        """验证分类"""
+        allowed_categories = ['notice', 'bulletin', 'request', 'report', 'letter', 'meeting']
+        if v not in allowed_categories:
+            raise ValueError(f'分类必须是以下之一: {", ".join(allowed_categories)}')
+        return v
+    
+    @field_validator('variables', mode='before')
+    @classmethod
+    def ensure_variables(cls, v):
+        """确保变量列表格式正确"""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            # 如果是字符串，按逗号分割
+            return [var.strip() for var in v.split(',') if var.strip()]
+        # 去除空字符串和重复项
+        return list(set(filter(None, [var.strip() for var in v])))
+
+
+class PromptTemplateCreate(PromptTemplateBase):
+    """创建 Prompt 模板"""
+    is_active: bool = Field(default=True, description="是否启用")
+
+
+class PromptTemplateUpdate(BaseModel):
+    """更新 Prompt 模板"""
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    category: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=500)
+    content: Optional[str] = Field(None, min_length=1, max_length=5000)
+    variables: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+    
+    @field_validator('category')
+    @classmethod
+    def validate_category(cls, v):
+        if v is not None:
+            allowed_categories = ['notice', 'bulletin', 'request', 'report', 'letter', 'meeting']
+            if v not in allowed_categories:
+                raise ValueError(f'分类必须是以下之一: {", ".join(allowed_categories)}')
+        return v
+    
+    @field_validator('variables', mode='before')
+    @classmethod
+    def ensure_variables(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [var.strip() for var in v.split(',') if var.strip()]
+        return list(set(filter(None, [var.strip() for var in v])))
+
+
+class PromptTemplateResponse(BaseModel):
+    """Prompt 模板响应"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: str  # 前端需要字符串类型的 ID
+    name: str
+    category: str
+    description: Optional[str] = None
+    content: str
+    variables: List[str] = Field(default_factory=list)
+    isActive: bool
+    createdAt: str
+    updatedAt: str
+    
+    @field_validator("id", mode="before")
+    @classmethod
+    def convert_id(cls, value):
+        """将整数 ID 转为字符串"""
+        return str(value)
+    
+    @field_validator("variables", mode="before")
+    @classmethod
+    def ensure_variables(cls, value):
+        """确保变量列表"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return value
+    
+    @field_validator("createdAt", mode="before")
+    @classmethod
+    def format_created_at(cls, value):
+        """格式化创建时间"""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return value
+    
+    @field_validator("updatedAt", mode="before")
+    @classmethod
+    def format_updated_at(cls, value):
+        """格式化更新时间"""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return value
+
+
+class PromptTemplateToggle(BaseModel):
+    """切换启用状态"""
+    isActive: bool = Field(..., description="是否启用")
+
+
+class PromptTemplateBatchDelete(BaseModel):
+    """批量删除"""
+    ids: List[str] = Field(..., min_length=1, description="要删除的ID列表")
+    
+    @field_validator("ids", mode="before")
+    @classmethod
+    def convert_ids(cls, value):
+        """确保 ID 列表是字符串"""
+        if not isinstance(value, list):
+            raise ValueError("ids 必须是列表")
+        return [str(v) for v in value]
+
+
+# ========== 管理员相关 Schema ==========
+
+class UserCreateByAdmin(BaseModel):
+    """管理员创建用户"""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=72)
+    department: Optional[str] = Field(None, max_length=128)
+    role: Literal["user", "admin"] = "user"
+    
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError('用户名不能为空')
+        if v.isdigit():
+            raise ValueError('用户名不能为纯数字')
+        return v
+    
+    @field_validator('password')
+    @classmethod
+    def validate_password_strength(cls, v):
+        if len(v) < 8:
+            raise ValueError('密码长度至少8位')
+        if not any(char.isdigit() for char in v):
+            raise ValueError('密码必须包含数字')
+        if not any(char.isupper() for char in v):
+            raise ValueError('密码必须包含大写字母')
+        if not any(char.islower() for char in v):
+            raise ValueError('密码必须包含小写字母')
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
+            raise ValueError('密码必须包含特殊符号')
+        return v
+
+
+class UserListResponse(BaseModel):
+    """用户列表响应"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    user_id: str
+    username: str
+    department: Optional[str]
+    role: str
+    created_at: datetime
+
+
+class UserUpdateByAdmin(BaseModel):
+    """管理员更新用户"""
+    username: Optional[str] = Field(None, min_length=3, max_length=50)
+    department: Optional[str] = Field(None, max_length=128)
+    role: Optional[Literal["user", "admin"]] = None
+
+
+class AdminStatsResponse(BaseData):
+    """系统统计"""
+    total_users: int
+    total_admins: int
+    total_documents: int
+    total_knowledge_bases: int
+    total_conversations: int
 
 # ========== AI-rate Schema ==========
 class AIRateRequest(BaseModel):
@@ -399,3 +595,7 @@ class AIRateRequest(BaseModel):
 class AIRateResponse(BaseData):
     """响应体：仅返回 AI 生成概率（0-100）"""
     ai_rate: float
+
+
+
+

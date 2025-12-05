@@ -3,10 +3,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
-from app.config import settings
-from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm, meeting, meeting_minute
-from app.utils.logger import logger
+import asyncio
 import os
+
+from app.config import settings
+from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm, meeting, meeting_minute, prompt
+from app.services.websocket_manager import meeting_ws_manager
+from app.utils.logger import logger
 
 # app/main.py 中的 lifespan 函数需要更新
 @asynccontextmanager
@@ -20,6 +23,7 @@ async def lifespan(app: FastAPI):
     from app.services.rag_service import rag_service
     from app.services.llm_service import llm_service
     
+    meeting_ws_manager.set_event_loop(asyncio.get_running_loop())
     # 初始化 embedding_service
     await embedding_service.initialize()
     
@@ -85,6 +89,7 @@ app.include_router(conversations.router)
 app.include_router(knowledge.router)
 app.include_router(translate.router)
 app.include_router(llm.router)
+app.include_router(prompt.router)
 
 @app.get("/health")
 def health_check():

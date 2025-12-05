@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, UploadFile, Form, HTTPException
+from fastapi import APIRouter, Depends, File, UploadFile, Form, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import json
@@ -21,12 +21,29 @@ router = APIRouter(prefix="/api/knowledge", tags=["知识库管理"])
 
 @router.get("/bases", response_model=List[KnowledgeBaseResponse])
 async def list_bases(
+    include_public: bool = Query(True, description="是否包含公有知识库"),
+    only_public: bool = Query(False, description="仅查看公有知识库"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """获取知识库列表"""
-    bases = await knowledge_service.list_bases(db, current_user["user_id"])
+    """
+    获取知识库列表
+    
+    **查询参数**:
+    - include_public: 是否包含公有知识库（默认True）
+    - only_public: 仅查看公有知识库（默认False）
+    """
+    if only_public:
+        # 仅查看公有知识库
+        from app.models.database import KnowledgeBase as KnowledgeBaseModel
+        bases = db.query(KnowledgeBaseModel).filter(
+            KnowledgeBaseModel.is_public == True
+        ).order_by(KnowledgeBaseModel.created_at.desc()).all()
+    else:
+        bases = await knowledge_service.list_bases(db, current_user["user_id"], include_public)
+    
     return bases
+
 
 @router.post("/bases", response_model=KnowledgeBaseResponse)
 async def create_base(
@@ -34,7 +51,13 @@ async def create_base(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """创建知识库"""
+    """
+    创建知识库
+    
+    **权限**:
+    - 普通用户：只能创建私有知识库 (is_public=False)
+    - 管理员：可以创建公有或私有知识库
+    """
     base = await knowledge_service.create_base(db, current_user["user_id"], payload)
     return base
 

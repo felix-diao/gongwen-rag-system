@@ -1,7 +1,7 @@
 # schemas.py
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 # 会议基础信息模型
 class MeetingBase(BaseModel):
@@ -93,34 +93,74 @@ class MeetingAudioInDB(MeetingAudioBase):
 
 
 
-# 会议纪要基础模型
-class MeetingMinutesBase(BaseModel):
-    # 关联会议ID
+class MeetingSummaryBase(BaseModel):
+    summary_text: str
+
+
+class MeetingSummaryCreate(MeetingSummaryBase):
     meeting_id: int
-    # 纪要标题
-    title: str
-    # 纪要内容
-    content: str
 
-# 创建会议纪要模型
-class MeetingMinutesCreate(MeetingMinutesBase):
-    pass
 
-# 更新会议纪要模型
-class MeetingMinutesUpdate(BaseModel):
-    # 纪要标题（可选）
-    title: Optional[str] = None
-    # 纪要内容（可选）
-    content: Optional[str] = None
+class MeetingSummaryUpdate(BaseModel):
+    summary_text: Optional[str] = None
 
-# 数据库会议纪要模型
-class MeetingMinutesInDB(MeetingMinutesBase):
-    # 纪要ID
+
+class MeetingSummaryInDB(MeetingSummaryBase):
+    model_config = ConfigDict(from_attributes=True)
     id: int
-    # 创建时间
+    meeting_id: int
     created_at: datetime
-    # 更新时间
     updated_at: datetime
-    
-    class Config:
-        orm_mode = True
+
+
+class MeetingActionItemBase(BaseModel):
+    description: str
+    owner: Optional[str] = None
+    due_date: Optional[date] = None
+    status: Optional[str] = "pending"
+
+
+class MeetingActionItemCreate(MeetingActionItemBase):
+    meeting_id: Optional[int] = None
+
+
+class MeetingActionItemUpdate(BaseModel):
+    description: Optional[str] = None
+    owner: Optional[str] = None
+    due_date: Optional[date] = None
+    status: Optional[str] = None
+
+
+class MeetingActionItemInDB(MeetingActionItemBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    meeting_id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class MeetingDecisionItemBase(BaseModel):
+    description: str
+
+
+class MeetingDecisionItemCreate(MeetingDecisionItemBase):
+    meeting_id: Optional[int] = None
+
+
+class MeetingDecisionItemUpdate(BaseModel):
+    description: Optional[str] = None
+
+
+class MeetingDecisionItemInDB(MeetingDecisionItemBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    meeting_id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class MeetingInsightsResponse(BaseModel):
+    summary: Optional[MeetingSummaryInDB]
+    action_items: List[MeetingActionItemInDB] = Field(default_factory=list)
+    decision_items: List[MeetingDecisionItemInDB] = Field(default_factory=list)
+

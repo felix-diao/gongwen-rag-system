@@ -36,6 +36,7 @@ def register(
     - 必须包含至少一个大写字母
     - 必须包含至少一个小写字母
     - 必须包含至少一个数字
+    - 必须包含至少一个特殊符号如 !@#$%^&*等
     - 不能使用常见弱密码（如：Password1、12345678等）
     
     用户名要求：
@@ -117,9 +118,32 @@ def login(
     )
 
 @router.get("/me")
-def get_current_user_info(current_user: dict = Depends(get_current_user)):
-    """获取当前用户信息"""
-    return current_user
+def get_current_user_info(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    获取当前用户信息
+    
+    返回完整的用户信息，包括角色、部门等
+    """
+    # 从数据库获取完整信息
+    user = db.query(User).filter(User.user_id == current_user["user_id"]).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "role": user.role,
+        "department": user.department,
+        "created_at": user.created_at,
+        "is_admin": user.role == "admin"  # 便于前端判断
+    }
 
 @router.post("/logout", response_model=StandardResponse[LogoutResponse])
 def logout(
@@ -157,9 +181,10 @@ def change_password(
     
     密码要求：
     - 长度至少8位
-    - 必须包含大写字母
-    - 必须包含小写字母
+    - 必须包含至少一个大写字母
+    - 必须包含至少一个小写字母
     - 必须包含数字
+    - 必须包含至少一个特殊符号如 !@#$%^&*等
     - 需要验证旧密码
     - 新密码不能与旧密码相同
     """

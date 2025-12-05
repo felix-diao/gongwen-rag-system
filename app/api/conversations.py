@@ -1,20 +1,50 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from typing import List
 from app.models.database import get_db
-from app.models.schemas import ConversationFeedback
+from app.models.schemas import ConversationCreate, ConversationFeedback
 from app.services.conversation_service import conversation_service
+from app.services.embedding_service import embedding_service
 from app.utils.auth import get_current_user
 
 router = APIRouter(prefix="/api/conversations", tags=["会话管理"])
 
-@router.get("/")
+
+# =========================
+# 1. 创建会话（含向量化）
+# =========================
+@router.post("")
+async def create_conversation(
+    conv_data: ConversationCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """创建会话（包含向量入库）"""
+    if conv_data.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="禁止为其他用户创建会话")
+
+    new_conv = await conversation_service.create_conversation(db, conv_data)
+
+    return {
+        "conv_id": new_conv.conv_id,
+        "query": new_conv.query,
+        "answer": new_conv.answer,
+        "weight": new_conv.weight,
+        "liked": new_conv.liked,
+        "created_at": new_conv.created_at
+    }
+
+
+# =========================
+# 2. 列出历史会话
+# =========================
+@router.get("")
 def list_conversations(
     limit: int = 20,
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """列出历史会话"""
     conversations = conversation_service.list_conversations(
         db=db,
         user_id=current_user["user_id"],
@@ -34,13 +64,16 @@ def list_conversations(
         for conv in conversations
     ]
 
+
+# =========================
+# 3. 获取单条会话
+# =========================
 @router.get("/{conv_id}")
 def get_conversation(
     conv_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """获取会话详情"""
     conversation = conversation_service.get_conversation(db, conv_id)
     
     if not conversation:
@@ -59,6 +92,10 @@ def get_conversation(
         "created_at": conversation.created_at
     }
 
+
+# =========================
+# 4. 会话反馈（点赞 / 权重调整）
+# =========================
 @router.patch("/{conv_id}/feedback")
 def update_conversation_feedback(
     conv_id: str,
@@ -66,7 +103,6 @@ def update_conversation_feedback(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """更新会话反馈"""
     conversation = conversation_service.get_conversation(db, conv_id)
     
     if not conversation:
@@ -83,13 +119,16 @@ def update_conversation_feedback(
         "liked": updated_conv.liked
     }
 
+
+# =========================
+# 5. 删除会话（软删除 + 真实向量删除）
+# =========================
 @router.delete("/{conv_id}")
 def delete_conversation(
     conv_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """删除会话"""
     conversation = conversation_service.get_conversation(db, conv_id)
     
     if not conversation:
@@ -104,3 +143,38 @@ def delete_conversation(
         raise HTTPException(status_code=500, detail="删除失败")
     
     return {"message": "删除成功"}
+
+
+# =========================
+# 6. 历史会话向量检索
+# =========================
+@router.post("/search")
+async def search_conversations(
+    query: str,
+    top_k: int = 3,
+    current_user: dict = Depends(get_current_user)
+):
+    """基于向量搜索用户历史会话"""
+    # 生成查询向量
+    query_vector = (await embedding_service.embed_texts([query]))[0]
+
+    results = await conversation_service.search_conversations(
+        user_id=current_user["user_id"],
+        query=query,
+        query_vector=query_vector,
+        top_k=top_k
+    )
+
+    return results
+
+
+# =========================
+# 7. 获取会话统计
+# =========================
+@router.get("/statistics")
+def get_statistics(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    stats = conversation_service.get_statistics(db, current_user["user_id"])
+    return stats

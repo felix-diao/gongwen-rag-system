@@ -1,6 +1,6 @@
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, any_
+from sqlalchemy import and_, or_, any_
 from fastapi import UploadFile, HTTPException
 import os
 import uuid
@@ -9,6 +9,7 @@ from datetime import datetime
 from app.models.database import (
     KnowledgeBase as KnowledgeBaseModel,
     KnowledgeItem as KnowledgeItemModel,
+    User,
 )
 from app.models.schemas import (
     DocumentCreate,
@@ -19,6 +20,7 @@ from app.services.document_service import document_service
 from app.config import settings
 from app.utils.logger import logger
 
+
 class KnowledgeService:
     """知识库管理服务"""
     
@@ -26,13 +28,93 @@ class KnowledgeService:
         self.upload_dir = settings.UPLOAD_DIR
         os.makedirs(self.upload_dir, exist_ok=True)
     
+    # ========== 权限检查辅助方法 ==========
+    
+    def _is_admin(self, db: Session, user_id: str) -> bool:
+        """检查是否是管理员"""
+        user = db.query(User).filter(User.user_id == user_id).first()
+        return user and user.role == "admin"
+    
+    def _check_base_permission(
+        self, 
+        db: Session, 
+        user_id: str, 
+        base: KnowledgeBaseModel,
+        operation: str  # "read", "write", "delete"
+    ):
+        """
+        检查知识库操作权限
+        
+        规则:
+        - 管理员：所有权限
+        - 私有知识库：仅所有者可操作
+        - 公有知识库：所有人只读，仅管理员可写/删
+        """
+        is_admin = self._is_admin(db, user_id)
+        is_owner = base.user_id == user_id
+        
+        # 管理员拥有所有权限
+        if is_admin:
+            return
+        
+        # 公有知识库
+        if base.is_public:
+            if operation == "read":
+                return  # 所有人可读
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="公有知识库仅管理员可修改"
+                )
+        
+        # 私有知识库
+        if not is_owner:
+            raise HTTPException(
+                status_code=403,
+                detail="无权访问此知识库"
+            )
+    
     # ========== 知识库管理 ==========
     
-    async def list_bases(self, db: Session, user_id: str) -> List[KnowledgeBaseModel]:
-        """获取用户的知识库列表"""
-        return db.query(KnowledgeBaseModel).filter(
-            KnowledgeBaseModel.user_id == user_id
-        ).order_by(KnowledgeBaseModel.created_at.desc()).all()
+    async def list_bases(
+        self, 
+        db: Session, 
+        user_id: str,
+        include_public: bool = True
+    ) -> List[KnowledgeBaseModel]:
+        """
+        获取知识库列表
+        
+        Args:
+            user_id: 用户ID
+            include_public: 是否包含公有知识库（默认True）
+        
+        Returns:
+            包含用户自己的私有知识库 + 所有公有知识库（如果 include_public=True）
+        """
+        is_admin = self._is_admin(db, user_id)
+        
+        if is_admin:
+            # 管理员：查看所有知识库
+            query = db.query(KnowledgeBaseModel)
+        else:
+            # 普通用户：自己的私有知识库 + 所有公有知识库
+            if include_public:
+                query = db.query(KnowledgeBaseModel).filter(
+                    or_(
+                        KnowledgeBaseModel.user_id == user_id,
+                        KnowledgeBaseModel.is_public == True
+                    )
+                )
+            else:
+                query = db.query(KnowledgeBaseModel).filter(
+                    KnowledgeBaseModel.user_id == user_id
+                )
+        
+        return query.order_by(
+            KnowledgeBaseModel.is_public.desc(),  # 公有的在前
+            KnowledgeBaseModel.created_at.desc()
+        ).all()
     
     async def create_base(
         self, 
@@ -40,7 +122,21 @@ class KnowledgeService:
         user_id: str, 
         data: KnowledgeBaseCreate
     ) -> KnowledgeBaseModel:
-        """创建知识库"""
+        """
+        创建知识库
+        
+        权限:
+        - 普通用户：只能创建私有知识库（is_public=False）
+        - 管理员：可以创建公有或私有知识库
+        """
+        is_admin = self._is_admin(db, user_id)
+        
+        # 普通用户不能创建公有知识库
+        if data.is_public and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="仅管理员可以创建公有知识库"
+            )
         
         # 检查 key 冲突
         if data.key:
@@ -58,14 +154,16 @@ class KnowledgeService:
             name=data.name,
             key=data.key,
             description=data.description,
-            user_id=user_id
+            user_id=user_id,
+            is_public=data.is_public
         )
         
         db.add(base)
         db.commit()
         db.refresh(base)
         
-        logger.info(f"用户 {user_id} 创建知识库: {base.name} (ID: {base.id})")
+        base_type = "公有" if base.is_public else "私有"
+        logger.info(f"用户 {user_id} 创建{base_type}知识库: {base.name} (ID: {base.id})")
         return base
     
     async def update_base(
@@ -75,17 +173,30 @@ class KnowledgeService:
         base_id: int, 
         data: KnowledgeBaseUpdate
     ) -> KnowledgeBaseModel:
-        """更新知识库"""
+        """
+        更新知识库
         
+        权限:
+        - 私有知识库：仅所有者或管理员
+        - 公有知识库：仅管理员
+        """
         base = db.query(KnowledgeBaseModel).filter(
-            and_(
-                KnowledgeBaseModel.id == base_id,
-                KnowledgeBaseModel.user_id == user_id
-            )
+            KnowledgeBaseModel.id == base_id
         ).first()
         
         if not base:
             raise HTTPException(status_code=404, detail="知识库不存在")
+        
+        # 权限检查
+        self._check_base_permission(db, user_id, base, "write")
+        
+        # 普通用户不能将私有知识库改为公有
+        is_admin = self._is_admin(db, user_id)
+        if data.is_public is not None and data.is_public and not base.is_public and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="仅管理员可以将知识库设为公有"
+            )
         
         # 检查 key 冲突
         if data.key and data.key != base.key:
@@ -113,17 +224,22 @@ class KnowledgeService:
         return base
     
     async def delete_base(self, db: Session, user_id: str, base_id: int):
-        """删除知识库（级联删除所有知识项和文档）"""
+        """
+        删除知识库（级联删除所有知识项和文档）
         
+        权限:
+        - 私有知识库：仅所有者或管理员
+        - 公有知识库：仅管理员
+        """
         base = db.query(KnowledgeBaseModel).filter(
-            and_(
-                KnowledgeBaseModel.id == base_id,
-                KnowledgeBaseModel.user_id == user_id
-            )
+            KnowledgeBaseModel.id == base_id
         ).first()
         
         if not base:
             raise HTTPException(status_code=404, detail="知识库不存在")
+        
+        # 权限检查
+        self._check_base_permission(db, user_id, base, "delete")
         
         # 获取所有知识项
         items = db.query(KnowledgeItemModel).filter(
@@ -132,7 +248,6 @@ class KnowledgeService:
         
         # 删除关联的文档和文件
         for item in items:
-            # 删除文档和向量（如果已索引）
             if item.doc_id:
                 try:
                     document_service.delete_document(db, item.doc_id)
@@ -140,7 +255,6 @@ class KnowledgeService:
                 except Exception as e:
                     logger.error(f"删除文档失败: {e}")
             
-            # 删除物理文件
             try:
                 if os.path.exists(item.url):
                     os.remove(item.url)
@@ -148,11 +262,12 @@ class KnowledgeService:
             except Exception as e:
                 logger.error(f"删除文件失败: {e}")
         
-        # 删除知识库（会级联删除 knowledge_items）
+        # 删除知识库
+        base_type = "公有" if base.is_public else "私有"
         db.delete(base)
         db.commit()
         
-        logger.info(f"删除知识库: {base_id}, 共删除 {len(items)} 个知识项")
+        logger.info(f"删除{base_type}知识库: {base_id}, 共删除 {len(items)} 个知识项")
     
     # ========== 知识项管理 ==========
     
@@ -164,19 +279,25 @@ class KnowledgeService:
         tags: List[str],
         base_id: Optional[int] = None
     ) -> KnowledgeItemModel:
-        """上传文件到知识库"""
+        """
+        上传文件到知识库
         
-        # 验证知识库
+        权限:
+        - 私有知识库：仅所有者或管理员
+        - 公有知识库：仅管理员
+        """
+        
+        # 验证知识库并检查权限
         if base_id:
             base = db.query(KnowledgeBaseModel).filter(
-                and_(
-                    KnowledgeBaseModel.id == base_id,
-                    KnowledgeBaseModel.user_id == user_id
-                )
+                KnowledgeBaseModel.id == base_id
             ).first()
             
             if not base:
                 raise HTTPException(status_code=404, detail="知识库不存在")
+            
+            # 权限检查
+            self._check_base_permission(db, user_id, base, "write")
         
         # 生成文件路径
         file_ext = os.path.splitext(file.filename)[1]
@@ -213,7 +334,7 @@ class KnowledgeService:
         db.commit()
         db.refresh(item)
         
-        # ⭐ 处理空文件
+        # 处理空文件
         if file_size == 0:
             item.status = "completed"
             item.error_msg = "文件为空，已保存但未索引"
@@ -228,7 +349,7 @@ class KnowledgeService:
             logger.info(f"空文件已保存: {item.id}")
             return item
         
-        # ⭐ 检查文件格式是否支持
+        # 检查文件格式
         file_ext_lower = file_ext.lower()
         supported_types = ['.txt', '.md', '.docx', '.pdf']
         
@@ -260,7 +381,6 @@ class KnowledgeService:
                 db, doc_data, file_path, base_id, item.id
             )
             
-            # 更新知识项
             item.doc_id = document.doc_id
             item.status = "completed"
             item.error_msg = None
@@ -278,7 +398,6 @@ class KnowledgeService:
                 logger.error(f"查询 chunk 数量失败: {e}")
                 item.chunk_count = 0
             
-            # 更新知识库统计
             if base_id:
                 self._update_base_stats(db, base_id, size_delta=file_size, count_delta=1)
             
@@ -289,7 +408,6 @@ class KnowledgeService:
             item.status = "failed"
             item.error_msg = str(e)[:500]
             
-            # 即使处理失败，文件已保存，也要计数
             if base_id:
                 self._update_base_stats(db, base_id, size_delta=file_size, count_delta=1)
         
@@ -412,58 +530,95 @@ class KnowledgeService:
         tag: Optional[str] = None,
         base_id: Optional[int] = None
     ) -> List[KnowledgeItemModel]:
-        """获取知识项列表"""
+        """
+        获取知识项列表
         
-        query = db.query(KnowledgeItemModel).filter(
-            KnowledgeItemModel.user_id == user_id
-        )
+        权限:
+        - 管理员：查看所有
+        - 普通用户：查看自己的 + 公有知识库的
+        """
+        is_admin = self._is_admin(db, user_id)
+        
+        if is_admin:
+            # 管理员查看所有
+            query = db.query(KnowledgeItemModel)
+        else:
+            # 普通用户：自己的 + 公有知识库的
+            query = db.query(KnowledgeItemModel).join(
+                KnowledgeBaseModel,
+                KnowledgeItemModel.base_id == KnowledgeBaseModel.id,
+                isouter=True  # 左连接，允许 base_id 为 NULL
+            ).filter(
+                or_(
+                    KnowledgeItemModel.user_id == user_id,
+                    KnowledgeBaseModel.is_public == True
+                )
+            )
         
         if base_id is not None:
+            # 检查知识库访问权限
+            base = db.query(KnowledgeBaseModel).filter(
+                KnowledgeBaseModel.id == base_id
+            ).first()
+            
+            if base:
+                self._check_base_permission(db, user_id, base, "read")
+            
             query = query.filter(KnowledgeItemModel.base_id == base_id)
         
         if tag:
-            from sqlalchemy import any_
             query = query.filter(tag == any_(KnowledgeItemModel.tags))
         
         return query.order_by(KnowledgeItemModel.created_at.desc()).all()
     
     async def remove_item(self, db: Session, user_id: str, item_id: int):
-        """删除知识项"""
+        """
+        删除知识项
         
+        权限:
+        - 私有知识库的项：仅所有者或管理员
+        - 公有知识库的项：仅管理员
+        """
         item = db.query(KnowledgeItemModel).filter(
-            and_(
-                KnowledgeItemModel.id == item_id,
-                KnowledgeItemModel.user_id == user_id
-            )
+            KnowledgeItemModel.id == item_id
         ).first()
         
         if not item:
             raise HTTPException(status_code=404, detail="知识项不存在")
         
-        # 删除文档和向量（如果已索引）
+        # 检查权限
+        if item.base_id:
+            base = db.query(KnowledgeBaseModel).filter(
+                KnowledgeBaseModel.id == item.base_id
+            ).first()
+            
+            if base:
+                self._check_base_permission(db, user_id, base, "delete")
+        else:
+            # 没有关联知识库，检查是否是所有者或管理员
+            is_admin = self._is_admin(db, user_id)
+            if not is_admin and item.user_id != user_id:
+                raise HTTPException(status_code=403, detail="无权删除此知识项")
+        
+        # 删除文档和向量
         if item.doc_id:
             try:
                 document_service.delete_document(db, item.doc_id)
                 logger.info(f"已删除文档和向量: {item.doc_id}")
             except Exception as e:
                 logger.error(f"删除文档失败: {e}")
-        else:
-            logger.info(f"知识项 {item_id} 未索引，跳过文档删除")
         
         # 删除物理文件
         try:
             if os.path.exists(item.url):
                 os.remove(item.url)
                 logger.info(f"已删除物理文件: {item.url}")
-            else:
-                logger.warning(f"物理文件不存在: {item.url}")
         except Exception as e:
             logger.error(f"删除物理文件失败: {e}")
         
         # 更新知识库统计
         if item.base_id:
             self._update_base_stats(db, item.base_id, size_delta=-item.size, count_delta=-1)
-            logger.info(f"已更新知识库 {item.base_id} 统计")
         
         db.delete(item)
         db.commit()
@@ -477,28 +632,42 @@ class KnowledgeService:
         item_id: int,
         target_base_id: int
     ):
-        """移动知识项"""
+        """
+        移动知识项
         
+        权限:
+        - 需要对源知识库和目标知识库都有写权限
+        """
         item = db.query(KnowledgeItemModel).filter(
-            and_(
-                KnowledgeItemModel.id == item_id,
-                KnowledgeItemModel.user_id == user_id
-            )
+            KnowledgeItemModel.id == item_id
         ).first()
         
         if not item:
             raise HTTPException(status_code=404, detail="知识项不存在")
         
-        # 验证目标知识库
+        # 检查源知识库权限
+        if item.base_id:
+            source_base = db.query(KnowledgeBaseModel).filter(
+                KnowledgeBaseModel.id == item.base_id
+            ).first()
+            
+            if source_base:
+                self._check_base_permission(db, user_id, source_base, "write")
+        else:
+            # 没有源知识库，检查是否是所有者或管理员
+            is_admin = self._is_admin(db, user_id)
+            if not is_admin and item.user_id != user_id:
+                raise HTTPException(status_code=403, detail="无权移动此知识项")
+        
+        # 验证目标知识库并检查权限
         target_base = db.query(KnowledgeBaseModel).filter(
-            and_(
-                KnowledgeBaseModel.id == target_base_id,
-                KnowledgeBaseModel.user_id == user_id
-            )
+            KnowledgeBaseModel.id == target_base_id
         ).first()
         
         if not target_base:
             raise HTTPException(status_code=404, detail="目标知识库不存在")
+        
+        self._check_base_permission(db, user_id, target_base, "write")
         
         # 更新统计
         old_base_id = item.base_id
@@ -510,7 +679,7 @@ class KnowledgeService:
         
         self._update_base_stats(db, target_base_id, size_delta=item.size, count_delta=1)
         
-        # 更新 Milvus 中的 base_id（逻辑更新）
+        # 更新向量
         if item.doc_id:
             self._update_vector_base_id(item.doc_id, target_base_id, user_id)
         
@@ -525,28 +694,48 @@ class KnowledgeService:
         item_ids: List[int],
         target_base_id: int
     ) -> int:
-        """批量移动知识项"""
+        """
+        批量移动知识项
         
-        # 验证目标知识库
+        权限:
+        - 需要对所有源知识库和目标知识库都有写权限
+        """
+        # 验证目标知识库并检查权限
         target_base = db.query(KnowledgeBaseModel).filter(
-            and_(
-                KnowledgeBaseModel.id == target_base_id,
-                KnowledgeBaseModel.user_id == user_id
-            )
+            KnowledgeBaseModel.id == target_base_id
         ).first()
         
         if not target_base:
             raise HTTPException(status_code=404, detail="目标知识库不存在")
         
+        self._check_base_permission(db, user_id, target_base, "write")
+        
+        # 获取知识项
         items = db.query(KnowledgeItemModel).filter(
-            and_(
-                KnowledgeItemModel.id.in_(item_ids),
-                KnowledgeItemModel.user_id == user_id
-            )
+            KnowledgeItemModel.id.in_(item_ids)
         ).all()
         
         moved_count = 0
         for item in items:
+            # 检查源知识库权限
+            if item.base_id:
+                source_base = db.query(KnowledgeBaseModel).filter(
+                    KnowledgeBaseModel.id == item.base_id
+                ).first()
+                
+                if source_base:
+                    try:
+                        self._check_base_permission(db, user_id, source_base, "write")
+                    except HTTPException:
+                        logger.warning(f"跳过知识项 {item.id}：无权访问源知识库")
+                        continue
+            else:
+                # 没有源知识库，检查是否是所有者或管理员
+                is_admin = self._is_admin(db, user_id)
+                if not is_admin and item.user_id != user_id:
+                    logger.warning(f"跳过知识项 {item.id}：无权移动")
+                    continue
+            
             old_base_id = item.base_id
             
             # 更新统计
@@ -592,5 +781,6 @@ class KnowledgeService:
             
         except Exception as e:
             logger.error(f"更新向量 base_id 失败: {e}")
+
 
 knowledge_service = KnowledgeService()
