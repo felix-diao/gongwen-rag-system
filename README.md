@@ -95,3 +95,4 @@ docker-compose logs -f app
 ```
 ### 3. 启动流程
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
+

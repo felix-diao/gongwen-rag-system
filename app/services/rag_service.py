@@ -121,16 +121,27 @@ class RAGService:
                 partition_names=[partition_name],
                 expr="valid == true"
             )
-            
+
             for candidate in private_candidates:
                 candidate["source_type"] = "private"
                 candidate["weighted_score"] = candidate["score"] * self.private_weight
-            
+
             all_candidates.extend(private_candidates)
-            logger.info(f"私有库检索到 {len(private_candidates)} 条结果")
-            
+
+            if private_candidates:
+                logger.info(f"私有文档库检索到 {len(private_candidates)} 条结果")
+            else:
+                logger.info("私有文档库存在，但当前用户暂无可用私有文档")
+
         except Exception as e:
-            logger.error(f"私有库检索失败: {e}")
+            err_msg = str(e)
+
+            # Milvus 分区不存在：正常情况，不算错误
+            if "partition name" in err_msg and "not found" in err_msg:
+                logger.info("私有文档库暂无数据（用户尚未上传私有文档）")
+            else:
+                logger.error(f"私有文档库检索异常: {e}")
+
         
         # 检索历史会话
         if include_conversations:
@@ -150,7 +161,7 @@ class RAGService:
                 logger.info(f"历史会话检索到 {len(conv_candidates)} 条结果")
                 
             except Exception as e:
-                logger.error(f"历史会话检索失败: {e}")
+                logger.warning("历史会话检索失败，已跳过该来源", exc_info=True)
         
         # 按加权分数排序
         all_candidates.sort(key=lambda x: x["weighted_score"], reverse=True)
