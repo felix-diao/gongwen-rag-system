@@ -222,6 +222,9 @@ class PromptTemplate(Base):
     content = Column(Text, nullable=False)
     variables = Column(ARRAY(String), default=[])  # 保持与你的风格一致，使用 ARRAY
     is_active = Column(Boolean, default=True, index=True)
+
+    is_public = Column(Boolean, default=False, index=True, comment="是否为公共模板（管理员专用）")
+
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
     updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
     

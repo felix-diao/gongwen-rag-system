@@ -1,9 +1,9 @@
 from typing import List, Dict
 import re
-import logging
 from app.config import settings
+from app.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("text_processor")
 
 class TextProcessor:
     """文本处理工具"""

@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -13,7 +12,9 @@ from app.models import database, schemas2
 from app.services.meeting_service import file_service
 from app.utils.text_processor import TextProcessor
 
-logger = logging.getLogger(__name__)
+from app.utils.logger import get_logger
+
+logger = get_logger("meeting_minute_service")
 
 
 class MinutesService:

@@ -5,9 +5,12 @@ import json
 from app.models.database import get_db
 from app.models.schemas import RAGRequest, ConversationCreate
 from app.services.rag_service import rag_service
+from app.services.embedding_service import embedding_service
 from app.services.conversation_service import conversation_service
 from app.utils.auth import get_current_user
-from app.utils.logger import logger
+from app.utils.logger import get_logger
+
+logger = get_logger("rag_api")
 
 router = APIRouter(prefix="/api/rag", tags=["RAG检索生成"])
 
@@ -163,3 +166,75 @@ async def rag_query_stream(
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
     
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+@router.post("/retrieve_and_generate_debug")
+async def rag_retrieve_and_generate_debug(
+    request: RAGRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """RAG 调试接口：完整复制 retrieve_and_generate，但返回 candidates + answer"""
+    '''
+    if request.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="无权操作")
+    '''
+    try:
+        # 1. 向量化查询
+        query_vector = await embedding_service.embed_query(request.query)
+
+        # 2. 多源检索
+        candidates = await rag_service._multi_source_retrieve(
+            user_id=request.user_id,
+            query=request.query,
+            query_vector=query_vector,
+            top_k=request.top_k * 2,
+            include_conversations=request.include_conversations
+        )
+
+        if not candidates:
+            return {
+                "query": request.query,
+                "answer": "抱歉，没有找到相关的公文资料。",
+                "candidates": [],
+                "sources": [],
+                "metadata": {"retrieval_count": 0}
+            }
+
+        # 3. 重排序（可选）
+        if request.rerank and len(candidates) > request.top_k:
+            candidates = await rag_service._rerank(
+                request.query,
+                candidates,
+                request.rerank_model,
+                request.top_k
+            )
+        else:
+            candidates = candidates[:request.top_k]
+
+        # 4. 构建上下文
+        context = rag_service._build_context(candidates, request.context_token_limit)
+
+        # 5. 调用 LLM 生成答案
+        answer = await rag_service.llm_service.generate_with_context(
+            query=request.query,
+            context=context
+        )
+
+        # 6. 来源格式化
+        sources = rag_service._format_sources(candidates)
+
+        # 7. 调试接口 —— 返回 candidates + answer
+        return {
+            "query": request.query,
+            "answer": answer,
+            "candidates": candidates,   # 🌟 调试重点：包含检索的全部内容
+            "sources": sources,
+            "metadata": {
+                "retrieval_count": len(candidates),
+                "reranked": request.rerank,
+                "context_length": len(context)
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"RAG 调试接口失败: {e}")
+        raise HTTPException(status_code=500, detail=f"调试失败: {str(e)}")

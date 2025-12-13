@@ -2,6 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.models.schemas import EmbedRequest, EmbedResponse
 from app.services.embedding_service import embedding_service
 from app.utils.auth import get_current_user
+from app.utils.logger import get_logger
+
+logger = get_logger("embed_api")
 
 router = APIRouter(prefix="/api/embed", tags=["向量化"])
 

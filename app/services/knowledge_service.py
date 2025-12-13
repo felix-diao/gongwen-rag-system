@@ -18,22 +18,27 @@ from app.models.schemas import (
 )
 from app.services.document_service import document_service
 from app.config import settings
-from app.utils.logger import logger
+from app.utils.logger import get_logger  # ← 修改导入
 
 
 class KnowledgeService:
     """知识库管理服务"""
     
     def __init__(self):
+        self.logger = get_logger("knowledge_service")  # ← 创建专属 logger
         self.upload_dir = settings.UPLOAD_DIR
         os.makedirs(self.upload_dir, exist_ok=True)
+        self.logger.info(f"知识库服务初始化完成，上传目录: {self.upload_dir}")
     
     # ========== 权限检查辅助方法 ==========
     
     def _is_admin(self, db: Session, user_id: str) -> bool:
         """检查是否是管理员"""
         user = db.query(User).filter(User.user_id == user_id).first()
-        return user and user.role == "admin"
+        is_admin = user and user.role == "admin"
+        if is_admin:
+            self.logger.debug(f"用户 {user_id} 是管理员")
+        return is_admin
     
     def _check_base_permission(
         self, 
@@ -62,6 +67,9 @@ class KnowledgeService:
             if operation == "read":
                 return  # 所有人可读
             else:
+                self.logger.warning(
+                    f"用户 {user_id} 尝试对公有知识库 {base.id} 执行 {operation} 操作，权限不足"
+                )
                 raise HTTPException(
                     status_code=403,
                     detail="公有知识库仅管理员可修改"
@@ -69,6 +77,9 @@ class KnowledgeService:
         
         # 私有知识库
         if not is_owner:
+            self.logger.warning(
+                f"用户 {user_id} 尝试访问他人的私有知识库 {base.id}，权限不足"
+            )
             raise HTTPException(
                 status_code=403,
                 detail="无权访问此知识库"
@@ -97,6 +108,7 @@ class KnowledgeService:
         if is_admin:
             # 管理员：查看所有知识库
             query = db.query(KnowledgeBaseModel)
+            self.logger.info(f"管理员 {user_id} 查询所有知识库")
         else:
             # 普通用户：自己的私有知识库 + 所有公有知识库
             if include_public:
@@ -111,10 +123,16 @@ class KnowledgeService:
                     KnowledgeBaseModel.user_id == user_id
                 )
         
-        return query.order_by(
+        bases = query.order_by(
             KnowledgeBaseModel.is_public.desc(),  # 公有的在前
             KnowledgeBaseModel.created_at.desc()
         ).all()
+        
+        self.logger.info(
+            f"用户 {user_id} 查询到 {len(bases)} 个知识库 "
+            f"(include_public={include_public})"
+        )
+        return bases
     
     async def create_base(
         self, 
@@ -130,9 +148,16 @@ class KnowledgeService:
         - 管理员：可以创建公有或私有知识库
         """
         is_admin = self._is_admin(db, user_id)
+        base_type = "公有" if data.is_public else "私有"
+        
+        self.logger.info(
+            f"用户 {user_id} 创建{base_type}知识库: {data.name}, "
+            f"key={data.key}, public={data.is_public}"
+        )
         
         # 普通用户不能创建公有知识库
         if data.is_public and not is_admin:
+            self.logger.warning(f"用户 {user_id} 尝试创建公有知识库但权限不足")
             raise HTTPException(
                 status_code=403,
                 detail="仅管理员可以创建公有知识库"
@@ -148,6 +173,7 @@ class KnowledgeService:
             ).first()
             
             if existing:
+                self.logger.warning(f"知识库标识符冲突: {data.key}")
                 raise HTTPException(status_code=400, detail="知识库标识符已存在")
         
         base = KnowledgeBaseModel(
@@ -162,8 +188,9 @@ class KnowledgeService:
         db.commit()
         db.refresh(base)
         
-        base_type = "公有" if base.is_public else "私有"
-        logger.info(f"用户 {user_id} 创建{base_type}知识库: {base.name} (ID: {base.id})")
+        self.logger.info(
+            f"用户 {user_id} 创建{base_type}知识库成功: {base.name} (ID: {base.id})"
+        )
         return base
     
     async def update_base(
@@ -185,7 +212,10 @@ class KnowledgeService:
         ).first()
         
         if not base:
+            self.logger.warning(f"知识库 {base_id} 不存在")
             raise HTTPException(status_code=404, detail="知识库不存在")
+        
+        self.logger.info(f"用户 {user_id} 请求更新知识库 {base_id}: {base.name}")
         
         # 权限检查
         self._check_base_permission(db, user_id, base, "write")
@@ -193,6 +223,7 @@ class KnowledgeService:
         # 普通用户不能将私有知识库改为公有
         is_admin = self._is_admin(db, user_id)
         if data.is_public is not None and data.is_public and not base.is_public and not is_admin:
+            self.logger.warning(f"用户 {user_id} 尝试将私有知识库改为公有，权限不足")
             raise HTTPException(
                 status_code=403,
                 detail="仅管理员可以将知识库设为公有"
@@ -209,6 +240,7 @@ class KnowledgeService:
             ).first()
             
             if existing:
+                self.logger.warning(f"知识库标识符冲突: {data.key}")
                 raise HTTPException(status_code=400, detail="知识库标识符已存在")
         
         # 更新字段
@@ -220,7 +252,7 @@ class KnowledgeService:
         db.commit()
         db.refresh(base)
         
-        logger.info(f"更新知识库: {base.id}")
+        self.logger.info(f"用户 {user_id} 更新知识库成功: {base_id}")
         return base
     
     async def delete_base(self, db: Session, user_id: str, base_id: int):
@@ -236,7 +268,11 @@ class KnowledgeService:
         ).first()
         
         if not base:
+            self.logger.warning(f"知识库 {base_id} 不存在")
             raise HTTPException(status_code=404, detail="知识库不存在")
+        
+        base_type = "公有" if base.is_public else "私有"
+        self.logger.info(f"用户 {user_id} 请求删除{base_type}知识库 {base_id}: {base.name}")
         
         # 权限检查
         self._check_base_permission(db, user_id, base, "delete")
@@ -246,28 +282,37 @@ class KnowledgeService:
             KnowledgeItemModel.base_id == base_id
         ).all()
         
+        self.logger.info(f"知识库 {base_id} 包含 {len(items)} 个知识项，开始删除...")
+        
         # 删除关联的文档和文件
+        deleted_docs = 0
+        deleted_files = 0
+        
         for item in items:
             if item.doc_id:
                 try:
                     document_service.delete_document(db, item.doc_id)
-                    logger.info(f"已删除文档: {item.doc_id}")
+                    deleted_docs += 1
+                    self.logger.debug(f"已删除文档: {item.doc_id}")
                 except Exception as e:
-                    logger.error(f"删除文档失败: {e}")
+                    self.logger.error(f"删除文档失败 {item.doc_id}: {e}")
             
             try:
                 if os.path.exists(item.url):
                     os.remove(item.url)
-                    logger.info(f"已删除文件: {item.url}")
+                    deleted_files += 1
+                    self.logger.debug(f"已删除文件: {item.url}")
             except Exception as e:
-                logger.error(f"删除文件失败: {e}")
+                self.logger.error(f"删除文件失败 {item.url}: {e}")
         
         # 删除知识库
-        base_type = "公有" if base.is_public else "私有"
         db.delete(base)
         db.commit()
         
-        logger.info(f"删除{base_type}知识库: {base_id}, 共删除 {len(items)} 个知识项")
+        self.logger.info(
+            f"用户 {user_id} 删除{base_type}知识库成功: {base_id}, "
+            f"删除 {len(items)} 个知识项, {deleted_docs} 个文档, {deleted_files} 个文件"
+        )
     
     # ========== 知识项管理 ==========
     
@@ -287,6 +332,8 @@ class KnowledgeService:
         - 公有知识库：仅管理员
         """
         
+        file_size_mb = 0
+        
         # 验证知识库并检查权限
         if base_id:
             base = db.query(KnowledgeBaseModel).filter(
@@ -294,6 +341,7 @@ class KnowledgeService:
             ).first()
             
             if not base:
+                self.logger.warning(f"知识库 {base_id} 不存在")
                 raise HTTPException(status_code=404, detail="知识库不存在")
             
             # 权限检查
@@ -308,14 +356,18 @@ class KnowledgeService:
         try:
             content = await file.read()
             file_size = len(content)
+            file_size_mb = file_size / (1024 * 1024)
             
             with open(file_path, "wb") as f:
                 f.write(content)
             
-            logger.info(f"文件保存成功: {file.filename}, 大小: {file_size} 字节")
+            self.logger.info(
+                f"用户 {user_id} 上传文件: {file.filename} ({file_size_mb:.2f}MB) "
+                f"到知识库 {base_id or '默认'}"
+            )
             
         except Exception as e:
-            logger.error(f"文件保存失败: {e}")
+            self.logger.error(f"文件保存失败: {file.filename} - {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="文件保存失败")
         
         # 创建知识项记录
@@ -346,7 +398,7 @@ class KnowledgeService:
             db.commit()
             db.refresh(item)
             
-            logger.info(f"空文件已保存: {item.id}")
+            self.logger.warning(f"空文件已保存: {file.filename} (ID: {item.id})")
             return item
         
         # 检查文件格式
@@ -364,11 +416,16 @@ class KnowledgeService:
             db.commit()
             db.refresh(item)
             
-            logger.warning(f"不支持的文件格式: {file_ext}")
+            self.logger.warning(
+                f"不支持的文件格式: {file.filename} ({file_ext}), "
+                f"已保存但未索引 (ID: {item.id})"
+            )
             return item
         
         # 处理文档并索引
         try:
+            self.logger.info(f"开始处理文档: {file.filename} (ID: {item.id})")
+            
             doc_data = DocumentCreate(
                 owner_id=user_id,
                 title=file.filename,
@@ -395,16 +452,22 @@ class KnowledgeService:
                 )
                 item.chunk_count = len(results)
             except Exception as e:
-                logger.error(f"查询 chunk 数量失败: {e}")
+                self.logger.error(f"查询 chunk 数量失败: {e}")
                 item.chunk_count = 0
             
             if base_id:
                 self._update_base_stats(db, base_id, size_delta=file_size, count_delta=1)
             
-            logger.info(f"文档处理完成: {item.id}, chunks: {item.chunk_count}")
+            self.logger.info(
+                f"文档处理完成: {file.filename} (ID: {item.id}, "
+                f"doc_id: {document.doc_id}, chunks: {item.chunk_count})"
+            )
             
         except Exception as e:
-            logger.error(f"文档处理失败: {e}", exc_info=True)
+            self.logger.error(
+                f"文档处理失败: {file.filename} (ID: {item.id}) - {e}",
+                exc_info=True
+            )
             item.status = "failed"
             item.error_msg = str(e)[:500]
             
@@ -414,7 +477,6 @@ class KnowledgeService:
         db.commit()
         db.refresh(item)
         
-        logger.info(f"用户 {user_id} 上传文件: {file.filename} (ID: {item.id})")
         return item
     
     async def _create_document_with_metadata(
@@ -477,6 +539,8 @@ class KnowledgeService:
         texts = [chunk.get("chunk_content", chunk.get("text", "")) for chunk in chunks]
         embeddings = await embedding_service.embed_texts(texts)
         
+        self.logger.info(f"文档 {document.doc_id} 分块完成: {len(chunks)} 个分块")
+        
         # 构建向量数据
         timestamp = int(time.time())
         vector_data = []
@@ -521,7 +585,10 @@ class KnowledgeService:
         
         vector_service.insert_documents(collection_name, vector_data, partition_name)
         
-        logger.info(f"文档 {document.doc_id} 索引完成（base_id={base_id}, item_id={item_id}）")
+        self.logger.info(
+            f"文档 {document.doc_id} 索引完成 "
+            f"(base_id={base_id}, item_id={item_id}, chunks={len(chunks)})"
+        )
     
     async def list_items(
         self,
@@ -569,7 +636,14 @@ class KnowledgeService:
         if tag:
             query = query.filter(tag == any_(KnowledgeItemModel.tags))
         
-        return query.order_by(KnowledgeItemModel.created_at.desc()).all()
+        items = query.order_by(KnowledgeItemModel.created_at.desc()).all()
+        
+        self.logger.info(
+            f"用户 {user_id} 查询到 {len(items)} 个知识项 "
+            f"(tag={tag}, base_id={base_id})"
+        )
+        
+        return items
     
     async def remove_item(self, db: Session, user_id: str, item_id: int):
         """
@@ -584,7 +658,12 @@ class KnowledgeService:
         ).first()
         
         if not item:
+            self.logger.warning(f"知识项 {item_id} 不存在")
             raise HTTPException(status_code=404, detail="知识项不存在")
+        
+        self.logger.info(
+            f"用户 {user_id} 请求删除知识项 {item_id}: {item.original_name}"
+        )
         
         # 检查权限
         if item.base_id:
@@ -598,23 +677,24 @@ class KnowledgeService:
             # 没有关联知识库，检查是否是所有者或管理员
             is_admin = self._is_admin(db, user_id)
             if not is_admin and item.user_id != user_id:
+                self.logger.warning(f"用户 {user_id} 无权删除知识项 {item_id}")
                 raise HTTPException(status_code=403, detail="无权删除此知识项")
         
         # 删除文档和向量
         if item.doc_id:
             try:
                 document_service.delete_document(db, item.doc_id)
-                logger.info(f"已删除文档和向量: {item.doc_id}")
+                self.logger.info(f"已删除文档和向量: {item.doc_id}")
             except Exception as e:
-                logger.error(f"删除文档失败: {e}")
+                self.logger.error(f"删除文档失败 {item.doc_id}: {e}", exc_info=True)
         
         # 删除物理文件
         try:
             if os.path.exists(item.url):
                 os.remove(item.url)
-                logger.info(f"已删除物理文件: {item.url}")
+                self.logger.info(f"已删除物理文件: {item.url}")
         except Exception as e:
-            logger.error(f"删除物理文件失败: {e}")
+            self.logger.error(f"删除物理文件失败 {item.url}: {e}")
         
         # 更新知识库统计
         if item.base_id:
@@ -623,7 +703,7 @@ class KnowledgeService:
         db.delete(item)
         db.commit()
         
-        logger.info(f"知识项 {item_id} 删除完成")
+        self.logger.info(f"用户 {user_id} 删除知识项成功: {item_id}")
     
     async def move_item(
         self,
@@ -643,7 +723,13 @@ class KnowledgeService:
         ).first()
         
         if not item:
+            self.logger.warning(f"知识项 {item_id} 不存在")
             raise HTTPException(status_code=404, detail="知识项不存在")
+        
+        self.logger.info(
+            f"用户 {user_id} 移动知识项 {item_id} "
+            f"从知识库 {item.base_id} 到 {target_base_id}"
+        )
         
         # 检查源知识库权限
         if item.base_id:
@@ -657,6 +743,7 @@ class KnowledgeService:
             # 没有源知识库，检查是否是所有者或管理员
             is_admin = self._is_admin(db, user_id)
             if not is_admin and item.user_id != user_id:
+                self.logger.warning(f"用户 {user_id} 无权移动知识项 {item_id}")
                 raise HTTPException(status_code=403, detail="无权移动此知识项")
         
         # 验证目标知识库并检查权限
@@ -665,6 +752,7 @@ class KnowledgeService:
         ).first()
         
         if not target_base:
+            self.logger.warning(f"目标知识库 {target_base_id} 不存在")
             raise HTTPException(status_code=404, detail="目标知识库不存在")
         
         self._check_base_permission(db, user_id, target_base, "write")
@@ -685,7 +773,7 @@ class KnowledgeService:
         
         db.commit()
         
-        logger.info(f"移动知识项 {item_id} 到知识库 {target_base_id}")
+        self.logger.info(f"用户 {user_id} 移动知识项成功: {item_id} -> {target_base_id}")
     
     async def move_batch(
         self,
@@ -700,12 +788,17 @@ class KnowledgeService:
         权限:
         - 需要对所有源知识库和目标知识库都有写权限
         """
+        self.logger.info(
+            f"用户 {user_id} 批量移动 {len(item_ids)} 个知识项 到知识库 {target_base_id}"
+        )
+        
         # 验证目标知识库并检查权限
         target_base = db.query(KnowledgeBaseModel).filter(
             KnowledgeBaseModel.id == target_base_id
         ).first()
         
         if not target_base:
+            self.logger.warning(f"目标知识库 {target_base_id} 不存在")
             raise HTTPException(status_code=404, detail="目标知识库不存在")
         
         self._check_base_permission(db, user_id, target_base, "write")
@@ -716,6 +809,8 @@ class KnowledgeService:
         ).all()
         
         moved_count = 0
+        skipped_count = 0
+        
         for item in items:
             # 检查源知识库权限
             if item.base_id:
@@ -727,13 +822,15 @@ class KnowledgeService:
                     try:
                         self._check_base_permission(db, user_id, source_base, "write")
                     except HTTPException:
-                        logger.warning(f"跳过知识项 {item.id}：无权访问源知识库")
+                        self.logger.warning(f"跳过知识项 {item.id}：无权访问源知识库")
+                        skipped_count += 1
                         continue
             else:
                 # 没有源知识库，检查是否是所有者或管理员
                 is_admin = self._is_admin(db, user_id)
                 if not is_admin and item.user_id != user_id:
-                    logger.warning(f"跳过知识项 {item.id}：无权移动")
+                    self.logger.warning(f"跳过知识项 {item.id}：无权移动")
+                    skipped_count += 1
                     continue
             
             old_base_id = item.base_id
@@ -755,7 +852,9 @@ class KnowledgeService:
         
         db.commit()
         
-        logger.info(f"批量移动 {moved_count} 个知识项到知识库 {target_base_id}")
+        self.logger.info(
+            f"用户 {user_id} 批量移动完成: 成功 {moved_count} 个, 跳过 {skipped_count} 个"
+        )
         return moved_count
     
     # ========== 辅助方法 ==========
@@ -767,20 +866,29 @@ class KnowledgeService:
         ).first()
         
         if base:
+            old_size = base.total_size
+            old_count = base.item_count
+            
             base.total_size = max(0, base.total_size + size_delta)
             base.item_count = max(0, base.item_count + count_delta)
             base.updated_at = datetime.utcnow()
             db.commit()
+            
+            self.logger.debug(
+                f"更新知识库 {base_id} 统计: "
+                f"size {old_size} -> {base.total_size}, "
+                f"count {old_count} -> {base.item_count}"
+            )
     
     def _update_vector_base_id(self, doc_id: str, new_base_id: int, user_id: str):
         """更新 Milvus 中的 base_id（逻辑更新）"""
         try:
             # Milvus 不支持直接 UPDATE，这里只记录日志
             # 检索时通过 DB 的 item_id 来过滤
-            logger.info(f"文档 {doc_id} 的 base_id 已逻辑更新为 {new_base_id}")
+            self.logger.info(f"文档 {doc_id} 的 base_id 已逻辑更新为 {new_base_id}")
             
         except Exception as e:
-            logger.error(f"更新向量 base_id 失败: {e}")
+            self.logger.error(f"更新向量 base_id 失败: {e}")
 
 
 knowledge_service = KnowledgeService()

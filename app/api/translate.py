@@ -3,7 +3,9 @@ from typing import List
 from pydantic import BaseModel
 from app.services.llm_service import llm_service
 from app.utils.auth import get_current_user
-from app.utils.logger import logger
+from app.utils.logger import get_logger
+
+logger = get_logger("translate_api")
 
 router = APIRouter(prefix="/api/translate", tags=["翻译服务"])
 

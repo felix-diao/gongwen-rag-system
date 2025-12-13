@@ -1,3 +1,4 @@
+# app/models/schemas.py
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, List, Literal, Generic, TypeVar
 from datetime import datetime
@@ -66,8 +67,8 @@ class KnowledgeBaseResponse(BaseModel):
     name: str
     key: Optional[str] = None
     description: Optional[str] = None
-    is_public: bool  # ⭐ 新增
-    user_id: str  # ⭐ 添加创建者ID
+    is_public: bool
+    user_id: str
     item_count: Optional[int] = 0
     total_size: Optional[int] = 0
     created_at: datetime
@@ -156,10 +157,46 @@ class ConversationCreate(BaseModel):
     weight: float = 0.8
     liked: bool = False
 
+
+class ConversationResponse(BaseModel):
+    """会话响应模型"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    conv_id: str
+    query: str
+    answer: str
+    weight: float
+    liked: bool
+    created_at: datetime
+
+
 class ConversationFeedback(BaseModel):
     """会话反馈"""
     liked: Optional[bool] = None
     weight_delta: Optional[float] = None
+
+
+class ConversationSearchRequest(BaseModel):
+    """会话搜索请求"""
+    query: str
+    top_k: int = 3
+
+
+class ConversationSearchResult(BaseModel):
+    """会话搜索结果"""
+    id: str
+    query: str
+    answer: str
+    score: float
+    weight: float
+    created_at: int
+
+
+class ConversationStatistics(BaseModel):
+    """会话统计"""
+    total_conversations: int
+    liked_conversations: int
+    like_rate: float
 
 # ========== 用户认证相关 Schema ==========
 
@@ -183,7 +220,6 @@ class UserRegister(BaseModel):
         if not v:
             raise ValueError('用户名不能为空或只包含空格')
         
-        # 不允许纯数字用户名
         if v.isdigit():
             raise ValueError('用户名不能为纯数字')
         
@@ -192,14 +228,7 @@ class UserRegister(BaseModel):
     @field_validator('password')
     @classmethod
     def validate_password_strength(cls, v):
-        """
-        验证密码强度
-        要求：
-        - 长度至少8位
-        - 必须包含大写字母
-        - 必须包含小写字母
-        - 必须包含数字
-        """
+        """验证密码强度"""
         if len(v) < 8:
             raise ValueError('密码长度至少8位')
         
@@ -218,7 +247,6 @@ class UserRegister(BaseModel):
         if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
             raise ValueError('密码必须包含至少一个特殊符号(!@#$%^&*等)')
 
-        # 可选：检查常见弱密码
         weak_passwords = [
             '12345678', 'Password1', 'Qwerty123', 'Abc12345',
             'Test1234', 'Admin123', 'User1234'
@@ -248,14 +276,7 @@ class PasswordChange(BaseModel):
     @field_validator('new_password')
     @classmethod
     def validate_password_strength(cls, v):
-        """
-        验证密码强度
-        要求：
-        - 长度至少8位
-        - 必须包含大写字母
-        - 必须包含小写字母
-        - 必须包含数字
-        """
+        """验证密码强度"""
         if len(v) < 8:
             raise ValueError('密码长度至少8位')
         
@@ -274,7 +295,6 @@ class PasswordChange(BaseModel):
         if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
             raise ValueError('密码必须包含至少一个特殊符号(!@#$%^&*等)')
 
-        # 可选：检查常见弱密码
         weak_passwords = [
             '12345678', 'Password1', 'Qwerty123', 'Abc12345',
             'Test1234', 'Admin123', 'User1234'
@@ -404,7 +424,8 @@ class PromptTemplateBase(BaseModel):
     description: Optional[str] = Field(None, max_length=500, description="描述")
     content: str = Field(..., min_length=1, max_length=5000, description="Prompt内容")
     variables: List[str] = Field(default_factory=list, description="变量列表")
-    
+    is_public: bool = Field(default=False, description="是否为公共模板（仅管理员可设置）")
+
     @field_validator('category')
     @classmethod
     def validate_category(cls, v):
@@ -421,9 +442,7 @@ class PromptTemplateBase(BaseModel):
         if v is None:
             return []
         if isinstance(v, str):
-            # 如果是字符串，按逗号分割
             return [var.strip() for var in v.split(',') if var.strip()]
-        # 去除空字符串和重复项
         return list(set(filter(None, [var.strip() for var in v])))
 
 
@@ -440,6 +459,7 @@ class PromptTemplateUpdate(BaseModel):
     content: Optional[str] = Field(None, min_length=1, max_length=5000)
     variables: Optional[List[str]] = None
     is_active: Optional[bool] = None
+    is_public: Optional[bool] = None
     
     @field_validator('category')
     @classmethod
@@ -464,13 +484,15 @@ class PromptTemplateResponse(BaseModel):
     """Prompt 模板响应"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: str  # 前端需要字符串类型的 ID
+    id: str
     name: str
     category: str
     description: Optional[str] = None
     content: str
     variables: List[str] = Field(default_factory=list)
     isActive: bool
+    isPublic: bool
+    userId: str
     createdAt: str
     updatedAt: str
     
@@ -586,6 +608,7 @@ class AdminStatsResponse(BaseData):
     total_knowledge_bases: int
     total_conversations: int
 
+
 # ========== AI-rate Schema ==========
 class AIRateRequest(BaseModel):
     """请求体：传入公文/文本内容以评估 AI 生成概率"""
@@ -595,7 +618,3 @@ class AIRateRequest(BaseModel):
 class AIRateResponse(BaseData):
     """响应体：仅返回 AI 生成概率（0-100）"""
     ai_rate: float
-
-
-
-

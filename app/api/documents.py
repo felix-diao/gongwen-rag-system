@@ -8,6 +8,9 @@ from app.models.schemas import DocumentCreate, DocumentResponse, DocumentUpdate
 from app.services.document_service import document_service
 from app.utils.auth import get_current_user
 from app.config import settings
+from app.utils.logger import get_logger
+
+logger = get_logger("documents_api")
 
 router = APIRouter(prefix="/api/documents", tags=["文档管理"])
 

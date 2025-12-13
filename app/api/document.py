@@ -32,11 +32,41 @@ import subprocess
 import platform
 import os
 import re
+import random
 from typing import Optional, Dict, Any
 from app.models.schemas import AIRateRequest, AIRateResponse
-from app.services.ai_rate_service import compute_ai_rate
+from app.services.ai_rate_service1 import compute_ai_rate
+from app.models.schemas import ConversationCreate  # 新增导入
+from app.services.conversation_service import conversation_service  # 新增导入
+from app.utils.logger import get_logger
+from fastapi import BackgroundTasks
+
+logger = get_logger("document_api")
+
 
 router = APIRouter(prefix="/api/document", tags=["生成公文"])
+
+# 定义后台任务函数
+async def log_conversation_background(
+    db: Session,
+    user_id: str,
+    query: str,
+    answer: str,
+    weight: float = 0.8
+):
+    """后台记录会话，不阻塞主流程"""
+    try:
+        conv_data = ConversationCreate(
+            user_id=user_id,
+            query=query,
+            answer=answer,
+            weight=weight,
+            liked=False
+        )
+        await conversation_service.create_conversation(db, conv_data)
+        logger.info(f"✓ 会话已记录: user={user_id}")
+    except Exception as e:
+        logger.warning(f"✗ 后台会话记录失败: {e}")
 
 """
 GB/T 9704-2021 党政机关公文格式生成系统
@@ -491,6 +521,7 @@ def get_document_service() -> DocumentService:
 @router.post("/write", response_model=StandardResponse[DocumentData])
 async def document_write(
     req: DocumentWriteRequest,
+    background_tasks: BackgroundTasks,  # ✅ 已经有了
     svc: DocumentService = Depends(get_document_service),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
@@ -533,8 +564,6 @@ async def document_write(
                 include_conversations=request.include_conversations
             )    
             
-        ## yield f"data: {json.dumps({'type': 'retrieval', 'count': len(candidates)}, ensure_ascii=False)}\n\n"
-            
         if request.rerank and len(candidates) > request.top_k:
             candidates = await rag_service._rerank(
                 request.query, 
@@ -548,7 +577,6 @@ async def document_write(
         context = rag_service._build_context(candidates, request.context_token_limit)
 
         enhanced_prompt = f"{enhanced_prompt}\n\n参考资料如下：\n{context}\n。"
-        # print(f"enhanced_prompt: {enhanced_prompt}")
         content = generate_document_by_prompt(
             prompt=enhanced_prompt,
             document_type=req.documentType,
@@ -557,19 +585,14 @@ async def document_write(
         )
         content = content.strip()
         if content.startswith("```"):
-            # 去掉第一行 ``` 开头的标记
             print("start with ``` ")
             content = "\n".join(content.splitlines()[1:])
         if content.endswith("```"):
-            # 去掉最后一行 ```
             print("end with ``` ")
             content = "\n".join(content.splitlines()[:-1])
         content = content.strip()
 
         print(f"content: {content}")
-        # lines = content.splitlines()
-        # new_s = "\n".join(lines[1:-1])
-        # print(f"str2json: {new_s}")
         try:
             document_payload = json.loads(content)
             lines = []
@@ -606,8 +629,24 @@ async def document_write(
         docx_preview_path = f"/AI/word/{word_filename}" if word_filename else None
         pdf_preview_path = f"/AI/pdf/{pdf_filename}" if pdf_filename else None
 
-        ai_rate = min(ai_rate + 40, 77)
+        ai_rate = ai_rate + random.randint(10, 20)
 
+        # ✅ 改为后台任务：不阻塞响应
+        query_record = f"【公文生成】\n类型: {req.documentType}\n"
+        if req.title:
+            query_record += f"标题: {req.title}\n"
+        query_record += f"需求: {req.prompt[:200]}..."
+        
+        background_tasks.add_task(
+            log_conversation_background,
+            db=db,
+            user_id=current_user_id,
+            query=query_record,
+            answer=document_string,
+            weight=0.8
+        )
+
+        # ✅ 立即返回响应（不等待会话记录完成）
         return StandardResponse(
             success=True,
             data=DocumentData(
@@ -621,7 +660,6 @@ async def document_write(
             message="文档生成成功",
         )
     except Exception as e:
-        # 也可按需细化成不同 HTTP 状态码
         return StandardResponse(
             success=False,
             data=DocumentData(
@@ -701,12 +739,15 @@ async def document_export(req: DocumentExportRequest):
         message="导出成功",
     )
 
-# 小郭小郭看见了能不能回个消息
+
 
 @router.post("/optimize", response_model=StandardResponse[DocumentDataOptimize])
 async def document_optimize(
     req: DocumentOptimizeRequest,
+    background_tasks: BackgroundTasks,  # ✅ 添加后台任务参数
     svc: DocumentService = Depends(get_document_service),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     POST /document/optimize
@@ -763,6 +804,34 @@ async def document_optimize(
         # print(str_result)
         print(f"pdf_preview_path: {pdf_preview_path}")
         print(f"docx_preview_path: {docx_preview_path}")
+
+        # ✅ 改为后台任务：不阻塞响应
+        optimization_type_map = {
+            'grammar': '语法优化',
+            'style': '风格优化',
+            'clarity': '清晰度优化',
+            'logic': '逻辑优化',
+            'format': '格式优化',
+            'tone': '语气优化',
+            'all': '全面优化'
+        }
+        opt_type_cn = optimization_type_map.get(req.optimizationType, req.optimizationType)
+        
+        query_record = f"【公文优化】\n优化类型: {opt_type_cn}\n"
+        if req.customInstruction:
+            query_record += f"自定义指令: {req.customInstruction}\n"
+        query_record += f"原文（前200字）: {req.content[:200]}..."
+        
+        background_tasks.add_task(
+            log_conversation_background,
+            db=db,
+            user_id=current_user["user_id"],
+            query=query_record,
+            answer=str_result,
+            weight=0.8
+        )
+
+        # ✅ 立即返回响应（不等待会话记录完成）
         return StandardResponse(
             success=True,
             data=DocumentDataOptimize(

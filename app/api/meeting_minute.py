@@ -1,7 +1,7 @@
-import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -16,7 +16,9 @@ from app.utils.auth import get_current_user
 # 会议纪要相关路由
 router = APIRouter(prefix="/api/minutes", tags=["meeting_minutes"])
 
-logger = logging.getLogger(__name__)
+from app.utils.logger import get_logger
+
+logger = get_logger("meeting_minute_api")
 
 meeting_service = MeetingService()
 
@@ -95,6 +97,10 @@ def generate_meeting_insights(
     if not result:
         # raise HTTPException(status_code=500, detail="生成结构化纪要失败")
         return None
+    try:
+        logger.info("生成结构化会议纪要内容: %s", jsonable_encoder(result))
+    except Exception:  # noqa: BLE001
+        logger.exception("结构化会议纪要内容序列化失败")
     return StandardResponse(success=True, data=result, message="结构化会议纪要生成成功")
 
 
@@ -106,11 +112,33 @@ def get_meeting_insights(
 ):
     """获取结构化会议纪要（摘要/行动项/决策事项）。"""
     logger.info("获取结构化会议纪要，会议ID: %s", meeting_id)
+
+    # 1. 会议信息存在检查（不存在才是错误）
     _ensure_meeting_exists(db, meeting_id)
-    result = minutes_service.get_meeting_insights(db, meeting_id)
-    if not result:
-        return None
-    return StandardResponse(success=True, data=result, message="获取结构化会议纪要成功")
+
+    try:
+        # 2. 获取结构化纪要
+        result = minutes_service.get_meeting_insights(db, meeting_id)
+
+        # 3. 如果没有任何结构化内容，不返回错误 → 返回空结构
+        if not result:
+            result = schemas2.MeetingInsightsResponse(
+                summary=None,
+                action_items=[],
+                decision_items=[]
+            )
+
+        return StandardResponse(
+            success=True,
+            data=result,
+            message="获取结构化会议纪要成功"
+        )
+
+    except Exception as e:
+        logger.error("获取结构化会议纪要失败: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="服务器内部错误，请联系管理员")
+
+
 
 
 @router.get("/insights/{meeting_id}/summary", response_model=StandardResponse[schemas2.MeetingSummaryInDB])

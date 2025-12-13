@@ -1,7 +1,5 @@
 
 # api/meetings.py
-
-import logging
 from typing import List
 from pathlib import Path
 import shutil
@@ -15,7 +13,7 @@ from app.models import schemas2
 from app.services.meeting_service import MeetingService, FileService, AudioService
 from app.models.database import get_db
 from app.utils.auth import get_current_user
-from app.services import transcription_service
+from app.services import transcription_service,transcription_service1
 from app.services.websocket_manager import meeting_ws_manager
 from app.models.schemas import StandardResponse
 
@@ -23,7 +21,9 @@ from app.models.schemas import StandardResponse
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
 # 创建日志记录器
-logger = logging.getLogger(__name__)
+from app.utils.logger import get_logger
+
+logger = get_logger("meeting_api")
 
 # -------- 服务实例（关键改动） --------
 meeting_service = MeetingService()
@@ -327,7 +327,7 @@ def upload_meeting_audio(
         raise HTTPException(status_code=404, detail="会议未找到")
 
     # 允许的音频后缀
-    allowed_exts = {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg'}
+    allowed_exts = {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg', '.webm'}
 
     # 存储目录
     repo_root = Path(__file__).resolve().parents[2]
@@ -366,7 +366,7 @@ def upload_meeting_audio(
 
         # 后台转写
         try:
-            transcription_service.transcribe_audio_background(audio_record.id, meeting_id, str(dest_path))
+            transcription_service1.transcribe_audio_background(audio_record.id, meeting_id, str(dest_path))
         except Exception:
             logger.exception("启动后台转写失败")
 

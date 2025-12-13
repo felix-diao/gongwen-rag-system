@@ -1,12 +1,12 @@
 import asyncio
 import json
-import logging
 from collections import defaultdict
 from typing import Dict, Set
 
 from fastapi import WebSocket
+from app.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("websocket_manager")
 
 
 class MeetingTranscriptionWSManager:

@@ -2,7 +2,9 @@ from pymilvus import db, connections, Collection, CollectionSchema, FieldSchema,
 from typing import List, Dict, Optional
 import time
 from app.config import settings
-from app.utils.logger import logger
+from app.utils.logger import get_logger
+
+logger = get_logger("vector_service")
 
 class VectorService:
     """向量数据库服务"""

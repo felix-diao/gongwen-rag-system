@@ -1,4 +1,3 @@
-import logging
 from pathlib import Path
 from typing import Optional
 
@@ -6,9 +5,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.models import database, schemas2
 from app.utils.text_processor import TextProcessor
+from app.utils.logger import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger("meeting_service")
 
 
 # 会议服务类
@@ -49,11 +49,20 @@ class MeetingService:
 
     # 获取所有会议
     def get_all_meetings(self, db: Session):
-        return db.query(database.Meeting).all()
+        return (
+            db.query(database.Meeting)
+            .order_by(database.Meeting.date.desc(), database.Meeting.id.desc())
+            .all()
+        )
 
     # 根据创建者ID获取该用户创建的所有会议
     def get_meetings_by_creator(self, db: Session, creator_id: str):
-        return db.query(database.Meeting).filter(database.Meeting.creator_id == creator_id).all()
+        return (
+            db.query(database.Meeting)
+            .filter(database.Meeting.creator_id == creator_id)
+            .order_by(database.Meeting.date.desc(), database.Meeting.id.desc())
+            .all()
+        )
 
 # 文件服务类
 class FileService:

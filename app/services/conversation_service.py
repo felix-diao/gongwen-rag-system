@@ -1,4 +1,3 @@
-# app/services/conversation_service.py
 from sqlalchemy.orm import Session
 from typing import List, Dict, Optional
 import uuid
@@ -7,7 +6,7 @@ from app.models.database import Conversation
 from app.models.schemas import ConversationCreate, ConversationFeedback
 from app.services.vector_service import vector_service
 from app.services.embedding_service import embedding_service
-from app.utils.logger import logger
+from app.utils.logger import get_logger  # ← 修改导入
 
 
 class ConversationService:
@@ -18,9 +17,10 @@ class ConversationService:
         初始化对话服务
         注意：不在这里创建集合，改为延迟初始化
         """
+        self.logger = get_logger("conversation_service")  # ← 创建专属 logger
         self.collection_name = "conversations"
         self._collection_initialized = False
-        logger.info("对话服务初始化完成（延迟加载模式）")
+        self.logger.info("对话服务初始化完成（延迟加载模式）")
     
     def _ensure_collection(self):
         """
@@ -31,15 +31,15 @@ class ConversationService:
             return
         
         try:
-            logger.info(f"首次使用对话服务，检查并创建集合: {self.collection_name}")
+            self.logger.info(f"首次使用对话服务，检查并创建集合: {self.collection_name}")
             vector_service.create_collection_if_not_exists(
                 self.collection_name, 
                 is_private=True
             )
             self._collection_initialized = True
-            logger.info(f"✓ 集合 {self.collection_name} 已就绪")
+            self.logger.info(f"集合 {self.collection_name} 已就绪")
         except Exception as e:
-            logger.error(f"✗ 初始化对话集合失败: {e}")
+            self.logger.error(f"初始化对话集合失败: {e}", exc_info=True)
             raise RuntimeError(f"无法初始化对话服务: {e}")
     
     async def create_conversation(
@@ -52,6 +52,10 @@ class ConversationService:
         self._ensure_collection()
         
         conv_id = f"conv_{uuid.uuid4().hex[:16]}"
+        
+        self.logger.info(
+            f"用户 {conv_data.user_id} 创建会话: {conv_data.query[:50]}..."
+        )
         
         db_conv = Conversation(
             conv_id=conv_id,
@@ -67,61 +71,74 @@ class ConversationService:
         
         try:
             await self._ingest_conversation(db_conv)
+            self.logger.info(f"会话 {conv_id} 创建并向量化完成")
         except Exception as e:
-            logger.error(f"会话向量化失败: {e}")
+            self.logger.error(f"会话向量化失败 {conv_id}: {e}", exc_info=True)
             # 注意：这里可以选择回滚数据库事务或继续
             # 如果向量化失败但数据库记录保存成功，后续可以重试向量化
         
         return db_conv
     
     async def _ingest_conversation(self, conversation: Conversation):
-        """
-        会话向量化
-        将对话内容转换为向量并存储到 Milvus
-        """
-        # 确保集合已初始化
+        """会话向量化（支持长文本分chunk）"""
         self._ensure_collection()
         
         # 构造要向量化的文本
         text = f"问题：{conversation.query}\n回答：{conversation.answer}"
         
-        # 生成向量
+        self.logger.info(f"向量化会话: {conversation.conv_id}")
+        
+        # 生成所有chunk的向量
         embeddings = await embedding_service.embed_texts([text])
-        embedding = embeddings[0]
         
-        # 准备向量数据
+        if not embeddings or len(embeddings) == 0:
+            raise ValueError("向量生成失败")
+        
+        self.logger.info(
+            f"会话 {conversation.conv_id} 分成 {len(embeddings)} 个chunk"
+        )
+        
+        # 为每个chunk准备向量数据
         timestamp = int(time.time())
-        vector_data = [{
-            "id": conversation.conv_id,
-            "owner_id": conversation.user_id,
-            "doc_id": "",
-            "title": conversation.query[:50],  # 标题取前50字符
-            "doc_type": "conversation",
-            "filename": "",
-            "tags": "",
-            "weight": conversation.weight,
-            "valid": conversation.valid,
-            "created_at": timestamp,
-            "chunk_index": 0,
-            "chunk_content": text,
-            "embedding": embedding
-        }]
+        vector_data = []
         
-        # 为用户创建分区（如果不存在）
+        # 获取所有chunk的文本（从 embedding_service 的分块逻辑）
+        chunks = embedding_service.chunker.chunk_text(text)
+        
+        for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+            vector_data.append({
+                "id": f"{conversation.conv_id}_chunk{i}",  # 每个chunk唯一ID
+                "owner_id": conversation.user_id,
+                "doc_id": conversation.conv_id,  # 记录原始会话ID
+                "title": conversation.query[:50],
+                "doc_type": "conversation",
+                "filename": "",
+                "tags": "",
+                "weight": conversation.weight,
+                "valid": conversation.valid,
+                "created_at": timestamp,
+                "chunk_index": i,
+                "chunk_content": chunk_text,  # 保存chunk的文本
+                "embedding": embedding
+            })
+        
+        # 为用户创建分区
         partition_name = f"user_{conversation.user_id}"
         vector_service.create_partition_if_not_exists(
             self.collection_name, 
             partition_name
         )
-        
-        # 插入向量数据
+
+        # 批量插入所有chunk（一次性插入）
         vector_service.insert_documents(
             self.collection_name, 
             vector_data, 
             partition_name
         )
         
-        logger.info(f"✓ 会话 {conversation.conv_id} 向量化完成")
+        self.logger.info(
+            f"会话 {conversation.conv_id} 向量化完成（插入 {len(vector_data)} 个chunk）"
+        )
     
     async def search_conversations(
         self,
@@ -145,12 +162,16 @@ class ConversationService:
         # 确保集合已初始化
         self._ensure_collection()
         
+        self.logger.info(
+            f"用户 {user_id} 检索历史会话: {query[:30]}... (top_k={top_k})"
+        )
+        
         try:
             partition_name = f"user_{user_id}"
             
             # 检查分区是否存在
             if not vector_service.has_partition(self.collection_name, partition_name):
-                logger.info(f"用户 {user_id} 没有历史会话分区")
+                self.logger.info(f"用户 {user_id} 没有历史会话分区")
                 return []
             
             # 执行向量检索
@@ -182,13 +203,11 @@ class ConversationService:
                     "created_at": result.get("created_at", 0)
                 })
             
-            logger.info(f"为用户 {user_id} 检索到 {len(conversations)} 条历史会话")
+            self.logger.info(f"为用户 {user_id} 检索到 {len(conversations)} 条历史会话")
             return conversations
             
         except Exception as e:
-            logger.error(f"✗ 检索历史会话失败: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"检索历史会话失败: {e}", exc_info=True)
             return []
     
     def get_conversation(self, db: Session, conv_id: str) -> Optional[Conversation]:
@@ -202,9 +221,12 @@ class ConversationService:
         Returns:
             会话对象或 None
         """
-        return db.query(Conversation)\
-            .filter(Conversation.conv_id == conv_id)\
-            .first()
+        conv = db.query(Conversation).filter(Conversation.conv_id == conv_id).first()
+        if conv:
+            self.logger.debug(f"查询到会话: {conv_id}")
+        else:
+            self.logger.warning(f"会话不存在: {conv_id}")
+        return conv
     
     def list_conversations(
         self,
@@ -225,7 +247,7 @@ class ConversationService:
         Returns:
             会话列表
         """
-        return db.query(Conversation)\
+        convs = db.query(Conversation)\
             .filter(
                 Conversation.user_id == user_id, 
                 Conversation.valid == True
@@ -234,6 +256,13 @@ class ConversationService:
             .offset(offset)\
             .limit(limit)\
             .all()
+        
+        self.logger.info(
+            f"用户 {user_id} 查询历史会话列表: {len(convs)} 条 "
+            f"(limit={limit}, offset={offset})"
+        )
+        
+        return convs
     
     def update_conversation(
         self,
@@ -254,20 +283,23 @@ class ConversationService:
         """
         conv = self.get_conversation(db, conv_id)
         if not conv:
-            logger.warning(f"会话 {conv_id} 不存在")
             return None
         
         # 更新点赞状态
         if feedback.liked is not None:
             conv.liked = feedback.liked
-            logger.info(f"会话 {conv_id} 点赞状态更新为: {feedback.liked}")
+            self.logger.info(f"会话 {conv_id} 点赞状态更新为: {feedback.liked}")
         
         # 更新权重
         if feedback.weight_delta is not None:
+            old_weight = conv.weight
             new_weight = conv.weight + feedback.weight_delta
             # 限制权重范围 [0.1, 1.0]
             conv.weight = max(0.1, min(1.0, new_weight))
-            logger.info(f"会话 {conv_id} 权重调整: {conv.weight - feedback.weight_delta:.2f} -> {conv.weight:.2f}")
+            self.logger.info(
+                f"会话 {conv_id} 权重调整: {old_weight:.2f} -> {conv.weight:.2f} "
+                f"(delta: {feedback.weight_delta:+.2f})"
+            )
         
         db.commit()
         db.refresh(conv)
@@ -290,8 +322,9 @@ class ConversationService:
         
         conv = self.get_conversation(db, conv_id)
         if not conv:
-            logger.warning(f"会话 {conv_id} 不存在")
             return False
+        
+        self.logger.info(f"删除会话: {conv_id} - 用户 {conv.user_id}")
         
         # 从向量库删除
         partition_name = f"user_{conv.user_id}"
@@ -305,17 +338,17 @@ class ConversationService:
                 partition_name=partition_name
             )
             collection.flush()
-            logger.info(f"✓ 从向量库删除会话 {conv_id}")
+            self.logger.info(f"会话 {conv_id} 已从向量库删除")
             
         except Exception as e:
-            logger.error(f"✗ 从向量库删除会话失败: {e}")
+            self.logger.error(f"从向量库删除会话失败 {conv_id}: {e}", exc_info=True)
             # 向量删除失败不影响数据库软删除
         
         # 数据库软删除（标记为无效）
         conv.valid = False
         db.commit()
         
-        logger.info(f"✓ 会话 {conv_id} 已标记为删除")
+        self.logger.info(f"会话 {conv_id} 删除完成（软删除）")
         return True
     
     def get_statistics(self, db: Session, user_id: str) -> Dict:
@@ -341,11 +374,18 @@ class ConversationService:
             )\
             .count()
         
-        return {
+        stats = {
             "total_conversations": total,
             "liked_conversations": liked,
             "like_rate": round(liked / total * 100, 2) if total > 0 else 0
         }
+        
+        self.logger.info(
+            f"用户 {user_id} 统计: 总会话 {total}, 点赞 {liked}, "
+            f"点赞率 {stats['like_rate']}%"
+        )
+        
+        return stats
 
 
 # 创建全局服务实例（不立即初始化集合）

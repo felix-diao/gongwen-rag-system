@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     LLM_API_URL: str = "http://localhost:8000/v1/chat/completions"
     LLM_API_KEY: str = "your-api-key"
     LLM_MODEL: str = "gongwen-llm-v1"
+    LLM_PROVIDER: str = "deepseek"
+    LLM_BASE_URL: str = "https://api.deepseek.com/v1"
+    LLM_TIMEOUT: int = 180
+    
     
     # Embedding 模型配置 - 使用本地缓存的模型
     EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"
@@ -57,6 +61,19 @@ class Settings(BaseSettings):
     TENCENT_MEETING_SECRET_ID: str = ""
     TENCENT_MEETING_SECRET_KEY: str = ""
     TENCENT_MEETING_API_URL: str = "https://api.meeting.qq.com/v1"
+
+    # 语音转文字配置
+    WHISPER_MODEL_PATH: str
+    BEAM_SIZE: int
+    VAD_FILTER: bool
+    LANGUAGE: str
+
+    # AI率配置
+    AI_RATE_MODEL_DIR: str
+    USE_LM: bool
+
+    #日志保存时间
+    LOG_KEEP_DAYS: int = 30   # ← 加这一行
     
     class Config:
         env_file = ".env"

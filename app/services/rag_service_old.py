@@ -4,7 +4,9 @@ from app.services.vector_service import vector_service
 from app.services.embedding_service import embedding_service
 from app.services.conversation_service import conversation_service
 from app.config import settings
-from app.utils.logger import logger
+from app.utils.logger import get_logger
+
+logger = get_logger("rag_service_old")
 
 class RAGService:
     """RAG 检索增强生成服务"""

@@ -20,6 +20,9 @@ from app.utils.auth import (
 )
 from app.config import settings
 import uuid
+from app.utils.logger import get_logger
+
+logger = get_logger("admin_api")
 
 router = APIRouter(prefix="/api/auth", tags=["认证管理"])
 

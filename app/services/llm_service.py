@@ -1,11 +1,13 @@
 import httpx
 from typing import List, Dict, Optional, AsyncGenerator
 from app.config import settings
-from app.utils.logger import logger
+from app.utils.logger import get_logger
+
+logger = get_logger("llm_service")
 
 
 class LLMService:
-    """大语言模型服务（独立解耦）"""
+    """大语言模型服务"""
     
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=60.0)

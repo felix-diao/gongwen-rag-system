@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 from app.models.database import Meeting
 from app.models.schemas import MeetingCreate, MeetingUpdate
 from app.config import settings
-from app.utils.logger import logger
+from app.utils.logger import get_logger
+
+logger = get_logger("tencent_meeting_service")
 
 
 class TencentMeetingService:
