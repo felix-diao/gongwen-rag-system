@@ -103,7 +103,7 @@ def list_admins():
         
         if not admins:
             print("当前系统中没有管理员账号")
-            print("请运行脚本创建管理员: python -m app.scripts.init_admin\n")
+            print("请运行脚本创建管理员: python -m scripts.init_admin\n")
             return
         
         print("\n" + "=" * 85)
