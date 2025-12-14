@@ -44,16 +44,16 @@ def create_admin_user(username: str, password: str, department: str = "系统管
         # 检查用户是否已存在
         existing = db.query(User).filter(User.username == username).first()
         if existing:
-            print(f"\n❌ 用户 '{username}' 已存在")
-            print(f"   用户ID: {existing.user_id}")
-            print(f"   角色: {existing.role}")
-            print(f"   创建时间: {existing.created_at}\n")
+            print(f"用户 '{username}' 已存在")
+            print(f"用户ID: {existing.user_id}")
+            print(f"角色: {existing.role}")
+            print(f"创建时间: {existing.created_at}\n")
             return False
         
         # 验证密码
         is_valid, msg = validate_password(password)
         if not is_valid:
-            print(f"\n❌ {msg}\n")
+            print(f"{msg}\n")
             return False
         
         # 创建管理员
@@ -73,22 +73,22 @@ def create_admin_user(username: str, password: str, department: str = "系统管
         db.refresh(admin)
         
         print("\n" + "=" * 70)
-        print("✅ 管理员账号创建成功！")
+        print("管理员账号创建成功！")
         print("=" * 70)
-        print(f"   用户ID:     {admin.user_id}")
-        print(f"   用户名:     {admin.username}")
-        print(f"   角色:       {admin.role}")
-        print(f"   部门:       {admin.department}")
-        print(f"   创建时间:   {admin.created_at}")
+        print(f"用户ID:     {admin.user_id}")
+        print(f"用户名:     {admin.username}")
+        print(f"角色:       {admin.role}")
+        print(f"部门:       {admin.department}")
+        print(f"创建时间:   {admin.created_at}")
         print("=" * 70)
-        print("\n⚠️  请妥善保管管理员密码！")
-        print("💡 登录地址: /api/auth/login\n")
+        print("请妥善保管管理员密码！")
+        print("登录地址: /api/auth/login\n")
         
         return True
         
     except Exception as e:
         db.rollback()
-        print(f"\n❌ 创建失败: {e}\n")
+        print(f"创建失败: {e}\n")
         return False
     finally:
         db.close()
@@ -102,8 +102,8 @@ def list_admins():
         admins = db.query(User).filter(User.role == "admin").all()
         
         if not admins:
-            print("\n📋 当前系统中没有管理员账号")
-            print("💡 请运行脚本创建管理员: python -m app.scripts.init_admin\n")
+            print("当前系统中没有管理员账号")
+            print("请运行脚本创建管理员: python -m app.scripts.init_admin\n")
             return
         
         print("\n" + "=" * 85)
@@ -118,7 +118,7 @@ def list_admins():
         print(f"共 {len(admins)} 个管理员账号\n")
         
     except Exception as e:
-        print(f"\n❌ 查询失败: {e}\n")
+        print(f"查询失败: {e}\n")
     finally:
         db.close()
 
@@ -126,12 +126,12 @@ def list_admins():
 def interactive_create():
     """交互式创建管理员"""
     print("\n" + "=" * 70)
-    print("                    管理员账号创建工具")
+    print("管理员账号创建工具")
     print("=" * 70)
     
     username = input("\n请输入管理员用户名 (至少3位): ").strip()
     if not username or len(username) < 3:
-        print("❌ 用户名长度至少3位")
+        print("用户名长度至少3位")
         return
     
     print("\n密码要求:")
@@ -145,7 +145,7 @@ def interactive_create():
     confirm = getpass("请再次确认密码: ")
     
     if password != confirm:
-        print("\n❌ 两次密码输入不一致\n")
+        print("\n两次密码输入不一致\n")
         return
     
     department = input("\n请输入部门名称 [默认: 系统管理部]: ").strip()
@@ -161,7 +161,7 @@ def interactive_create():
     if confirm == 'y':
         create_admin_user(username, password, department)
     else:
-        print("\n❌ 已取消创建\n")
+        print("\n已取消创建\n")
 
 
 if __name__ == "__main__":
@@ -173,14 +173,14 @@ if __name__ == "__main__":
         epilog="""
 使用示例:
   
-  # 交互式创建管理员（推荐）
-  python -m app.scripts.init_admin
+  # 交互式创建管理员
+  python -m scripts.init_admin
   
   # 命令行快速创建
-  python -m app.scripts.init_admin -u admin -p Admin@123456! -d "系统管理部"
-  
+  python -m scripts.init_admin -u admin -p Admin@123456! -d "系统管理部"
+
   # 列出所有管理员
-  python -m app.scripts.init_admin --list
+  python -m scripts.init_admin --list
         """
     )
     

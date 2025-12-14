@@ -49,19 +49,16 @@ else
     exit 1
 fi
 
-# 2. 备份 etcd (只备份快照文件，避免 WAL 文件变化问题)
+# 2. 备份 etcd (使用 docker cp 直接从容器复制，绕过 volume 同步问题)
 log "📦 备份 etcd 配置..."
 ETCD_SNAPSHOT_NAME="snapshot-$DATE.db"
 if docker exec etcd-service etcdctl snapshot save /etcd/$ETCD_SNAPSHOT_NAME 2>/dev/null; then
-    # 等待快照文件写入完成
-    sleep 1
-    # 直接复制快照文件
-    if cp "./volumes/etcd/$ETCD_SNAPSHOT_NAME" "$BACKUP_DIR/etcd_snapshot.db" 2>/dev/null; then
+    # 使用 docker cp 直接从容器复制快照文件（避免 volume 同步延迟）
+    if docker cp "etcd-service:/etcd/$ETCD_SNAPSHOT_NAME" "$BACKUP_DIR/etcd_snapshot.db" 2>/dev/null; then
         log "✅ etcd 备份成功 ($(du -sh "$BACKUP_DIR/etcd_snapshot.db" | cut -f1))"
-        # 清理容器内的临时快照（可选，避免占用空间）
-        find "./volumes/etcd" -name "snapshot-*.db" -mtime +7 -delete 2>/dev/null || true
+        # 注意：容器内的临时快照会保留，可通过 volume 清理或手动删除
     else
-        warning "⚠️  etcd 快照创建成功，但复制失败"
+        error "❌ etcd 快照创建成功，但从容器复制失败"
     fi
 else
     warning "⚠️  etcd 备份失败（可能服务未运行）"
