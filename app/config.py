@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import List, Optional
 import os
 
 # 在导入配置之前就设置离线模式
@@ -74,6 +74,32 @@ class Settings(BaseSettings):
 
     #日志保存时间
     LOG_KEEP_DAYS: int = 30   # ← 加这一行
+
+    # 火山引擎对象存储配置
+    VOLC_TOS_ENDPOINT: str = "https://tos-cn-beijing.volces.com"
+    VOLC_TOS_REGION: str = "cn-beijing"
+    VOLC_TOS_BUCKET: str = ""
+    VOLC_TOS_PUBLIC_BASE: str = ""
+    VOLC_TOS_ACCESS_KEY_ID: str = ""
+    VOLC_TOS_SECRET_ACCESS_KEY: str = ""
+
+    # 豆包语音妙记 API 配置
+    VOLC_MINUTES_API_BASE: str = "https://openspeech.bytedance.com"
+    VOLC_MINUTES_SUBMIT_PATH: str = "/api/v3/auc/lark/submit"
+    VOLC_MINUTES_QUERY_PATH: str = "/api/v3/auc/lark/query"
+    VOLC_MINUTES_APP_KEY: str = ""
+    VOLC_MINUTES_ACCESS_KEY: str = ""
+    VOLC_MINUTES_RESOURCE_ID: str = "volc.lark.minutes"
+    VOLC_MINUTES_SOURCE_LANG: str = "zh_cn"
+    VOLC_MINUTES_SPEAKER_IDENTIFICATION: bool = False
+    VOLC_MINUTES_NUMBER_OF_SPEAKERS: int = 0
+    VOLC_MINUTES_NEED_WORD_TS: bool = False
+    VOLC_MINUTES_TIMEOUT: int = 10
+    VOLC_MINUTES_TRANSLATION_ENABLE: bool = False
+    VOLC_MINUTES_TRANSLATION_TARGET_LANG: str = "zh_cn"
+    VOLC_MINUTES_INFORMATION_EXTRACTION_TYPES: List[str] = ["todo_list", "question_answer", "transition"]
+    VOLC_MINUTES_SUMMARIZATION_TYPES: List[str] = ["summary"]
+    VOLC_MINUTES_CHAPTER_ENABLED: bool = True
     
     class Config:
         env_file = ".env"

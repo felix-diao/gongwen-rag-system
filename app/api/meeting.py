@@ -1,19 +1,23 @@
 
 # api/meetings.py
-from typing import List
+from typing import List, Optional
 from pathlib import Path
+import os
 import shutil
 import time
+import tempfile
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from sqlalchemy.orm import Session
 
 from app.models import schemas2
 from app.services.meeting_service import MeetingService, FileService, AudioService
-from app.models.database import get_db
+from app.models.database import VolcMeetingAudio, get_db
 from app.utils.auth import get_current_user
 from app.services import transcription_service,transcription_service1
+from app.services.volc_minutes_service import volc_minutes_service
 from app.services.websocket_manager import meeting_ws_manager
 from app.models.schemas import StandardResponse
 
@@ -54,8 +58,17 @@ def get_all_meetings(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    logger.info("获取所有会议列表")
-    meetings = meeting_service.get_all_meetings(db)
+    """
+    默认返回当前登录用户创建的会议，避免一次性暴露所有会议。
+    如需管理员视角查询，请使用 /mine 或 /user/{user_id} 等专用接口。
+    """
+    user_id = current_user.get("user_id")
+    logger.info("获取会议列表，请求用户: %s", user_id)
+    if not user_id:
+        logger.warning("当前会话缺少 user_id，退回获取全部会议")
+        meetings = meeting_service.get_all_meetings(db)
+    else:
+        meetings = meeting_service.get_meetings_by_creator(db, user_id)
     return StandardResponse(success=True, data=meetings, message="获取会议列表成功")
 
 
@@ -447,7 +460,6 @@ def delete_meeting_audio(
     audio = audio_service.get_audio_by_id(db, audio_id)
     if not audio or audio.meeting_id != meeting_id:
         raise HTTPException(status_code=404, detail="音频未找到")
-
     # 删除文件
     try:
         p = Path(audio.file_path)
@@ -461,6 +473,192 @@ def delete_meeting_audio(
         raise HTTPException(status_code=500, detail="删除失败")
 
     return StandardResponse(success=True, data=None, message="音频已删除")
+
+
+# 上传火山引擎模式的会议音频，仅负责上传至对象存储
+@router.post("/volc/audio/{meeting_id}", response_model=StandardResponse[schemas2.VolcMeetingAudioInDB])
+def upload_volc_meeting_audio(
+    meeting_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="音频文件不能为空")
+
+    # NOTE: Starlette parses the multipart body before entering this handler.
+    # These timings reflect server-side work (disk/TOS/DB), not client->server upload time.
+    start = time.monotonic()
+    size_bytes: Optional[int] = None
+    try:
+        file.file.seek(0, os.SEEK_END)
+        size_bytes = int(file.file.tell())
+        file.file.seek(0)
+    except Exception:
+        try:
+            file.file.seek(0)
+        except Exception:
+            pass
+
+    logger.info(
+        "Upload volc audio start meeting_id=%s filename=%r content_type=%s size_bytes=%s",
+        meeting_id,
+        file.filename,
+        file.content_type,
+        size_bytes,
+    )
+
+    temp_path: Optional[Path] = None
+    try:
+        tos_start = time.monotonic()
+        record = volc_minutes_service.upload_audio_fileobj(
+            db=db,
+            meeting_id=meeting_id,
+            upload_file=file,
+            original_name=file.filename,
+            content_type=file.content_type,
+        )
+        tos_s = time.monotonic() - tos_start
+        total_s = time.monotonic() - start
+        logger.info(
+            "Upload volc audio done meeting_id=%s audio_id=%s tos_s=%.3f total_s=%.3f file_url=%r",
+            meeting_id,
+            record.id,
+            tos_s,
+            total_s,
+            record.file_url,
+        )
+    except ValueError as exc:
+        logger.warning("上传火山音频失败: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("调用火山音频接口失败: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        # Back-compat cleanup: previous implementation wrote a temp file.
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    data = schemas2.VolcMeetingAudioInDB.model_validate(record)
+    return StandardResponse(success=True, data=data, message="音频已上传至火山对象存储")
+
+
+# 查询火山引擎模式下某会议已提交的所有音频
+@router.get("/volc/audio/{meeting_id}", response_model=StandardResponse[List[schemas2.VolcMeetingAudioInDB]])
+def list_volc_meeting_audio(
+    meeting_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+    records = (
+        db.query(VolcMeetingAudio)
+        .filter(VolcMeetingAudio.meeting_id == meeting_id)
+        .order_by(VolcMeetingAudio.created_at.desc())
+        .all()
+    )
+    data = [schemas2.VolcMeetingAudioInDB.model_validate(item) for item in records]
+    return StandardResponse(success=True, data=data, message="获取火山音频列表成功")
+
+
+# 下载火山引擎模式的会议音频
+@router.get("/volc/audio/download/{meeting_id}/{audio_id}")
+def download_volc_meeting_audio(
+    meeting_id: int,
+    audio_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    record = (
+        db.query(VolcMeetingAudio)
+        .filter(VolcMeetingAudio.id == audio_id, VolcMeetingAudio.meeting_id == meeting_id)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="音频记录未找到")
+    
+    if not record.object_key:
+         raise HTTPException(status_code=404, detail="音频文件未存储在对象存储中")
+
+    # Create temp file
+    suffix = Path(record.file_name).suffix if record.file_name else ".audio"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(tmp_fd)
+    tmp_file_path = Path(tmp_path)
+    
+    try:
+        volc_minutes_service.download_audio(record.object_key, tmp_file_path)
+    except Exception as e:
+        if tmp_file_path.exists():
+            tmp_file_path.unlink()
+        logger.error(f"Download from TOS failed: {e}")
+        raise HTTPException(status_code=500, detail=f"从对象存储下载失败: {str(e)}")
+
+    def cleanup():
+        try:
+            if tmp_file_path.exists():
+                tmp_file_path.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to delete temp file {tmp_file_path}: {e}")
+
+    filename = record.file_name or f"volc_audio_{audio_id}{suffix}"
+    return FileResponse(
+        path=str(tmp_file_path), 
+        filename=filename, 
+        media_type=record.file_type or "application/octet-stream",
+        background=BackgroundTask(cleanup)
+    )
+
+    
+
+
+@router.delete("/volc/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas2.VolcMeetingAudioInDB])
+def delete_volc_meeting_audio(
+    meeting_id: int,
+    audio_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """删除火山引擎音频记录及对象存储文件"""
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    record = (
+        db.query(VolcMeetingAudio)
+        .filter(VolcMeetingAudio.id == audio_id, VolcMeetingAudio.meeting_id == meeting_id)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="音频记录未找到")
+    
+    # 删除 TOS 文件
+    if record.object_key:
+        try:
+            volc_minutes_service.delete_audio(record.object_key)
+        except Exception as e:
+            logger.error(f"Failed to delete TOS object {record.object_key}: {e}")
+            # 即使TOS删除失败，是否继续删除数据库记录？通常建议继续，或报错。
+            # 这里选择记录错误但继续删除数据库记录，防止脏数据永远无法删除
+            
+    # 删除数据库记录
+    db.delete(record)
+    db.commit()
+    
+    data = schemas2.VolcMeetingAudioInDB.model_validate(record)
+    return StandardResponse(success=True, data=data, message="音频删除成功")
 
 
 @router.websocket("/audio/ws/{meeting_id}")

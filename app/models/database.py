@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey,DateTime
+from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -201,7 +201,7 @@ class MeetingAudio(Base):
     meeting_id = Column(Integer, index=True)
     filename = Column(String)
     file_path = Column(String)
-    file_type = Column(String)
+    file_type = Column(String) 
     uploaded_at = Column(DateTime, default=datetime.utcnow)
     transcript_text = Column(Text)
     language = Column(String(20), default="zh")
@@ -230,6 +230,47 @@ class PromptTemplate(Base):
     
     # 关联关系
     user = relationship("User", foreign_keys=[user_id])
+
+
+class VolcMeetingAudio(Base):
+    __tablename__ = "volc_meeting_audios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    file_name = Column(String(255), nullable=False)
+    object_key = Column(String(512), nullable=False)
+    file_url = Column(Text, nullable=False)
+    file_type = Column(String(64))
+    status = Column(String(32), default="uploaded", nullable=False)
+    task_id = Column(String(128), index=True)
+    error_msg = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VolcMeetingTodo(Base):
+    __tablename__ = "volc_meeting_todos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    content = Column(Text, nullable=False)
+    executor = Column(String(128))
+    execution_time = Column(String(64))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VolcMeetingSummary(Base):
+    __tablename__ = "volc_meeting_summaries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, unique=True, index=True, nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    title = Column(String(255))
+    paragraph = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 # 创建所有表

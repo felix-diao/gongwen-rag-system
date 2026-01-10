@@ -164,3 +164,67 @@ class MeetingInsightsResponse(BaseModel):
     action_items: List[MeetingActionItemInDB] = Field(default_factory=list)
     decision_items: List[MeetingDecisionItemInDB] = Field(default_factory=list)
 
+
+class VolcMeetingAudioBase(BaseModel):
+    meeting_id: int
+    file_name: str
+    object_key: str
+    file_url: str
+    file_type: Optional[str] = None
+    status: Optional[str] = None
+    task_id: Optional[str] = None
+    error_msg: Optional[str] = None
+
+
+class VolcMeetingAudioCreate(VolcMeetingAudioBase):
+    pass
+
+
+class VolcMeetingAudioInDB(VolcMeetingAudioBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class VolcMeetingTodoBase(BaseModel):
+    meeting_id: int
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class VolcMeetingTodoCreate(VolcMeetingTodoBase):
+    pass
+
+
+class VolcMeetingTodoInDB(VolcMeetingTodoBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class VolcMeetingSummaryBase(BaseModel):
+    meeting_id: int
+    title: Optional[str] = None
+    paragraph: str
+    source_audio_id: Optional[int] = None
+
+
+class VolcMeetingSummaryCreate(VolcMeetingSummaryBase):
+    pass
+
+
+class VolcMeetingSummaryInDB(VolcMeetingSummaryBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class VolcMeetingMinutesResponse(BaseModel):
+    summary: Optional[VolcMeetingSummaryInDB] = None
+    todos: List[VolcMeetingTodoInDB] = Field(default_factory=list)
+

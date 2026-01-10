@@ -95,3 +95,13 @@ dmypy.json
 
 # Project specific
 docker-compose.override.yml
+
+# local generated / runtime data
+/generated_documents/
+/meeting_files/
+/pdf/
+/txt/
+/volumes/
+/tests/
+/test_temp/
+/backups/
