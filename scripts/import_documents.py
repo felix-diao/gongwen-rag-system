@@ -52,8 +52,8 @@ async def import_documents(directory: str, doc_type: str, owner_id: str = "publi
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("使用方法: python scripts/import_documents.py <目录路径> <文档类型> [owner_id]")
-        print("示例: python scripts/import_documents.py ./data/reports 报告 public")
+        logger.error("用法: python scripts/import_documents.py <目录路径> <文档类型> [所有者ID]")
+        logger.error("Example: python scripts/import_documents.py ./data reports user123")
         sys.exit(1)
     
     directory = sys.argv[1]

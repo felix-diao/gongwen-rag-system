@@ -136,4 +136,4 @@ def compute_ai_rate(text: str) -> float:
 if __name__ == "__main__":
     text = "运载火箭可以将各种人造卫星、飞船、空间站等航天器送入太空。目前，运载火箭多为一次性运载工具。..."
     ai_rate = compute_ai_rate(text)
-    print(f"AI 率: {ai_rate}%")
+    logger.info(f"AI 率: {ai_rate}%")

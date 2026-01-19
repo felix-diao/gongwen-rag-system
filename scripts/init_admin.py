@@ -44,16 +44,11 @@ def create_admin_user(username: str, password: str, department: str = "系统管
         # 检查用户是否已存在
         existing = db.query(User).filter(User.username == username).first()
         if existing:
-            print(f"用户 '{username}' 已存在")
-            print(f"用户ID: {existing.user_id}")
-            print(f"角色: {existing.role}")
-            print(f"创建时间: {existing.created_at}\n")
             return False
         
         # 验证密码
         is_valid, msg = validate_password(password)
         if not is_valid:
-            print(f"{msg}\n")
             return False
         
         # 创建管理员

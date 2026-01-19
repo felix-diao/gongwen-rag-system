@@ -10,12 +10,38 @@ from app.utils.logger import get_logger
 
 logger = get_logger("meeting_service")
 
+import pytz
+from dateutil import parser
+SH = pytz.timezone("Asia/Shanghai")
+def to_beijing_naive(dt_val):
+    """
+    方案2：统一存北京时间（naive）
+    dt_val 可能是 str，也可能是 datetime（pydantic 解析后的）
+    """
+    if dt_val is None:
+        return None
+
+    # str -> datetime
+    if isinstance(dt_val, str):
+        dt = parser.parse(dt_val)
+    else:
+        dt = dt_val  # datetime
+
+    # 有 tz：先转上海再去 tz
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.astimezone(SH).replace(tzinfo=None)
+
+    # 无 tz：直接认为就是北京时间，保持不动
+    return dt
 
 # 会议服务类
 class MeetingService:
     # 创建会议
     def create_meeting(self, db: Session, meeting: schemas2.MeetingCreate, creator_id: str = None):
         data = meeting.dict()
+        # ✅ 关键：修正 date
+        if "date" in data:
+            data["date"] = to_beijing_naive(data["date"])
         if creator_id:
             data["creator_id"] = creator_id
         db_meeting = database.Meeting(**data)

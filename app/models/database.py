@@ -132,9 +132,9 @@ class Meeting(Base):
     # 创建者ID
     creator_id = Column(String(64), index=True)
     # 创建时间
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
     # 更新时间
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # 关联会议文件和纪要（逻辑关联，无外键约束）
     # files = relationship("MeetingFile", back_populates="meeting")
@@ -244,8 +244,8 @@ class VolcMeetingAudio(Base):
     status = Column(String(32), default="uploaded", nullable=False)
     task_id = Column(String(128), index=True)
     error_msg = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
 class VolcMeetingTodo(Base):

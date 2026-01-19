@@ -73,7 +73,7 @@ class LogCleaner:
                     
                     self.cleanup()
                 except Exception as e:
-                    print(f"[日志清理失败] {e}")
+                    print(f"[日志清理] 出错: {e}")
                     time.sleep(3600)  # 出错后1小时重试
         
         thread = threading.Thread(target=cleanup_loop, daemon=True, name="LogCleaner")

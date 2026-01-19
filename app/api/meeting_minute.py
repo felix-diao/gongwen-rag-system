@@ -134,7 +134,7 @@ def get_meeting_insights(
                 decision_items=[]
             )
         
-        print("Get meeting insights result:", jsonable_encoder(result))
+        logger.info("获取结构化会议纪要成功，会议ID: %s", meeting_id)
 
         return StandardResponse(
             success=True,
@@ -353,7 +353,7 @@ def list_volc_minutes(
     _ensure_meeting_exists(db, meeting_id)
     minutes = volc_minutes_service.get_minutes(db, meeting_id)
     if minutes.summary or minutes.todos:
-        print("Volc minutes (cached):", jsonable_encoder(minutes))
+        logger.info("Volc minutes (existing): %s", jsonable_encoder(minutes))
         return StandardResponse(success=True, data=minutes, message="获取火山纪要数据成功")
 
     audio = (
@@ -375,7 +375,7 @@ def list_volc_minutes(
         refreshed_minutes if refreshed_minutes else volc_minutes_service.get_minutes(db, updated_audio.meeting_id)
     )
     if completed:
-        print("Volc minutes (refreshed):", jsonable_encoder(final_minutes))
+        logger.info("Volc minutes (refreshed completed): %s", jsonable_encoder(final_minutes))
     message_text = "火山纪要已完成" if completed else "火山纪要处理中"
     return StandardResponse(success=True, data=final_minutes, message=message_text)
 

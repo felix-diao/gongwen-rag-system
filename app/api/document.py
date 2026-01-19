@@ -352,7 +352,6 @@ class OfficialDocumentGenerator:
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.doc.save(path)
-        print(f"Word文档已保存: {path}")
         return str(path)
     
     def save_pdf(self, docx_file, pdf_file='official_document.pdf'):
@@ -419,25 +418,24 @@ class OfficialDocumentGenerator:
                 if not output_candidate.exists():
                     output_candidate = pdf_path.parent / f"{docx_path.stem}.pdf"
                 if output_candidate.exists():
-                    print(f"PDF文档已保存: {output_candidate}")
                     return str(output_candidate)
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr.decode(errors="ignore") if e.stderr else ""
-                print(f"PDF转换失败（{label}）：{error_msg}")
+                logger.warning(f"PDF转换失败（{label}）：{error_msg}")
 
         # Linux 下 docx2pdf 依赖 Microsoft Word，会直接失败，因此跳过
         if platform.system().lower() not in {"linux"}:
             try:
                 from docx2pdf import convert
                 convert(str(docx_path), str(pdf_path))
-                print(f"PDF文档已保存: {pdf_path}")
+                logger.info("PDF转换成功（docx2pdf）")
                 return str(pdf_path)
             except ImportError:
-                print("请安装docx2pdf: pip install docx2pdf")
+                logger.warning("docx2pdf 未安装，跳过该转换方式")
             except Exception as e:
-                print(f"PDF转换失败（docx2pdf）：{e}")
+                logger.warning(f"PDF转换失败（docx2pdf）：{e}")
 
-        print("PDF转换失败：请安装 LibreOffice（提供 soffice/libreoffice 命令）或 unoconv。")
+        logger.error("未找到可用的PDF转换工具，转换失败")
         return None
 
 
@@ -585,14 +583,11 @@ async def document_write(
         )
         content = content.strip()
         if content.startswith("```"):
-            print("start with ``` ")
             content = "\n".join(content.splitlines()[1:])
         if content.endswith("```"):
-            print("end with ``` ")
             content = "\n".join(content.splitlines()[:-1])
         content = content.strip()
 
-        print(f"content: {content}")
         try:
             document_payload = json.loads(content)
             lines = []
@@ -707,7 +702,6 @@ async def document_export(req: DocumentExportRequest):
                 )
             file_path = Path(pdf_result)
             url = f"/AI/pdf/{file_path.name}"
-            print(f"pdf_path: {pdf_path}")
         elif req.format == "txt":
             txt_dir.mkdir(parents=True, exist_ok=True)
             file_path = txt_dir / f"{base_name}.txt"
@@ -802,8 +796,6 @@ async def document_optimize(
         docx_preview_path = f"/AI/word/{word_filename}" if word_filename else None
         pdf_preview_path = f"/AI/pdf/{pdf_filename}" if pdf_filename else None
         # print(str_result)
-        print(f"pdf_preview_path: {pdf_preview_path}")
-        print(f"docx_preview_path: {docx_preview_path}")
 
         # ✅ 改为后台任务：不阻塞响应
         optimization_type_map = {
@@ -843,7 +835,7 @@ async def document_optimize(
             message="OK"
         )
     except Exception as e:
-        print(f"优化失败：{e}")
+        logger.error(f"公文优化失败：{e}")
         return StandardResponse(
             success=False,
             data=DocumentDataOptimize(content=""),
