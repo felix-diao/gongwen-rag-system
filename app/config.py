@@ -75,6 +75,14 @@ class Settings(BaseSettings):
     #日志保存时间
     LOG_KEEP_DAYS: int = 30   # ← 加这一行
 
+    # 火山引擎大模型流式语音识别 (Functionality 1)
+    # 资源ID：小时版 volc.bigasr.sauc.duration；并发版 volc.bigasr.sauc.concurrent
+    VOLC_ASR_RESOURCE_ID: str = "volc.bigasr.sauc.duration"
+    VOLC_ASR_APP_KEY: str = ""
+    VOLC_ASR_ACCESS_KEY: str = ""
+    # 实时录音保存目录（留空则使用 UPLOAD_DIR/asr_recordings）
+    VOLC_ASR_AUDIO_SAVE_DIR: str = ""
+
     # 火山引擎对象存储配置
     VOLC_TOS_ENDPOINT: str = "https://tos-cn-beijing.volces.com"
     VOLC_TOS_REGION: str = "cn-beijing"
@@ -87,8 +95,8 @@ class Settings(BaseSettings):
     VOLC_MINUTES_API_BASE: str = "https://openspeech.bytedance.com"
     VOLC_MINUTES_SUBMIT_PATH: str = "/api/v3/auc/lark/submit"
     VOLC_MINUTES_QUERY_PATH: str = "/api/v3/auc/lark/query"
-    VOLC_MINUTES_APP_KEY: str = ""
-    VOLC_MINUTES_ACCESS_KEY: str = ""
+    VOLC_MINUTES_APP_KEY: str = "7348432775"
+    VOLC_MINUTES_ACCESS_KEY: str = "AH0yQdtRt-FFj7Iq_hQT--GewVFLVYYj"
     VOLC_MINUTES_RESOURCE_ID: str = "volc.lark.minutes"
     VOLC_MINUTES_SOURCE_LANG: str = "zh_cn"
     VOLC_MINUTES_SPEAKER_IDENTIFICATION: bool = False

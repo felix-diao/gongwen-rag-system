@@ -165,6 +165,28 @@ class MeetingInsightsResponse(BaseModel):
     decision_items: List[MeetingDecisionItemInDB] = Field(default_factory=list)
 
 
+# ── 火山引擎大模型流式 ASR 会话 ─────────────────────────────────────────────
+
+class VolcAsrSessionBase(BaseModel):
+    meeting_id: int
+    session_type: str = "file"        # "file" | "live"
+    status: str = "pending"           # pending / processing / completed / failed
+    transcript_text: Optional[str] = None
+    audio_local_path: Optional[str] = None
+    audio_filename: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    error_msg: Optional[str] = None
+
+
+class VolcAsrSessionInDB(VolcAsrSessionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+# ── 火山引擎 TOS 音频（用于语音妙记）────────────────────────────────────────
+
 class VolcMeetingAudioBase(BaseModel):
     meeting_id: int
     file_name: str
@@ -174,6 +196,8 @@ class VolcMeetingAudioBase(BaseModel):
     status: Optional[str] = None
     task_id: Optional[str] = None
     error_msg: Optional[str] = None
+    transcript_text: Optional[str] = None
+    source_asr_session_id: Optional[int] = None
 
 
 class VolcMeetingAudioCreate(VolcMeetingAudioBase):
@@ -186,6 +210,8 @@ class VolcMeetingAudioInDB(VolcMeetingAudioBase):
     created_at: datetime
     updated_at: datetime
 
+
+# ── 语音妙记结果（Todos / Summary）──────────────────────────────────────────
 
 class VolcMeetingTodoBase(BaseModel):
     meeting_id: int
@@ -224,7 +250,48 @@ class VolcMeetingSummaryInDB(VolcMeetingSummaryBase):
     updated_at: datetime
 
 
+class SpeakerSegment(BaseModel):
+    """单段说话人转写"""
+    speaker: str
+    text: str
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
+
+
 class VolcMeetingMinutesResponse(BaseModel):
+    """语音妙记完整结果：精准转写 + 说话人分段 + 摘要 + Todos"""
+    transcript_text: Optional[str] = None
+    speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
     summary: Optional[VolcMeetingSummaryInDB] = None
     todos: List[VolcMeetingTodoInDB] = Field(default_factory=list)
+
+
+class VolcTranscriptUpdate(BaseModel):
+    """修改会议转写文本"""
+    transcript_text: str
+
+
+# ── 流式 ASR 逐段文本 ─────────────────────────────────────────────────────────
+
+class VolcAudioTranscriptionBase(BaseModel):
+    meeting_id: Optional[int] = None
+    source_session_id: Optional[int] = None
+    source_audio_id: Optional[int] = None
+    text: str
+    is_final: Optional[bool] = False
+    provider: Optional[str] = "volc"
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+
+
+class VolcAudioTranscriptionCreate(VolcAudioTranscriptionBase):
+    pass
+
+
+class VolcAudioTranscriptionInDB(VolcAudioTranscriptionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
 

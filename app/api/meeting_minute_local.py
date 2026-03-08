@@ -7,24 +7,18 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.models import schemas2
-from app.models.database import (
-    MeetingAudio,
-    MeetingFile,
-    VolcMeetingAudio,
-    get_db,
-)
+from app.models.database import MeetingAudio, MeetingFile, get_db
 from app.models.schemas import StandardResponse
 from app.services.meeting_minute_service import minutes_service
 from app.services.meeting_service import MeetingService
-from app.services.volc_minutes_service import volc_minutes_service
 from app.utils.auth import get_current_user
 
-# 会议纪要相关路由
-router = APIRouter(prefix="/api/minutes", tags=["meeting_minutes"])
+# 本地模型会议纪要路由
+router = APIRouter(prefix="/api/minutes", tags=["meeting_minutes_local"])
 
 from app.utils.logger import get_logger
 
-logger = get_logger("meeting_minute_api")
+logger = get_logger("meeting_minute_local_api")
 
 meeting_service = MeetingService()
 
@@ -101,7 +95,6 @@ def generate_meeting_insights(
         audio_segments=audio_segments,
     )
     if not result:
-        # raise HTTPException(status_code=500, detail="生成结构化纪要失败")
         return None
     try:
         logger.info("生成结构化会议纪要内容: %s", jsonable_encoder(result))
@@ -119,21 +112,18 @@ def get_meeting_insights(
     """获取结构化会议纪要（摘要/行动项/决策事项）。"""
     logger.info("获取结构化会议纪要，会议ID: %s", meeting_id)
 
-    # 1. 会议信息存在检查（不存在才是错误）
     _ensure_meeting_exists(db, meeting_id)
 
     try:
-        # 2. 获取结构化纪要
         result = minutes_service.get_meeting_insights(db, meeting_id)
 
-        # 3. 如果没有任何结构化内容，不返回错误 → 返回空结构
         if not result:
             result = schemas2.MeetingInsightsResponse(
                 summary=None,
                 action_items=[],
                 decision_items=[]
             )
-        
+
         logger.info("获取结构化会议纪要成功，会议ID: %s", meeting_id)
 
         return StandardResponse(
@@ -145,8 +135,6 @@ def get_meeting_insights(
     except Exception as e:
         logger.error("获取结构化会议纪要失败: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail="服务器内部错误，请联系管理员")
-
-
 
 
 @router.get("/insights/{meeting_id}/summary", response_model=StandardResponse[schemas2.MeetingSummaryInDB])
@@ -319,67 +307,6 @@ def delete_decision_item(
     return StandardResponse(success=True, data=None, message="删除决策事项成功")
 
 
-@router.post("/volc/audio/{audio_id}/submit", response_model=StandardResponse[schemas2.VolcMeetingAudioInDB])
-def submit_volc_meeting_audio(
-    audio_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    audio = db.query(VolcMeetingAudio).filter(VolcMeetingAudio.id == audio_id).first()
-    if not audio:
-        raise HTTPException(status_code=404, detail="火山音频未找到")
-    _ensure_meeting_exists(db, audio.meeting_id)
-
-    try:
-        record = volc_minutes_service.submit_audio(db=db, audio_id=audio_id)
-    except ValueError as exc:
-        message_text = str(exc)
-        logger.warning("提交火山音频失败: %s", message_text)
-        raise HTTPException(status_code=400, detail=message_text) from exc
-    except RuntimeError as exc:
-        logger.error("调用火山音频接口失败: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    data = schemas2.VolcMeetingAudioInDB.model_validate(record)
-    return StandardResponse(success=True, data=data, message="音频已提交至火山引擎处理")
-
-
-@router.get("/volc/{meeting_id}", response_model=StandardResponse[schemas2.VolcMeetingMinutesResponse])
-def list_volc_minutes(
-    meeting_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    _ensure_meeting_exists(db, meeting_id)
-    minutes = volc_minutes_service.get_minutes(db, meeting_id)
-    if minutes.summary or minutes.todos:
-        logger.info("Volc minutes (existing): %s", jsonable_encoder(minutes))
-        return StandardResponse(success=True, data=minutes, message="获取火山纪要数据成功")
-
-    audio = (
-        db.query(VolcMeetingAudio)
-        .filter(VolcMeetingAudio.meeting_id == meeting_id)
-        .filter(VolcMeetingAudio.task_id.isnot(None))
-        .order_by(VolcMeetingAudio.created_at.desc())
-        .first()
-    )
-    if not audio:
-        return StandardResponse(success=True, data=minutes, message="火山纪要尚未生成，请稍后再试")
-
-    try:
-        updated_audio, completed, refreshed_minutes = volc_minutes_service.refresh_minutes(db, audio.id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    final_minutes = (
-        refreshed_minutes if refreshed_minutes else volc_minutes_service.get_minutes(db, updated_audio.meeting_id)
-    )
-    if completed:
-        logger.info("Volc minutes (refreshed completed): %s", jsonable_encoder(final_minutes))
-    message_text = "火山纪要已完成" if completed else "火山纪要处理中"
-    return StandardResponse(success=True, data=final_minutes, message=message_text)
-
-
 @router.get("/insights/export/docx/{meeting_id}")
 def export_insights_docx(
     meeting_id: int,
@@ -395,66 +322,3 @@ def export_insights_docx(
         filename=file_path.name,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
-
-
-# 更新火山引擎模式的会议摘要
-@router.put("/volc/{meeting_id}/summary", response_model=StandardResponse[schemas2.VolcMeetingSummaryInDB])
-def update_volc_summary(
-    meeting_id: int,
-    payload: schemas2.VolcMeetingSummaryCreate = Body(...),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """更新火山会议摘要。"""
-    _ensure_meeting_exists(db, meeting_id)
-    summary = volc_minutes_service.update_summary(db, meeting_id, payload)
-    data = schemas2.VolcMeetingSummaryInDB.model_validate(summary)
-    return StandardResponse(success=True, data=data, message="火山会议摘要更新成功")
-
-
-# 新增火山引擎模式的待办事项
-@router.post("/volc/{meeting_id}/todos", response_model=StandardResponse[schemas2.VolcMeetingTodoInDB])
-def create_volc_todo(
-    meeting_id: int,
-    payload: schemas2.VolcMeetingTodoCreate = Body(...),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    _ensure_meeting_exists(db, meeting_id)
-    todo = volc_minutes_service.create_todo(db, meeting_id, payload)
-    data = schemas2.VolcMeetingTodoInDB.model_validate(todo)
-    return StandardResponse(success=True, data=data, message="新增待办事项成功")
-
-
-# 更新火山引擎模式的待办事项
-@router.put("/volc/{meeting_id}/todos/{todo_id}", response_model=StandardResponse[schemas2.VolcMeetingTodoInDB])
-def update_volc_todo(
-    meeting_id: int,
-    todo_id: int,
-    payload: schemas2.VolcMeetingTodoCreate = Body(...),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    _ensure_meeting_exists(db, meeting_id)
-    todo = volc_minutes_service.update_todo(db, meeting_id, todo_id, payload)
-    if not todo:
-         raise HTTPException(status_code=404, detail="待办事项未找到")
-    
-    data = schemas2.VolcMeetingTodoInDB.model_validate(todo)
-    return StandardResponse(success=True, data=data, message="更新待办事项成功")
-
-
-# 删除火山引擎模式的待办事项
-@router.delete("/volc/{meeting_id}/todos/{todo_id}", response_model=StandardResponse[None])
-def delete_volc_todo(
-    meeting_id: int,
-    todo_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    _ensure_meeting_exists(db, meeting_id)
-    success = volc_minutes_service.delete_todo(db, meeting_id, todo_id)
-    if not success:
-         raise HTTPException(status_code=404, detail="待办事项未找到")
-
-    return StandardResponse(success=True, data=None, message="删除待办事项成功")

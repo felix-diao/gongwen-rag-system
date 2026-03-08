@@ -17,6 +17,14 @@ from app.models import database, schemas2
 from app.services.websocket_manager import meeting_ws_manager
 from app.utils.logger import get_logger
 
+# 火山引擎 TOS / ASR 域名需绕过系统代理直连，否则在配置了本地代理的环境下会 Connection refused
+_VOLC_NO_PROXY_DOMAINS = "volces.com,bytedance.com,openspeech.bytedance.com"
+for _env_key in ("NO_PROXY", "no_proxy"):
+    _existing = os.environ.get(_env_key, "")
+    _missing = [d for d in _VOLC_NO_PROXY_DOMAINS.split(",") if d not in _existing]
+    if _missing:
+        os.environ[_env_key] = ",".join(filter(None, [_existing] + _missing))
+
 try:
     import boto3  # type: ignore
     from botocore.config import Config  # type: ignore
@@ -751,6 +759,7 @@ class VolcMinutesService:
             for item in todo_records:
                 db.refresh(item)
             minutes = schemas2.VolcMeetingMinutesResponse(
+                transcript_text=audio.transcript_text,
                 summary=schemas2.VolcMeetingSummaryInDB.model_validate(summary_record) if summary_record else None,
                 todos=[schemas2.VolcMeetingTodoInDB.model_validate(item) for item in todo_records],
             )
@@ -772,7 +781,30 @@ class VolcMinutesService:
             .order_by(database.VolcMeetingTodo.id.asc())
             .all()
         )
+        # 取最新完成的 VolcMeetingAudio 的 transcript_text
+        latest_audio = (
+            db.query(database.VolcMeetingAudio)
+            .filter(
+                database.VolcMeetingAudio.meeting_id == meeting_id,
+                database.VolcMeetingAudio.transcript_text.isnot(None),
+            )
+            .order_by(database.VolcMeetingAudio.updated_at.desc())
+            .first()
+        )
+        transcript_text = latest_audio.transcript_text if latest_audio else None
+
+        # 解析说话人分段
+        speaker_segments: list = []
+        if latest_audio and latest_audio.speaker_transcript:
+            try:
+                raw_segs = json.loads(latest_audio.speaker_transcript)
+                speaker_segments = [schemas2.SpeakerSegment(**seg) for seg in raw_segs]
+            except Exception as exc:
+                logger.warning("Failed to parse speaker_transcript audio_id=%s: %s", latest_audio.id, exc)
+
         return schemas2.VolcMeetingMinutesResponse(
+            transcript_text=transcript_text,
+            speaker_segments=speaker_segments,
             summary=schemas2.VolcMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas2.VolcMeetingTodoInDB.model_validate(item) for item in todos],
         )
@@ -800,6 +832,27 @@ class VolcMinutesService:
         db.commit()
         db.refresh(summary)
         return summary
+
+    def clear_minutes(self, db: Session, meeting_id: int) -> None:
+        """
+        清空指定会议的所有妙记内容：摘要、Todos、以及所有 TOS 音频记录上的转写文本。
+        在每次新建 ASR 任务开始时调用，确保新一轮转写与摘要的一致性。
+        """
+        db.query(database.VolcMeetingSummary).filter(
+            database.VolcMeetingSummary.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+
+        db.query(database.VolcMeetingTodo).filter(
+            database.VolcMeetingTodo.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+
+        # 清空所有音频记录上的转写文本（新转写完成后会重新写入）
+        db.query(database.VolcMeetingAudio).filter(
+            database.VolcMeetingAudio.meeting_id == meeting_id
+        ).update({"transcript_text": None}, synchronize_session=False)
+
+        db.commit()
+        logger.info("Cleared minutes for meeting_id=%s", meeting_id)
 
     def delete_summary(self, db: Session, meeting_id: int) -> bool:
         summary = (
@@ -950,6 +1003,113 @@ class VolcMinutesService:
         file_url = uploader.upload_file(upload_path, object_key, content_type)
         return object_key, file_url
 
+    def upload_from_local(
+        self,
+        db: Session,
+        meeting_id: int,
+        local_path: Path,
+        original_name: str,
+        content_type: Optional[str],
+        source_asr_session_id: Optional[int] = None,
+    ) -> database.VolcMeetingAudio:
+        """将本地音频文件上传至 TOS，创建 VolcMeetingAudio 记录（供功能2使用）。"""
+        object_key, file_url = self._upload_to_tos(meeting_id, local_path, original_name, content_type)
+        audio_record = database.VolcMeetingAudio(
+            meeting_id=meeting_id,
+            file_name=original_name,
+            object_key=object_key,
+            file_url=file_url,
+            file_type=content_type,
+            status="uploaded",
+            source_asr_session_id=source_asr_session_id,
+        )
+        db.add(audio_record)
+        db.commit()
+        db.refresh(audio_record)
+        logger.info(
+            "Volc audio uploaded from local session_id=%s audio_id=%s meeting_id=%s",
+            source_asr_session_id, audio_record.id, meeting_id,
+        )
+        return audio_record
+
+    @staticmethod
+    def _parse_speaker_segments(transcript_payload) -> List[Dict]:
+        """
+        从妙记转写 JSON 中提取说话人分段。
+        支持格式：
+          - 列表：[{"speaker_id":"S_0","text":"...","start_time":0,"end_time":1500}, ...]
+          - 字典：{"utterances": [...]} 或 {"sentences": [...]}
+        返回：[{"speaker":"说话人1","text":"...","start_ms":0,"end_ms":1500}, ...]
+        若无说话人信息则返回空列表。
+        """
+        utterances: List = []
+        if isinstance(transcript_payload, list):
+            utterances = transcript_payload
+        elif isinstance(transcript_payload, dict):
+            utterances = (
+                transcript_payload.get("utterances")
+                or transcript_payload.get("sentences")
+                or transcript_payload.get("results")
+                or []
+            )
+
+        if not utterances:
+            return []
+
+        has_speaker = any(
+            isinstance(u, dict) and (u.get("speaker_id") or u.get("speaker"))
+            for u in utterances
+        )
+        if not has_speaker:
+            return []
+
+        # 按出现顺序建立 speaker_id → "说话人N" 映射
+        # speaker_id 可能是字符串或字典，统一转为字符串
+        def _to_str(v) -> str:
+            if not v:
+                return ""
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict):
+                return v.get("id") or v.get("name") or v.get("speaker_id") or json.dumps(v, ensure_ascii=False)
+            return str(v)
+
+        speaker_name_map: Dict[str, str] = {}
+        for u in utterances:
+            if not isinstance(u, dict):
+                continue
+            sid = _to_str(u.get("speaker_id") or u.get("speaker"))
+            if sid and sid not in speaker_name_map:
+                speaker_name_map[sid] = f"说话人{len(speaker_name_map) + 1}"
+
+        # 先收集原始分段，再合并连续同一说话人的片段
+        raw_segments = []
+        for u in utterances:
+            if not isinstance(u, dict):
+                continue
+            text = u.get("text") or u.get("transcript") or u.get("content") or ""
+            if not text:
+                continue
+            sid = _to_str(u.get("speaker_id") or u.get("speaker"))
+            raw_segments.append({
+                "speaker": speaker_name_map.get(sid, sid or "未知"),
+                "text": text,
+                "start_ms": u.get("start_time"),
+                "end_ms": u.get("end_time"),
+            })
+
+        # 合并连续同一说话人的片段
+        segments: List[Dict] = []
+        for seg in raw_segments:
+            if segments and segments[-1]["speaker"] == seg["speaker"]:
+                # 追加文本，更新结束时间
+                segments[-1]["text"] += seg["text"]
+                if seg["end_ms"] is not None:
+                    segments[-1]["end_ms"] = seg["end_ms"]
+            else:
+                segments.append(dict(seg))
+        return segments
+
     def _store_minutes_payload(
         self,
         db: Session,
@@ -958,27 +1118,91 @@ class VolcMinutesService:
     ) -> Tuple[Optional[database.VolcMeetingSummary], List[database.VolcMeetingTodo]]:
         summary_url = result.get("SummarizationFile")
         todo_url = result.get("InformationExtractionFile")
+        # 语音妙记返回的精准转写文件（尝试多个常见字段名）
+        transcript_url = (
+            result.get("TranscriptionFile")
+            or result.get("AsrFile")
+            or result.get("RecognitionFile")
+            or result.get("AudioTranscriptionFile")
+        )
         summaries = self._fetch_json(summary_url) if summary_url else None
         todos_payload = self._fetch_json(todo_url) if todo_url else None
+        transcript_payload = self._fetch_json(transcript_url) if transcript_url else None
 
         db.query(database.VolcMeetingSummary).filter(database.VolcMeetingSummary.meeting_id == audio.meeting_id).delete(synchronize_session=False)
         db.query(database.VolcMeetingTodo).filter(database.VolcMeetingTodo.meeting_id == audio.meeting_id).delete(synchronize_session=False)
         db.flush()
 
+        # 保存精准转写文本到 VolcMeetingAudio（覆盖流式 ASR 结果）
+        if transcript_payload:
+            # 优先尝试提取说话人分段
+            speaker_segs = self._parse_speaker_segments(transcript_payload)
+            if speaker_segs:
+                audio.speaker_transcript = json.dumps(speaker_segs, ensure_ascii=False)
+                transcript_text = "\n".join(
+                    f"[{seg['speaker']}] {seg['text']}" for seg in speaker_segs
+                )
+                logger.info(
+                    "Stored speaker transcript from 妙记 audio_id=%s speakers=%d segments=%d",
+                    audio.id,
+                    len({s["speaker"] for s in speaker_segs}),
+                    len(speaker_segs),
+                )
+            else:
+                # 无说话人信息：降级为纯文本拼接
+                audio.speaker_transcript = None
+                if isinstance(transcript_payload, list):
+                    parts = []
+                    for item in transcript_payload:
+                        if isinstance(item, dict):
+                            t = item.get("text") or item.get("transcript") or item.get("content") or ""
+                        else:
+                            t = str(item)
+                        if t:
+                            parts.append(t)
+                    transcript_text = "".join(parts) or json.dumps(transcript_payload, ensure_ascii=False)
+                else:
+                    transcript_text = (
+                        transcript_payload.get("text")
+                        or transcript_payload.get("transcript")
+                        or transcript_payload.get("content")
+                        or json.dumps(transcript_payload, ensure_ascii=False)
+                    )
+            if transcript_text:
+                audio.transcript_text = transcript_text
+                logger.info("Stored transcript from 妙记 audio_id=%s len=%d", audio.id, len(transcript_text))
+
         summary_record: Optional[database.VolcMeetingSummary] = None
         if summaries:
-            paragraph = summaries.get("paragraph") or summaries.get("summary") or json.dumps(summaries, ensure_ascii=False)
+            if isinstance(summaries, list):
+                # 列表格式：拼接所有摘要段落
+                paragraph = "\n".join(
+                    (item.get("paragraph") or item.get("summary") or json.dumps(item, ensure_ascii=False))
+                    if isinstance(item, dict) else str(item)
+                    for item in summaries
+                )
+                title = next(
+                    (item.get("title") for item in summaries if isinstance(item, dict) and item.get("title")),
+                    None,
+                )
+            else:
+                paragraph = summaries.get("paragraph") or summaries.get("summary") or json.dumps(summaries, ensure_ascii=False)
+                title = summaries.get("title")
             summary_record = database.VolcMeetingSummary(
                 meeting_id=audio.meeting_id,
                 source_audio_id=audio.id,
-                title=summaries.get("title"),
+                title=title,
                 paragraph=paragraph,
             )
             db.add(summary_record)
 
         todo_records: List[database.VolcMeetingTodo] = []
         if todos_payload:
-            todo_items = todos_payload.get("todo_list") or []
+            # 列表格式直接就是 todo 列表，字典格式从 todo_list 字段取
+            if isinstance(todos_payload, list):
+                todo_items = todos_payload
+            else:
+                todo_items = todos_payload.get("todo_list") or []
             for item in todo_items:
                 content = item.get("content") or (
                     (item.get("polished_res") or {}).get("content")

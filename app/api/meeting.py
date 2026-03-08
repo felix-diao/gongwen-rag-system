@@ -663,12 +663,14 @@ def delete_volc_meeting_audio(
 
 @router.websocket("/audio/ws/{meeting_id}")
 async def meeting_audio_ws(meeting_id: int, websocket: WebSocket):
+    logger.info("Meeting audio WS: connection attempt meeting_id=%s client=%s", meeting_id, websocket.client)
     await meeting_ws_manager.connect(meeting_id, websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        logger.info("Meeting audio WS: client disconnect meeting_id=%s", meeting_id)
         await meeting_ws_manager.disconnect(meeting_id, websocket)
     except Exception:
-        logger.exception("会议音频 WebSocket 异常")
+        logger.exception("Meeting audio WS: exception meeting_id=%s", meeting_id)
         await meeting_ws_manager.disconnect(meeting_id, websocket)

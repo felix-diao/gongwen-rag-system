@@ -25,7 +25,7 @@ class MeetingTranscriptionWSManager:
         await websocket.accept()
         async with self._lock:
             self._connections[meeting_id].add(websocket)
-        logger.debug("WebSocket connected: meeting %s", meeting_id)
+        logger.info("Meeting WS: connected meeting_id=%s client=%s", meeting_id, websocket.client)
 
     async def disconnect(self, meeting_id: int, websocket: WebSocket) -> None:
         async with self._lock:
@@ -34,18 +34,22 @@ class MeetingTranscriptionWSManager:
                 conns.remove(websocket)
                 if not conns:
                     self._connections.pop(meeting_id, None)
-        logger.debug("WebSocket disconnected: meeting %s", meeting_id)
+        logger.info("Meeting WS: disconnected meeting_id=%s client=%s", meeting_id, websocket.client)
 
     async def _send(self, meeting_id: int, payload: dict) -> None:
         conns = list(self._connections.get(meeting_id, set()))
         if not conns:
+            logger.debug("Meeting WS: no clients for meeting_id=%s, skip broadcast type=%s",
+                         meeting_id, payload.get("type", "?"))
             return
         text = json.dumps(payload, ensure_ascii=False)
         stale: list[WebSocket] = []
         for ws in conns:
             try:
                 await ws.send_text(text)
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Meeting WS: send failed meeting_id=%s type=%s: %s",
+                               meeting_id, payload.get("type", "?"), e)
                 stale.append(ws)
         if stale:
             async with self._lock:

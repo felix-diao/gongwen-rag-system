@@ -244,6 +244,12 @@ class VolcMeetingAudio(Base):
     status = Column(String(32), default="uploaded", nullable=False)
     task_id = Column(String(128), index=True)
     error_msg = Column(Text)
+    # 语音妙记 返回的更精准转写文本（覆盖流式 ASR 结果）
+    transcript_text = Column(Text)
+    # 说话人分段转写（JSON 字符串）：[{"speaker":"说话人1","text":"...","start_ms":0,"end_ms":1500}, ...]
+    speaker_transcript = Column(Text)
+    # 关联的流式 ASR 会话（来源于 Functionality 1）
+    source_asr_session_id = Column(Integer, index=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -271,7 +277,50 @@ class VolcMeetingSummary(Base):
     paragraph = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+class VolcAsrSession(Base):
+    """火山引擎大模型流式语音识别会话"""
+    __tablename__ = "volc_asr_sessions"
 
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    # "file"：上传音频文件后台转写；"live"：实时 WebSocket 录音转写
+    session_type = Column(String(32), default="file", nullable=False)
+    # pending / processing / completed / failed
+    status = Column(String(32), default="pending", nullable=False)
+    # 累积的最终转写文本（流式 ASR 输出）
+    transcript_text = Column(Text)
+    # 本地保存的音频文件路径（实时录音时由服务器合成 WAV 保存）
+    audio_local_path = Column(String(512))
+    # 原始文件名
+    audio_filename = Column(String(255))
+    # 音频时长（秒）
+    duration_seconds = Column(Float)
+    error_msg = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VolcAudioTranscription(Base):
+    """Volc 流式语音识别逐段结果存储"""
+    __tablename__ = "volc_audio_transcriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=True)
+    # 关联 VolcAsrSession.id
+    source_session_id = Column(Integer, index=True, nullable=True)
+    # 兼容旧字段（可关联 meeting_audios.id）
+    source_audio_id = Column(Integer, index=True, nullable=True)
+    # 来源标记
+    provider = Column(String(64), default="volc")
+    # 每一段的识别文本
+    text = Column(Text, nullable=False)
+    # 是否是当前 utterance 的最终确认段
+    is_final = Column(Boolean, default=False)
+    # 起止时间（毫秒）
+    start_time = Column(Float)
+    end_time = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # 创建所有表
 Base.metadata.create_all(bind=engine)

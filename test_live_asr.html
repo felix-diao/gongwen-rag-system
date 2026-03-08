@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Volc 实时 ASR 测试</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'PingFang SC', sans-serif; background: #f0f2f5; min-height: 100vh; padding: 24px; }
+  h2 { color: #1a1a2e; margin-bottom: 20px; font-size: 20px; }
+  .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 12px; }
+  label { font-size: 13px; color: #555; display: block; margin-bottom: 4px; }
+  input { border: 1px solid #d9d9d9; border-radius: 6px; padding: 7px 10px; font-size: 14px; width: 200px; outline: none; }
+  input:focus { border-color: #4096ff; }
+  button { padding: 8px 18px; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; transition: .2s; }
+  .btn-primary { background: #4096ff; color: #fff; }
+  .btn-primary:hover { background: #1677ff; }
+  .btn-primary:disabled { background: #b0c4f7; cursor: not-allowed; }
+  .btn-danger  { background: #ff4d4f; color: #fff; }
+  .btn-danger:hover  { background: #cf1322; }
+  .btn-success { background: #52c41a; color: #fff; }
+  .btn-success:hover { background: #389e0d; }
+  .btn-default { background: #f0f0f0; color: #333; }
+  .btn-default:hover { background: #d9d9d9; }
+  .status { font-size: 13px; color: #888; margin-top: 4px; }
+  .status.ok   { color: #52c41a; }
+  .status.err  { color: #ff4d4f; }
+  .status.warn { color: #fa8c16; }
+  #transcript-box {
+    background: #fafafa; border: 1px solid #e8e8e8; border-radius: 8px;
+    padding: 14px; min-height: 120px; font-size: 15px; line-height: 1.8;
+    color: #222; white-space: pre-wrap; word-break: break-all;
+  }
+  .partial-text { color: #aaa; }
+  #log-box {
+    background: #1e1e2e; border-radius: 8px; padding: 14px;
+    font-size: 12px; color: #a6e3a1; font-family: monospace;
+    max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 12px; margin-right: 6px;
+  }
+  .tag-ok   { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
+  .tag-err  { background: #fff1f0; color: #ff4d4f; border: 1px solid #ffa39e; }
+  .tag-info { background: #e6f4ff; color: #1677ff; border: 1px solid #91caff; }
+  #vol-bar { height: 8px; background: #eee; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  #vol-fill { height: 100%; width: 0%; background: #52c41a; transition: width .1s; border-radius: 4px; }
+  .meta-info { font-size: 12px; color: #999; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h2>🎙️ Volc 实时 ASR 测试工具</h2>
+
+<!-- 第一步：登录 -->
+<div class="card">
+  <b>第 1 步：登录获取 Token</b>
+  <div class="row" style="margin-top:12px">
+    <div>
+      <label>服务地址</label>
+      <input id="server" value="http://8.152.214.78:8080" style="width:220px">
+    </div>
+    <div>
+      <label>用户名</label>
+      <input id="username" value="admin">
+    </div>
+    <div>
+      <label>密码</label>
+      <input id="password" type="password" value="">
+    </div>
+    <button class="btn-primary" onclick="doLogin()">登录</button>
+  </div>
+  <div id="login-status" class="status">尚未登录</div>
+</div>
+
+<!-- 第二步：配置 -->
+<div class="card">
+  <b>第 2 步：配置参数</b>
+  <div class="row" style="margin-top:12px">
+    <div>
+      <label>会议 ID</label>
+      <input id="meeting-id" value="1" style="width:100px" type="number">
+    </div>
+    <div>
+      <label>采样率 (Hz)</label>
+      <input id="sample-rate" value="16000" style="width:100px" type="number">
+    </div>
+  </div>
+</div>
+
+<!-- 第三步：录音 -->
+<div class="card">
+  <b>第 3 步：实时录音 + ASR</b>
+  <div class="row" style="margin-top:12px">
+    <button class="btn-success" id="btn-start" onclick="startRecording()">▶ 开始录音</button>
+    <button class="btn-danger"  id="btn-stop"  onclick="stopRecording()" disabled>⏹ 停止录音</button>
+    <button class="btn-default" onclick="clearAll()">🗑 清空</button>
+  </div>
+  <div id="rec-status" class="status">就绪</div>
+  <div id="vol-bar"><div id="vol-fill"></div></div>
+  <div class="meta-info" id="meta-info"></div>
+</div>
+
+<!-- 转写结果 -->
+<div class="card">
+  <b>识别文本</b>
+  <div id="transcript-box" style="margin-top:10px">等待录音...</div>
+</div>
+
+<!-- 日志 -->
+<div class="card">
+  <b>WebSocket 消息日志</b>
+  <div id="log-box" style="margin-top:10px">等待连接...</div>
+</div>
+
+<script>
+let token = '';
+let ws = null;
+let mediaStream = null;
+let audioContext = null;
+let processorNode = null;
+let analyserNode = null;
+let sessionId = null;
+let audioId = null;
+let confirmedText = '';
+let partialText = '';
+let volAnimFrame = null;
+
+// ─── 登录 ─────────────────────────────────────────────────────────────
+async function doLogin() {
+  const server   = document.getElementById('server').value.trim();
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  const statusEl = document.getElementById('login-status');
+  statusEl.className = 'status';
+  statusEl.textContent = '登录中...';
+  try {
+    const res = await fetch(`${server}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (data.success && data.data && data.data.access_token) {
+      token = data.data.access_token;
+      statusEl.className = 'status ok';
+      statusEl.textContent = `✅ 登录成功，token 已获取（${token.slice(0,20)}...）`;
+    } else {
+      statusEl.className = 'status err';
+      statusEl.textContent = `❌ 登录失败：${JSON.stringify(data)}`;
+    }
+  } catch(e) {
+    statusEl.className = 'status err';
+    statusEl.textContent = `❌ 请求异常：${e.message}`;
+  }
+}
+
+// ─── 开始录音 ─────────────────────────────────────────────────────────
+async function startRecording() {
+  if (!token) { alert('请先登录！'); return; }
+
+  const server    = document.getElementById('server').value.trim();
+  const meetingId = document.getElementById('meeting-id').value;
+  const sampleRate = parseInt(document.getElementById('sample-rate').value) || 16000;
+  const wsUrl = server.replace(/^http/, 'ws') + `/api/minutes/volc/${meetingId}/live?token=${token}`;
+
+  confirmedText = '';
+  partialText   = '';
+  renderTranscript();
+  clearLog();
+  appendLog('info', `连接 ${wsUrl}`);
+
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    appendLog('ok', 'WebSocket 已连接');
+    setStatus('rec-status', '🔗 WebSocket 已连接，正在申请麦克风...', 'ok');
+
+    // 发送音频配置
+    ws.send(JSON.stringify({ action: 'config', rate: sampleRate, channels: 1, sample_width: 2 }));
+
+    // 申请麦克风
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: {
+        sampleRate, channelCount: 1, echoCancellation: true, noiseSuppression: true,
+      }});
+    } catch(e) {
+      appendLog('err', `麦克风权限被拒绝：${e.message}`);
+      setStatus('rec-status', `❌ 麦克风权限被拒绝`, 'err');
+      ws.close();
+      return;
+    }
+
+    audioContext = new AudioContext({ sampleRate });
+    const source = audioContext.createMediaStreamSource(mediaStream);
+
+    // 音量分析
+    analyserNode = audioContext.createAnalyser();
+    analyserNode.fftSize = 256;
+    source.connect(analyserNode);
+    startVolMeter();
+
+    // ScriptProcessor 捕获 PCM（512 帧 / ~32ms）
+    processorNode = audioContext.createScriptProcessor(512, 1, 1);
+    source.connect(processorNode);
+    processorNode.connect(audioContext.destination);
+
+    processorNode.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      // 转换为 16-bit PCM
+      const pcm = float32ToPcm16(float32);
+      ws.send(pcm.buffer);
+    };
+
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled  = false;
+    setStatus('rec-status', '🎙️ 录音中...', 'warn');
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      appendLog('ok', JSON.stringify(msg));
+      handleMessage(msg);
+    } catch(e) {
+      appendLog('info', `raw: ${evt.data}`);
+    }
+  };
+
+  ws.onerror = (e) => {
+    appendLog('err', `WebSocket 错误：${e.message || '未知错误'}`);
+    setStatus('rec-status', '❌ 连接错误', 'err');
+  };
+
+  ws.onclose = (e) => {
+    appendLog('info', `WebSocket 关闭 code=${e.code} reason=${e.reason}`);
+    stopMic();
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-stop').disabled  = true;
+    if (e.code !== 1000 && e.code !== 1005) {
+      setStatus('rec-status', `⚠️ 连接断开 code=${e.code}`, 'err');
+    }
+  };
+}
+
+// ─── 停止录音 ─────────────────────────────────────────────────────────
+function stopRecording() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ action: 'stop' }));
+    appendLog('info', '已发送 stop 指令，等待服务端返回 completed...');
+    setStatus('rec-status', '⏳ 等待服务端处理完成...', '');
+  }
+  stopMic();
+  document.getElementById('btn-stop').disabled = true;
+}
+
+function stopMic() {
+  if (processorNode) { processorNode.disconnect(); processorNode = null; }
+  if (analyserNode)  { analyserNode.disconnect();  analyserNode = null; }
+  if (audioContext)  { audioContext.close();        audioContext = null; }
+  if (mediaStream)   { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  cancelAnimationFrame(volAnimFrame);
+  document.getElementById('vol-fill').style.width = '0%';
+}
+
+// ─── 处理服务端消息 ────────────────────────────────────────────────────
+function handleMessage(msg) {
+  switch(msg.type) {
+    case 'session_created':
+      sessionId = msg.session_id;
+      setStatus('rec-status', `🎙️ 录音中... session_id=${sessionId}`, 'warn');
+      break;
+    case 'partial':
+      partialText = msg.text || '';
+      renderTranscript();
+      break;
+    case 'final':
+      confirmedText = msg.accumulated || (confirmedText + (msg.text || ''));
+      partialText   = '';
+      renderTranscript();
+      break;
+    case 'completed':
+      sessionId = msg.session_id;
+      audioId   = msg.audio_id;
+      confirmedText = msg.transcript || confirmedText;
+      partialText   = '';
+      renderTranscript();
+      setStatus('rec-status', `✅ 完成！session_id=${sessionId} audio_id=${audioId} 时长=${(msg.duration_seconds||0).toFixed(1)}s`, 'ok');
+      document.getElementById('meta-info').textContent =
+        `audio_id: ${audioId}（可用于提交妙记 POST /api/minutes/volc/${document.getElementById('meeting-id').value}/submit）`;
+      document.getElementById('btn-start').disabled = false;
+      break;
+    case 'error':
+      setStatus('rec-status', `❌ 错误：${msg.message}`, 'err');
+      document.getElementById('btn-start').disabled = false;
+      break;
+  }
+}
+
+function renderTranscript() {
+  const box = document.getElementById('transcript-box');
+  box.innerHTML = '';
+  if (confirmedText) {
+    const span = document.createElement('span');
+    span.textContent = confirmedText;
+    box.appendChild(span);
+  }
+  if (partialText) {
+    const span = document.createElement('span');
+    span.className = 'partial-text';
+    span.textContent = partialText;
+    box.appendChild(span);
+  }
+  if (!confirmedText && !partialText) {
+    box.textContent = '等待识别...';
+  }
+}
+
+// ─── 音量仪表 ─────────────────────────────────────────────────────────
+function startVolMeter() {
+  const buf = new Uint8Array(analyserNode.frequencyBinCount);
+  function tick() {
+    if (!analyserNode) return;
+    analyserNode.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+    const rms = Math.sqrt(sum / buf.length);
+    document.getElementById('vol-fill').style.width = Math.min(rms * 400, 100) + '%';
+    volAnimFrame = requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+// ─── PCM 转换 ─────────────────────────────────────────────────────────
+function float32ToPcm16(float32arr) {
+  const out = new Int16Array(float32arr.length);
+  for (let i = 0; i < float32arr.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32arr[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+// ─── 工具 ─────────────────────────────────────────────────────────────
+function setStatus(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+function appendLog(type, text) {
+  const box = document.getElementById('log-box');
+  const time = new Date().toLocaleTimeString();
+  const icons = { ok: '✅', err: '❌', info: 'ℹ️' };
+  box.textContent += `[${time}] ${icons[type] || ''} ${text}\n`;
+  box.scrollTop = box.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('log-box').textContent = '';
+}
+
+function clearAll() {
+  confirmedText = '';
+  partialText = '';
+  renderTranscript();
+  clearLog();
+  document.getElementById('meta-info').textContent = '';
+  setStatus('rec-status', '就绪', '');
+}
+</script>
+</body>
+</html>
