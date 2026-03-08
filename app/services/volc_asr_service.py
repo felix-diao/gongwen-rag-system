@@ -686,10 +686,13 @@ class LiveAsrHandler:
 
                         if self._ws_alive:
                             try:
+                                # 实时出字：accumulated 需包含当前 partial，否则前端只有 final 时才更新
+                                base = "".join(self._transcript_parts)
+                                display_accumulated = base if should_accumulate else (base + text)
                                 await self._ws.send_json({
                                     "type": "final" if is_definite else "partial",
                                     "text": text,
-                                    "accumulated": "".join(self._transcript_parts),
+                                    "accumulated": display_accumulated,
                                 })
                             except Exception:
                                 self._ws_alive = False
@@ -809,10 +812,10 @@ async def stream_file_asr(
         session.status = "processing"
         db.commit()
 
-        yield _sse({"type": "session_created", "session_id": session_id, "audio_id": audio_id})
+        yield _sse({"type": "session_created", "session_id": session_id, "audio_id": audio_id, "accumulated": ""})
 
         url = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
-        async with AsrWsClient(url, segment_duration=200, realtime=False) as client:
+        async with AsrWsClient(url, segment_duration=200, realtime=False, send_interval_ms=20) as client:
             async for response in client.execute(file_path):
                 payload = response.payload_msg
                 text = _extract_text(payload) if payload else None
@@ -838,10 +841,12 @@ async def stream_file_asr(
         transcript = "".join(accumulated)
         _finalize_session(db, session_id, transcript, audio_local_path=file_path)
 
-        # 同步更新 VolcMeetingAudio 的粗转写文本
+        # 同步更新 VolcMeetingAudio 的粗转写文本并关联 ASR session
         audio_record = db.query(VolcMeetingAudio).filter(VolcMeetingAudio.id == audio_id).first()
-        if audio_record and transcript:
-            audio_record.transcript_text = transcript
+        if audio_record:
+            if transcript:
+                audio_record.transcript_text = transcript
+            audio_record.source_asr_session_id = session_id
             db.commit()
 
         logger.info("SSE ASR completed session_id=%s audio_id=%s len=%d", session_id, audio_id, len(transcript))

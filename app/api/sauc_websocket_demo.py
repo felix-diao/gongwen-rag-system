@@ -332,13 +332,15 @@ class ResponseParser:
         return response
 
 class AsrWsClient:
-    def __init__(self, url: str, segment_duration: int = 200, realtime: bool = True):
+    def __init__(self, url: str, segment_duration: int = 200, realtime: bool = True,
+                 send_interval_ms: Optional[int] = None):
         self.seq = 1
         self.url = url
         self.segment_duration = segment_duration
-        self.realtime = realtime  # False = 文件模式，不 sleep，尽快发完
+        self.realtime = realtime
+        self.send_interval_ms = send_interval_ms
         self.conn = None
-        self.session = None  # 添加session引用
+        self.session = None
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -421,10 +423,10 @@ class AsrWsClient:
                 self.seq += 1
 
             if self.realtime:
-                # 实时模式：按音频时长节奏发送，模拟麦克风输入速率
                 await asyncio.sleep(self.segment_duration / 1000)
+            elif self.send_interval_ms is not None and self.send_interval_ms > 0:
+                await asyncio.sleep(self.send_interval_ms / 1000)
             else:
-                # 文件模式：仅让出事件循环控制权，不引入额外延迟
                 await asyncio.sleep(0)
             yield
             

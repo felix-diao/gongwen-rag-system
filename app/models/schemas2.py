@@ -261,6 +261,8 @@ class SpeakerSegment(BaseModel):
 class VolcMeetingMinutesResponse(BaseModel):
     """语音妙记完整结果：精准转写 + 说话人分段 + 摘要 + Todos"""
     transcript_text: Optional[str] = None
+    stream_transcript_text: Optional[str] = None   # 粗 ASR 流式转写结果（用于退出重进后恢复流式文本框）
+    audio_status: Optional[str] = None             # 最新音频的妙记处理状态，'completed' 表示妙记已跑完
     speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
     summary: Optional[VolcMeetingSummaryInDB] = None
     todos: List[VolcMeetingTodoInDB] = Field(default_factory=list)

@@ -781,7 +781,7 @@ class VolcMinutesService:
             .order_by(database.VolcMeetingTodo.id.asc())
             .all()
         )
-        # 取最新完成的 VolcMeetingAudio 的 transcript_text
+        # 取最新完成的 VolcMeetingAudio 的精准转写文本
         latest_audio = (
             db.query(database.VolcMeetingAudio)
             .filter(
@@ -791,7 +791,30 @@ class VolcMinutesService:
             .order_by(database.VolcMeetingAudio.updated_at.desc())
             .first()
         )
+        # 若上面没找到（妙记尚未返回精准转写），则取最新一条有 source_asr_session_id 的音频
+        if latest_audio is None:
+            latest_audio = (
+                db.query(database.VolcMeetingAudio)
+                .filter(
+                    database.VolcMeetingAudio.meeting_id == meeting_id,
+                    database.VolcMeetingAudio.source_asr_session_id.isnot(None),
+                )
+                .order_by(database.VolcMeetingAudio.updated_at.desc())
+                .first()
+            )
+
         transcript_text = latest_audio.transcript_text if latest_audio else None
+
+        # 粗 ASR 流式转写：从关联的 VolcAsrSession 取（退出重进后用于恢复流式文本框）
+        stream_transcript_text: Optional[str] = None
+        if latest_audio and latest_audio.source_asr_session_id:
+            asr_session = (
+                db.query(database.VolcAsrSession)
+                .filter(database.VolcAsrSession.id == latest_audio.source_asr_session_id)
+                .first()
+            )
+            if asr_session and asr_session.transcript_text:
+                stream_transcript_text = asr_session.transcript_text
 
         # 解析说话人分段
         speaker_segments: list = []
@@ -802,8 +825,12 @@ class VolcMinutesService:
             except Exception as exc:
                 logger.warning("Failed to parse speaker_transcript audio_id=%s: %s", latest_audio.id, exc)
 
+        audio_status = latest_audio.status if latest_audio else None
+
         return schemas2.VolcMeetingMinutesResponse(
             transcript_text=transcript_text,
+            stream_transcript_text=stream_transcript_text,
+            audio_status=audio_status,
             speaker_segments=speaker_segments,
             summary=schemas2.VolcMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas2.VolcMeetingTodoInDB.model_validate(item) for item in todos],
@@ -846,10 +873,10 @@ class VolcMinutesService:
             database.VolcMeetingTodo.meeting_id == meeting_id
         ).delete(synchronize_session=False)
 
-        # 清空所有音频记录上的转写文本（新转写完成后会重新写入）
+        # 清空所有音频记录上的转写与说话人分段（新转写完成后会重新写入）
         db.query(database.VolcMeetingAudio).filter(
             database.VolcMeetingAudio.meeting_id == meeting_id
-        ).update({"transcript_text": None}, synchronize_session=False)
+        ).update({"transcript_text": None, "speaker_transcript": None}, synchronize_session=False)
 
         db.commit()
         logger.info("Cleared minutes for meeting_id=%s", meeting_id)
@@ -1173,28 +1200,53 @@ class VolcMinutesService:
                 logger.info("Stored transcript from 妙记 audio_id=%s len=%d", audio.id, len(transcript_text))
 
         summary_record: Optional[database.VolcMeetingSummary] = None
-        if summaries:
-            if isinstance(summaries, list):
-                # 列表格式：拼接所有摘要段落
-                paragraph = "\n".join(
-                    (item.get("paragraph") or item.get("summary") or json.dumps(item, ensure_ascii=False))
-                    if isinstance(item, dict) else str(item)
-                    for item in summaries
+        if summaries is not None:
+            # 火山可能返回包装结构，先解包
+            raw = summaries
+            if isinstance(raw, dict):
+                summaries = (
+                    raw.get("Data") or raw.get("Result") or raw.get("Summary") or raw.get("Summaries")
+                    or raw.get("summary") or raw.get("summaries")
                 )
-                title = next(
-                    (item.get("title") for item in summaries if isinstance(item, dict) and item.get("title")),
-                    None,
-                )
-            else:
-                paragraph = summaries.get("paragraph") or summaries.get("summary") or json.dumps(summaries, ensure_ascii=False)
-                title = summaries.get("title")
-            summary_record = database.VolcMeetingSummary(
-                meeting_id=audio.meeting_id,
-                source_audio_id=audio.id,
-                title=title,
-                paragraph=paragraph,
-            )
-            db.add(summary_record)
+                if summaries is None and (raw.get("paragraph") is not None or raw.get("summary") or raw.get("title") is not None):
+                    summaries = raw
+            if summaries:
+                if isinstance(summaries, list):
+                    # 列表格式：拼接所有摘要段落，支持多种字段名
+                    def _para_text(item):
+                        if not isinstance(item, dict):
+                            return str(item)
+                        return (
+                            item.get("paragraph") or item.get("summary") or item.get("content")
+                            or item.get("text") or item.get("summary_text")
+                            or json.dumps(item, ensure_ascii=False)
+                        )
+                    paragraph = "\n".join(_para_text(item) for item in summaries if _para_text(item))
+                    title = next(
+                        (item.get("title") for item in summaries if isinstance(item, dict) and item.get("title")),
+                        None,
+                    )
+                elif isinstance(summaries, dict):
+                    paragraph = (
+                        summaries.get("paragraph") or summaries.get("summary") or summaries.get("content")
+                        or summaries.get("text") or summaries.get("summary_text")
+                        or json.dumps(summaries, ensure_ascii=False)
+                    )
+                    title = summaries.get("title")
+                else:
+                    paragraph = str(summaries)
+                    title = None
+                if paragraph or title is not None:
+                    summary_record = database.VolcMeetingSummary(
+                        meeting_id=audio.meeting_id,
+                        source_audio_id=audio.id,
+                        title=title,
+                        paragraph=paragraph or "",
+                    )
+                    db.add(summary_record)
+                    logger.info("Stored summary from 妙记 audio_id=%s meeting_id=%s len=%d", audio.id, audio.meeting_id, len(paragraph or ""))
+                else:
+                    logger.info("SummarizationFile returned empty paragraph/title for audio_id=%s, skipping summary record", audio.id)
 
         todo_records: List[database.VolcMeetingTodo] = []
         if todos_payload:

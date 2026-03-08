@@ -263,19 +263,29 @@ async def stream_asr(
 )
 def submit_minutes(
     meeting_id: int,
+    audio_id: Optional[int] = Query(None, description="指定要提交的音频 ID，不传则取该会议最新一条"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     """
-    【工作流A 按钮2 / 工作流B 按钮3】提交最新音频到豆包语音妙记。
+    【工作流A 按钮2 / 工作流B 按钮3】提交音频到豆包语音妙记。
 
-    - 自动取该会议最新一条 TOS 音频记录
+    - 若传 audio_id 则提交该条音频（用于「用已有音频生成纪要」时覆盖式提交刚转写的那条）
+    - 若不传则取该会议最新一条 TOS 音频记录（按 created_at）
     - 提交后台异步处理：精准转写（覆盖粗转写）+ 摘要 + Todos
     - 处理完成通过会议 WebSocket 推送 volc_minutes_completed 消息
     - 可通过 GET /api/minutes/volc/{meeting_id} 查询最新结果
     """
     _get_meeting_or_404(db, meeting_id)
-    audio = _get_latest_audio_or_404(db, meeting_id)
+    if audio_id is not None:
+        audio = db.query(VolcMeetingAudio).filter(
+            VolcMeetingAudio.id == audio_id,
+            VolcMeetingAudio.meeting_id == meeting_id,
+        ).first()
+        if not audio:
+            raise HTTPException(status_code=404, detail="该会议下未找到指定音频")
+    else:
+        audio = _get_latest_audio_or_404(db, meeting_id)
 
     try:
         record = volc_minutes_service.submit_audio(db=db, audio_id=audio.id)
@@ -289,6 +299,25 @@ def submit_minutes(
         data=schemas2.VolcMeetingAudioInDB.model_validate(record),
         message="已提交豆包语音妙记，处理中，完成后将通过 WebSocket 推送结果",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 清空会议纪要（覆盖式：开启新录音/新生成前调用）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/volc/{meeting_id}/clear",
+    response_model=StandardResponse[None],
+)
+def clear_minutes(
+    meeting_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """清空指定会议的全部妙记内容（摘要、待办、所有音频的转写/说话人文本），便于覆盖式生成新纪要。"""
+    _get_meeting_or_404(db, meeting_id)
+    volc_minutes_service.clear_minutes(db, meeting_id)
+    return StandardResponse(success=True, data=None, message="已清空会议纪要")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
