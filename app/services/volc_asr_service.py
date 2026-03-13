@@ -489,6 +489,13 @@ class LiveAsrHandler:
         logger.info("LiveAsrHandler: Volc ASR done, saving audio meeting_id=%s session_id=%s chunks=%d",
                     self._meeting_id, self._session_id, len(self._audio_chunks))
 
+        # 通知前端：开始保存音频（便于展示进度）
+        if self._ws_alive:
+            try:
+                await self._ws.send_json({"type": "saving_audio", "session_id": self._session_id})
+            except Exception:
+                self._ws_alive = False
+
         # 保存音频
         audio_path: Optional[str] = None
         duration: Optional[float] = None
@@ -503,6 +510,13 @@ class LiveAsrHandler:
                 logger.info("Live audio saved to %s (%.2fs)", audio_path, duration)
             except Exception as exc:
                 logger.warning("Failed to save live audio: %s", exc)
+
+        # 通知前端：开始上传音频到 TOS（便于展示进度）
+        if self._ws_alive and audio_path:
+            try:
+                await self._ws.send_json({"type": "uploading_audio", "session_id": self._session_id})
+            except Exception:
+                self._ws_alive = False
 
         transcript = "".join(self._transcript_parts)
         _finalize_session(

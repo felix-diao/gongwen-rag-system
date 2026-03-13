@@ -108,6 +108,8 @@ async def live_recording(
         {"type": "session_created", "session_id": 123}
         {"type": "partial",   "text": "...", "accumulated": "..."}
         {"type": "final",     "text": "...", "accumulated": "..."}
+        {"type": "saving_audio",   "session_id": 123}   # 用户停止录音后，开始保存 WAV 前推送
+        {"type": "uploading_audio", "session_id": 123}   # 保存完成后，开始上传 TOS 前推送
         {"type": "completed", "session_id": 123, "audio_id": 456,
          "transcript": "...", "audio_uploaded": true, "duration_seconds": 60.0}
         {"type": "error",     "message": "..."}
