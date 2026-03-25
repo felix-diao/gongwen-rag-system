@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "deepseek"
     LLM_BASE_URL: str = "https://api.deepseek.com/v1"
     LLM_TIMEOUT: int = 180
+    # LLM 代理控制：默认不继承系统代理，避免失效代理导致调用失败
+    LLM_USE_ENV_PROXY: bool = False
+    LLM_PROXY_URL: str = ""
     
     
     # Embedding 模型配置 - 使用本地缓存的模型
@@ -108,7 +111,37 @@ class Settings(BaseSettings):
     VOLC_MINUTES_INFORMATION_EXTRACTION_TYPES: List[str] = ["todo_list", "question_answer", "transition"]
     VOLC_MINUTES_SUMMARIZATION_TYPES: List[str] = ["summary"]
     VOLC_MINUTES_CHAPTER_ENABLED: bool = True
-    
+
+    # Qwen3-ASR 实时语音识别配置（本地部署，请修改为实际的 IP:端口）
+    QWEN_ASR_API_KEY: str = ""
+    QWEN_ASR_MODEL: str = "qwen3-asr-flash-realtime"
+    QWEN_ASR_WS_URL: str = "ws://192.168.1.100:8888/api-ws/v1/realtime"
+    QWEN_ASR_LANGUAGE: str = "zh"
+    # server_vad 阈值，调高可减少静音/底噪误触发
+    QWEN_ASR_VAD_THRESHOLD: float = 0.65
+    QWEN_ASR_SILENCE_DURATION_MS: int = 400
+    QWEN_ASR_AUDIO_SAVE_DIR: str = ""
+    # 文件分段识别回退到 chat-completions(audio_url) 时用于暴露 chunk 的 HTTP 地址
+    QWEN_ASR_HTTP_SERVER_IP: str = ""
+    QWEN_ASR_HTTP_SERVER_PORT: int = 0
+    # HTTP 分段回退（仿 qwen_asr_smoketest_incremental_merge）使用的可访问地址
+    QWEN_ASR_HTTP_AUDIO_HOST: str = ""
+    QWEN_ASR_HTTP_AUDIO_PORT: int = 8001
+    # 上传音频文件流式识别策略：默认强制走 HTTP 分段，避免 WS 在 commit 后才一次性回传
+    QWEN_ASR_FILE_FORCE_HTTP_CHUNK: bool = True
+    # 对齐 qwen_asr_smoketest_incremental_merge.py：6s 分段 + 1s 重叠，拼接更自然
+    QWEN_ASR_FILE_CHUNK_SEC: float = 6.0
+    QWEN_ASR_FILE_OVERLAP_SEC: float = 1.0
+    # 文件转写过程保活心跳间隔（秒），用于大音频在首段结果前维持 WS 活跃
+    QWEN_ASR_FILE_HEARTBEAT_SEC: float = 2.0
+    # 在线录音转写策略：默认强制按固定时长分段（即使静音也按时间推进）
+    QWEN_ASR_LIVE_FORCE_HTTP_CHUNK: bool = True
+    QWEN_ASR_LIVE_CHUNK_SEC: float = 6.0
+    QWEN_ASR_LIVE_OVERLAP_SEC: float = 1.0
+
+    # 本地会议纪要 TOS 配置（复用 VOLC_TOS 的 endpoint/region/key，仅 bucket 不同）
+    LOCAL_TOS_BUCKET: str = "meeting-record-local-temp"
+
     class Config:
         env_file = ".env"
 

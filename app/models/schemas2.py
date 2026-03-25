@@ -1,7 +1,14 @@
 # schemas.py
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_serializer
 from typing import List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+
+
+def _ensure_utc_aware(dt: datetime) -> datetime:
+    """Normalize DB datetime to timezone-aware UTC for JSON serialization."""
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 # 会议基础信息模型
 class MeetingBase(BaseModel):
@@ -295,5 +302,100 @@ class VolcAudioTranscriptionInDB(VolcAudioTranscriptionBase):
     id: int
     created_at: datetime
     updated_at: datetime
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 本地会议纪要（Qwen3-ASR + LLM）
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LocalMeetingAudioBase(BaseModel):
+    meeting_id: int
+    file_name: str
+    object_key: str
+    file_url: str
+    file_type: Optional[str] = None
+    status: Optional[str] = None
+    transcript_text: Optional[str] = None
+    source_asr_session_id: Optional[int] = None
+    error_msg: Optional[str] = None
+
+
+class LocalMeetingAudioInDB(LocalMeetingAudioBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetimes(self, value: datetime) -> datetime:
+        return _ensure_utc_aware(value)
+
+
+class LocalMeetingSummaryBase(BaseModel):
+    meeting_id: int
+    title: Optional[str] = None
+    paragraph: str
+    source_audio_id: Optional[int] = None
+
+
+class LocalMeetingSummaryCreate(LocalMeetingSummaryBase):
+    pass
+
+
+class LocalMeetingSummaryInDB(LocalMeetingSummaryBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class LocalMeetingTodoBase(BaseModel):
+    meeting_id: int
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class LocalMeetingTodoCreate(LocalMeetingTodoBase):
+    pass
+
+
+class LocalMeetingTodoInDB(LocalMeetingTodoBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class LocalAsrSessionBase(BaseModel):
+    meeting_id: int
+    session_type: str = "file"
+    status: str = "pending"
+    transcript_text: Optional[str] = None
+    audio_local_path: Optional[str] = None
+    audio_filename: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    error_msg: Optional[str] = None
+
+
+class LocalAsrSessionInDB(LocalAsrSessionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class LocalMeetingMinutesResponse(BaseModel):
+    """本地会议纪要完整结果：转写 + 摘要 + Todos"""
+    transcript_text: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    audio_status: Optional[str] = None
+    summary: Optional[LocalMeetingSummaryInDB] = None
+    todos: List[LocalMeetingTodoInDB] = Field(default_factory=list)
+
+
+class LocalTranscriptUpdate(BaseModel):
+    transcript_text: str
 
 

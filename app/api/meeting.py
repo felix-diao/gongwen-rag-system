@@ -14,10 +14,11 @@ from sqlalchemy.orm import Session
 
 from app.models import schemas2
 from app.services.meeting_service import MeetingService, FileService, AudioService
-from app.models.database import VolcMeetingAudio, get_db
+from app.models.database import LocalMeetingAudio, VolcMeetingAudio, get_db
 from app.utils.auth import get_current_user
 from app.services import transcription_service,transcription_service1
 from app.services.volc_minutes_service import volc_minutes_service
+from app.services.local_minutes_service import local_minutes_service
 from app.services.websocket_manager import meeting_ws_manager
 from app.models.schemas import StandardResponse
 
@@ -659,6 +660,108 @@ def delete_volc_meeting_audio(
     
     data = schemas2.VolcMeetingAudioInDB.model_validate(record)
     return StandardResponse(success=True, data=data, message="音频删除成功")
+
+
+@router.get("/local/audio/{meeting_id}", response_model=StandardResponse[List[schemas2.LocalMeetingAudioInDB]])
+def list_local_meeting_audio(
+    meeting_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    records = (
+        db.query(LocalMeetingAudio)
+        .filter(LocalMeetingAudio.meeting_id == meeting_id)
+        .order_by(LocalMeetingAudio.created_at.desc())
+        .all()
+    )
+    data = [schemas2.LocalMeetingAudioInDB.model_validate(item) for item in records]
+    return StandardResponse(success=True, data=data, message="获取本地音频列表成功")
+
+
+@router.get("/local/audio/download/{meeting_id}/{audio_id}")
+def download_local_meeting_audio(
+    meeting_id: int,
+    audio_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    record = (
+        db.query(LocalMeetingAudio)
+        .filter(LocalMeetingAudio.id == audio_id, LocalMeetingAudio.meeting_id == meeting_id)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="音频记录未找到")
+    if not record.object_key:
+        raise HTTPException(status_code=404, detail="音频文件未存储在对象存储中")
+
+    suffix = Path(record.file_name).suffix if record.file_name else ".audio"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(tmp_fd)
+    tmp_file_path = Path(tmp_path)
+
+    try:
+        local_minutes_service.download_audio(record.object_key, tmp_file_path)
+    except Exception as exc:
+        if tmp_file_path.exists():
+            tmp_file_path.unlink()
+        logger.error("Download local audio from TOS failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"从对象存储下载失败: {exc}") from exc
+
+    def cleanup():
+        try:
+            if tmp_file_path.exists():
+                tmp_file_path.unlink()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to delete temp file %s: %s", tmp_file_path, exc)
+
+    filename = record.file_name or f"local_audio_{audio_id}{suffix}"
+    return FileResponse(
+        path=str(tmp_file_path),
+        filename=filename,
+        media_type=record.file_type or "application/octet-stream",
+        background=BackgroundTask(cleanup),
+    )
+
+
+@router.delete("/local/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas2.LocalMeetingAudioInDB])
+def delete_local_meeting_audio(
+    meeting_id: int,
+    audio_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    db_meeting = meeting_service.get_meeting(db, meeting_id)
+    if not db_meeting:
+        raise HTTPException(status_code=404, detail="会议未找到")
+
+    record = (
+        db.query(LocalMeetingAudio)
+        .filter(LocalMeetingAudio.id == audio_id, LocalMeetingAudio.meeting_id == meeting_id)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="音频记录未找到")
+
+    if record.object_key:
+        try:
+            local_minutes_service.delete_audio(record.object_key)
+        except Exception as exc:
+            logger.error("Failed to delete local TOS object %s: %s", record.object_key, exc)
+
+    db.delete(record)
+    db.commit()
+
+    data = schemas2.LocalMeetingAudioInDB.model_validate(record)
+    return StandardResponse(success=True, data=data, message="本地音频删除成功")
 
 
 @router.websocket("/audio/ws/{meeting_id}")

@@ -322,6 +322,70 @@ class VolcAudioTranscription(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+# ── 本地会议纪要（Qwen3-ASR + LLM）────────────────────────────────────────
+
+class LocalMeetingAudio(Base):
+    """本地会议纪要 - TOS 音频记录"""
+    __tablename__ = "local_meeting_audios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    file_name = Column(String(255), nullable=False)
+    object_key = Column(String(512), nullable=False)
+    file_url = Column(Text, nullable=False)
+    file_type = Column(String(64))
+    status = Column(String(32), default="uploaded", nullable=False)
+    transcript_text = Column(Text)
+    source_asr_session_id = Column(Integer, index=True)
+    error_msg = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LocalMeetingSummary(Base):
+    """本地会议纪要 - 会议摘要（LLM 生成）"""
+    __tablename__ = "local_meeting_summaries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, unique=True, index=True, nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    title = Column(String(255))
+    paragraph = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LocalMeetingTodo(Base):
+    """本地会议纪要 - 待办事项（LLM 生成）"""
+    __tablename__ = "local_meeting_todos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    content = Column(Text, nullable=False)
+    executor = Column(String(128))
+    execution_time = Column(String(64))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LocalAsrSession(Base):
+    """本地 Qwen3-ASR 流式语音识别会话"""
+    __tablename__ = "local_asr_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    session_type = Column(String(32), default="file", nullable=False)
+    status = Column(String(32), default="pending", nullable=False)
+    transcript_text = Column(Text)
+    audio_local_path = Column(String(512))
+    audio_filename = Column(String(255))
+    duration_seconds = Column(Float)
+    error_msg = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # 创建所有表
 Base.metadata.create_all(bind=engine)
 

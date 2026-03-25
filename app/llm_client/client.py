@@ -6,6 +6,13 @@ class LLMClient:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
         self.session = requests.Session()
+        # 默认禁用 requests 对系统代理环境变量的继承，避免 127.0.0.1:7890 等失效代理拖挂
+        self.session.trust_env = bool(self.cfg.use_env_proxy)
+        if self.cfg.proxy_url:
+            self.session.proxies.update({
+                "http": self.cfg.proxy_url,
+                "https": self.cfg.proxy_url,
+            })
 
     def _headers(self):
         headers = {"Content-Type": "application/json"}
@@ -34,4 +41,7 @@ class LLMClient:
             except Exception as e:
                 last_err = e
                 time.sleep(1.5 ** attempt)
-        return f"（调用失败：{last_err}）"
+        hint = ""
+        if "proxy" in str(last_err).lower():
+            hint = "；可检查 LLM_USE_ENV_PROXY / LLM_PROXY_URL 配置"
+        return f"（调用失败：{last_err}{hint}）"
