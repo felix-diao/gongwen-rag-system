@@ -4,8 +4,9 @@ import shutil
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -40,6 +41,7 @@ except ImportError:  # pragma: no cover
     tos = None
 
 logger = get_logger("volc_minutes_service")
+MAX_VOLC_MINUTES_AUDIOS_PER_MEETING = 10
 
 
 class _TosUploaderBase:
@@ -437,6 +439,15 @@ class VolcMinutesService:
         self._poll_stop_flags: Dict[int, threading.Event] = {}
         self._poll_threads: Dict[int, threading.Thread] = {}
 
+    def _ensure_audio_upload_limit(self, db: Session, meeting_id: int) -> None:
+        count = (
+            db.query(database.VolcMeetingAudio)
+            .filter(database.VolcMeetingAudio.meeting_id == meeting_id)
+            .count()
+        )
+        if count >= MAX_VOLC_MINUTES_AUDIOS_PER_MEETING:
+            raise ValueError(f"每个会议最多上传 {MAX_VOLC_MINUTES_AUDIOS_PER_MEETING} 个火山音频，请先删除旧音频后再上传")
+
     def upload_audio(
         self,
         db: Session,
@@ -445,6 +456,7 @@ class VolcMinutesService:
         original_name: str,
         content_type: Optional[str],
     ) -> database.VolcMeetingAudio:
+        self._ensure_audio_upload_limit(db, meeting_id)
         object_key, file_url = self._upload_to_tos(meeting_id, upload_path, original_name, content_type)
         audio_record = database.VolcMeetingAudio(
             meeting_id=meeting_id,
@@ -468,6 +480,7 @@ class VolcMinutesService:
         original_name: str,
         content_type: Optional[str],
     ) -> database.VolcMeetingAudio:
+        self._ensure_audio_upload_limit(db, meeting_id)
         uploader = self._ensure_uploader()
         object_key = self._build_object_key(meeting_id, original_name)
 
@@ -580,12 +593,14 @@ class VolcMinutesService:
         db.refresh(audio)
         logger.info("Volc minutes submit succeeded task_id=%s audio_id=%s", audio.task_id, audio.id)
 
+        history_session = self._create_minutes_session(db, audio)
+
         # Fire-and-forget polling to refresh minutes and notify frontend via websocket.
         # Frontend can update progress bar and then fetch latest minutes via GET /api/minutes/volc/{meeting_id}.
-        self.start_polling(audio_id=audio.id)
+        self.start_polling(audio_id=audio.id, minutes_session_id=history_session.id)
         return audio
 
-    def start_polling(self, audio_id: int) -> None:
+    def start_polling(self, audio_id: int, minutes_session_id: Optional[int] = None) -> None:
         """Start (or restart) a background poller for a volc audio task.
 
         This will continuously query task status; once completed, it overwrites minutes in DB
@@ -600,13 +615,13 @@ class VolcMinutesService:
             thread = threading.Thread(
                 target=self._poll_loop,
                 name=f"volc-minutes-poll-{audio_id}",
-                args=(audio_id, stop_event),
+                args=(audio_id, stop_event, minutes_session_id),
                 daemon=True,
             )
             self._poll_threads[audio_id] = thread
             thread.start()
 
-    def _poll_loop(self, audio_id: int, stop_event: threading.Event) -> None:
+    def _poll_loop(self, audio_id: int, stop_event: threading.Event, minutes_session_id: Optional[int] = None) -> None:
         poll_interval = 5.0
         max_seconds = 60.0 * 60.0  # 1 hour safety cap
         started = time.monotonic()
@@ -634,7 +649,11 @@ class VolcMinutesService:
                     time.sleep(poll_interval)
                     continue
 
-                updated_audio, completed, minutes = self.refresh_minutes(db, audio_id)
+                updated_audio, completed, minutes = self.refresh_minutes(
+                    db,
+                    audio_id,
+                    minutes_session_id=minutes_session_id,
+                )
                 current_status = str(updated_audio.status or "")
                 current_task_id = updated_audio.task_id
                 meeting_id = updated_audio.meeting_id
@@ -725,6 +744,7 @@ class VolcMinutesService:
         self,
         db: Session,
         audio_id: int,
+        minutes_session_id: Optional[int] = None,
     ) -> Tuple[database.VolcMeetingAudio, bool, Optional[schemas2.VolcMeetingMinutesResponse]]:
         audio = db.query(database.VolcMeetingAudio).filter(database.VolcMeetingAudio.id == audio_id).first()
         if not audio:
@@ -738,6 +758,7 @@ class VolcMinutesService:
             audio.status = raw_status or status or "processing"
             db.commit()
             db.refresh(audio)
+            self._sync_minutes_session_status(db, minutes_session_id, audio)
             return audio, False, None
         if status in {"failed", "error"}:
             body = query_result["body"].get("Data") or {}
@@ -745,6 +766,7 @@ class VolcMinutesService:
             audio.error_msg = body.get("ErrMessage") or query_result["body"].get("Message")
             db.commit()
             db.refresh(audio)
+            self._sync_minutes_session_status(db, minutes_session_id, audio)
             return audio, False, None
         if status in {"success", "succeeded", "successed", "finished", "completed"}:
             body = query_result["body"].get("Data") or {}
@@ -758,6 +780,13 @@ class VolcMinutesService:
                 db.refresh(summary_record)
             for item in todo_records:
                 db.refresh(item)
+            self._sync_minutes_session_payload(
+                db,
+                minutes_session_id,
+                audio,
+                summary_record,
+                todo_records,
+            )
             minutes = schemas2.VolcMeetingMinutesResponse(
                 transcript_text=audio.transcript_text,
                 summary=schemas2.VolcMeetingSummaryInDB.model_validate(summary_record) if summary_record else None,
@@ -767,7 +796,111 @@ class VolcMinutesService:
         audio.status = raw_status or status or "unknown"
         db.commit()
         db.refresh(audio)
+        self._sync_minutes_session_status(db, minutes_session_id, audio)
         return audio, False, None
+
+    def list_minutes_sessions(
+        self,
+        db: Session,
+        meeting_id: int,
+    ) -> List[schemas2.VolcMeetingMinutesSessionInDB]:
+        sessions = (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(
+                database.VolcMeetingMinutesSession.meeting_id == meeting_id,
+                database.VolcMeetingMinutesSession.session_no.isnot(None),
+            )
+            .order_by(database.VolcMeetingMinutesSession.created_at.asc())
+            .all()
+        )
+        return [self._build_session_schema(item) for item in sessions]
+
+    def get_minutes_session(
+        self,
+        db: Session,
+        meeting_id: int,
+        session_id: int,
+    ) -> Optional[schemas2.VolcMeetingMinutesSessionInDB]:
+        session = (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(
+                database.VolcMeetingMinutesSession.id == session_id,
+                database.VolcMeetingMinutesSession.meeting_id == meeting_id,
+            )
+            .first()
+        )
+        if not session:
+            return None
+        return self._build_session_schema(session)
+
+    def update_minutes_session(
+        self,
+        db: Session,
+        meeting_id: int,
+        session_id: int,
+        payload: schemas2.VolcMeetingMinutesSessionUpdate,
+    ) -> Optional[schemas2.VolcMeetingMinutesSessionInDB]:
+        session = (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(
+                database.VolcMeetingMinutesSession.id == session_id,
+                database.VolcMeetingMinutesSession.meeting_id == meeting_id,
+            )
+            .first()
+        )
+        if not session:
+            return None
+
+        fields_set = payload.model_fields_set
+        if "status" in fields_set:
+            session.status = payload.status or session.status
+        if "error_msg" in fields_set:
+            session.error_msg = payload.error_msg
+        if "stream_transcript_text" in fields_set:
+            session.stream_transcript_text = payload.stream_transcript_text
+        if "transcript_text" in fields_set:
+            session.transcript_text = payload.transcript_text
+        if "summary_title" in fields_set:
+            session.summary_title = payload.summary_title
+        if "summary_paragraph" in fields_set:
+            session.summary_paragraph = payload.summary_paragraph
+        if "speaker_segments" in fields_set:
+            segments_payload = [seg.model_dump() for seg in (payload.speaker_segments or [])]
+            session.speaker_segments_json = json.dumps(segments_payload, ensure_ascii=False)
+        if "todos" in fields_set:
+            todos_payload = [todo.model_dump() for todo in (payload.todos or [])]
+            session.todos_json = json.dumps(todos_payload, ensure_ascii=False)
+
+        is_latest_session = self._is_latest_minutes_session(db, meeting_id, session.id)
+        if is_latest_session:
+            self._apply_latest_session_to_current_minutes(db, session, payload, fields_set)
+
+        db.commit()
+        db.refresh(session)
+        if is_latest_session:
+            self._sync_latest_session_from_current_minutes(db, meeting_id)
+            db.refresh(session)
+        return self._build_session_schema(session)
+
+    def delete_minutes_session(
+        self,
+        db: Session,
+        meeting_id: int,
+        session_id: int,
+    ) -> bool:
+        session = (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(
+                database.VolcMeetingMinutesSession.id == session_id,
+                database.VolcMeetingMinutesSession.meeting_id == meeting_id,
+            )
+            .first()
+        )
+        if not session:
+            return False
+        db.delete(session)
+        db.commit()
+        return True
 
     def get_minutes(self, db: Session, meeting_id: int) -> schemas2.VolcMeetingMinutesResponse:
         summary = (
@@ -836,6 +969,186 @@ class VolcMinutesService:
             todos=[schemas2.VolcMeetingTodoInDB.model_validate(item) for item in todos],
         )
 
+    def _create_minutes_session(
+        self,
+        db: Session,
+        audio: database.VolcMeetingAudio,
+    ) -> database.VolcMeetingMinutesSession:
+        stream_transcript_text = self._resolve_stream_transcript_text(db, audio)
+
+        session = database.VolcMeetingMinutesSession(
+            meeting_id=audio.meeting_id,
+            source_audio_id=audio.id,
+            source_asr_session_id=audio.source_asr_session_id,
+            volc_task_id=audio.task_id,
+            status=audio.status or "submitted",
+            error_msg=audio.error_msg,
+            stream_transcript_text=stream_transcript_text,
+            transcript_text=audio.transcript_text,
+        )
+        session.session_no = self._build_unique_session_no(db, audio.meeting_id)
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        return session
+
+    def _sync_minutes_session_status(
+        self,
+        db: Session,
+        session_id: Optional[int],
+        audio: database.VolcMeetingAudio,
+    ) -> None:
+        if not session_id:
+            return
+        session = (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(database.VolcMeetingMinutesSession.id == session_id)
+            .first()
+        )
+        if not session:
+            return
+        session.status = audio.status or session.status
+        session.error_msg = audio.error_msg
+        session.volc_task_id = audio.task_id
+        session.stream_transcript_text = self._resolve_stream_transcript_text(db, audio)
+        session.transcript_text = audio.transcript_text
+        db.commit()
+
+    def _sync_minutes_session_payload(
+        self,
+        db: Session,
+        session_id: Optional[int],
+        audio: database.VolcMeetingAudio,
+        summary_record: Optional[database.VolcMeetingSummary],
+        todo_records: List[database.VolcMeetingTodo],
+    ) -> None:
+        if not session_id:
+            return
+        session = (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(database.VolcMeetingMinutesSession.id == session_id)
+            .first()
+        )
+        if not session:
+            return
+        session.status = audio.status or "completed"
+        session.error_msg = audio.error_msg
+        session.volc_task_id = audio.task_id
+        session.transcript_text = audio.transcript_text
+        session.speaker_segments_json = audio.speaker_transcript
+
+        if summary_record:
+            session.summary_title = summary_record.title
+            session.summary_paragraph = summary_record.paragraph
+        else:
+            session.summary_title = None
+            session.summary_paragraph = None
+
+        todos_payload: List[Dict[str, Any]] = []
+        for item in todo_records:
+            todos_payload.append(
+                {
+                    "content": item.content,
+                    "executor": item.executor,
+                    "execution_time": item.execution_time,
+                    "source_audio_id": item.source_audio_id,
+                }
+            )
+        session.todos_json = json.dumps(todos_payload, ensure_ascii=False)
+        db.commit()
+
+    def _build_session_schema(
+        self,
+        item: database.VolcMeetingMinutesSession,
+    ) -> schemas2.VolcMeetingMinutesSessionInDB:
+        speaker_segments: List[schemas2.SpeakerSegment] = []
+        for seg in self._safe_load_json(item.speaker_segments_json, []):
+            if isinstance(seg, dict):
+                try:
+                    speaker_segments.append(schemas2.SpeakerSegment(**seg))
+                except Exception:
+                    continue
+
+        todos: List[schemas2.VolcSessionTodoItem] = []
+        for todo in self._safe_load_json(item.todos_json, []):
+            if isinstance(todo, dict):
+                try:
+                    todos.append(schemas2.VolcSessionTodoItem(**todo))
+                except Exception:
+                    continue
+
+        payload = {
+            "id": item.id,
+            "session_no": item.session_no,
+            "meeting_id": item.meeting_id,
+            "source_audio_id": item.source_audio_id,
+            "source_asr_session_id": item.source_asr_session_id,
+            "volc_task_id": item.volc_task_id,
+            "status": item.status,
+            "error_msg": item.error_msg,
+            "stream_transcript_text": item.stream_transcript_text,
+            "transcript_text": item.transcript_text,
+            "speaker_segments": speaker_segments,
+            "summary_title": item.summary_title,
+            "summary_paragraph": item.summary_paragraph,
+            "todos": todos,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+        }
+        return schemas2.VolcMeetingMinutesSessionInDB.model_validate(payload)
+
+    def _format_session_no(self, meeting_id: int, dt_value: datetime) -> str:
+        ts = dt_value.strftime("%Y%m%d%H%M%S")
+        return f"VOLC-{meeting_id}-{ts}"
+
+    def _build_unique_session_no(
+        self,
+        db: Session,
+        meeting_id: int,
+        base_dt: Optional[datetime] = None,
+    ) -> str:
+        # 规则：VOLC + 会议ID + 精确到秒时间戳。若同秒冲突，则顺延秒数保证唯一。
+        cursor = (base_dt or datetime.utcnow()).replace(microsecond=0)
+        while True:
+            candidate = self._format_session_no(meeting_id, cursor)
+            exists = (
+                db.query(database.VolcMeetingMinutesSession.id)
+                .filter(database.VolcMeetingMinutesSession.session_no == candidate)
+                .first()
+            )
+            if not exists:
+                return candidate
+            cursor = cursor + timedelta(seconds=1)
+
+    @staticmethod
+    def _safe_load_json(raw: Optional[str], default):
+        if not raw:
+            return default
+        try:
+            loaded = json.loads(raw)
+        except Exception:
+            return default
+        return loaded if loaded is not None else default
+
+    def _resolve_stream_transcript_text(
+        self,
+        db: Session,
+        audio: database.VolcMeetingAudio,
+    ) -> Optional[str]:
+        """
+        优先返回流式 ASR 会话文本；若不存在则回退到音频表上的 transcript_text。
+        这样会话历史能稳定保留“流式转写”快照。
+        """
+        if audio.source_asr_session_id:
+            asr_session = (
+                db.query(database.VolcAsrSession)
+                .filter(database.VolcAsrSession.id == audio.source_asr_session_id)
+                .first()
+            )
+            if asr_session and asr_session.transcript_text:
+                return asr_session.transcript_text
+        return audio.transcript_text
+
     def update_summary(
         self, db: Session, meeting_id: int, payload: schemas2.VolcMeetingSummaryCreate
     ) -> database.VolcMeetingSummary:
@@ -858,6 +1171,7 @@ class VolcMinutesService:
             db.add(summary)
         db.commit()
         db.refresh(summary)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return summary
 
     def clear_minutes(self, db: Session, meeting_id: int) -> None:
@@ -906,6 +1220,7 @@ class VolcMinutesService:
         db.add(todo)
         db.commit()
         db.refresh(todo)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return todo
 
     def update_todo(
@@ -930,6 +1245,7 @@ class VolcMinutesService:
 
         db.commit()
         db.refresh(todo)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return todo
 
     def delete_todo(self, db: Session, meeting_id: int, todo_id: int) -> bool:
@@ -945,7 +1261,161 @@ class VolcMinutesService:
             return False
         db.delete(todo)
         db.commit()
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return True
+
+    def update_latest_transcript(
+        self,
+        db: Session,
+        meeting_id: int,
+        transcript_text: str,
+    ) -> database.VolcMeetingAudio:
+        audio = (
+            db.query(database.VolcMeetingAudio)
+            .filter(database.VolcMeetingAudio.meeting_id == meeting_id)
+            .order_by(database.VolcMeetingAudio.created_at.desc(), database.VolcMeetingAudio.id.desc())
+            .first()
+        )
+        if not audio:
+            raise ValueError("该会议尚无已上传的音频，请先完成录音或上传音频文件")
+        audio.transcript_text = transcript_text
+        db.commit()
+        db.refresh(audio)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
+        return audio
+
+    def _is_latest_minutes_session(self, db: Session, meeting_id: int, session_id: int) -> bool:
+        latest = self._get_latest_minutes_session_record(db, meeting_id)
+        return bool(latest and latest.id == session_id)
+
+    def _get_latest_minutes_session_record(
+        self,
+        db: Session,
+        meeting_id: int,
+    ) -> Optional[database.VolcMeetingMinutesSession]:
+        return (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(database.VolcMeetingMinutesSession.meeting_id == meeting_id)
+            .order_by(database.VolcMeetingMinutesSession.created_at.desc(), database.VolcMeetingMinutesSession.id.desc())
+            .first()
+        )
+
+    def _sync_latest_session_from_current_minutes(self, db: Session, meeting_id: int) -> None:
+        session = self._get_latest_minutes_session_record(db, meeting_id)
+        if not session:
+            return
+        audio = (
+            db.query(database.VolcMeetingAudio)
+            .filter(database.VolcMeetingAudio.meeting_id == meeting_id)
+            .order_by(database.VolcMeetingAudio.updated_at.desc(), database.VolcMeetingAudio.id.desc())
+            .first()
+        )
+        if not audio:
+            return
+        summary = (
+            db.query(database.VolcMeetingSummary)
+            .filter(database.VolcMeetingSummary.meeting_id == meeting_id)
+            .first()
+        )
+        todos = (
+            db.query(database.VolcMeetingTodo)
+            .filter(database.VolcMeetingTodo.meeting_id == meeting_id)
+            .order_by(database.VolcMeetingTodo.id.asc())
+            .all()
+        )
+        session.source_audio_id = audio.id
+        session.source_asr_session_id = audio.source_asr_session_id
+        session.volc_task_id = audio.task_id
+        session.status = audio.status or session.status
+        session.error_msg = audio.error_msg
+        session.stream_transcript_text = self._resolve_stream_transcript_text(db, audio)
+        session.transcript_text = audio.transcript_text
+        session.speaker_segments_json = audio.speaker_transcript
+        session.summary_title = summary.title if summary else None
+        session.summary_paragraph = summary.paragraph if summary else None
+        todos_payload = [
+            {
+                "content": item.content,
+                "executor": item.executor,
+                "execution_time": item.execution_time,
+                "source_audio_id": item.source_audio_id,
+            }
+            for item in todos
+        ]
+        session.todos_json = json.dumps(todos_payload, ensure_ascii=False)
+        db.commit()
+
+    def _apply_latest_session_to_current_minutes(
+        self,
+        db: Session,
+        session: database.VolcMeetingMinutesSession,
+        payload: schemas2.VolcMeetingMinutesSessionUpdate,
+        fields_set: set,
+    ) -> None:
+        meeting_id = session.meeting_id
+        audio = None
+        if session.source_audio_id:
+            audio = (
+                db.query(database.VolcMeetingAudio)
+                .filter(
+                    database.VolcMeetingAudio.id == session.source_audio_id,
+                    database.VolcMeetingAudio.meeting_id == meeting_id,
+                )
+                .first()
+            )
+        if not audio:
+            audio = (
+                db.query(database.VolcMeetingAudio)
+                .filter(database.VolcMeetingAudio.meeting_id == meeting_id)
+                .order_by(database.VolcMeetingAudio.updated_at.desc(), database.VolcMeetingAudio.id.desc())
+                .first()
+            )
+        if audio:
+            if "transcript_text" in fields_set:
+                audio.transcript_text = payload.transcript_text
+            if "stream_transcript_text" in fields_set and audio.source_asr_session_id:
+                asr_session = (
+                    db.query(database.VolcAsrSession)
+                    .filter(database.VolcAsrSession.id == audio.source_asr_session_id)
+                    .first()
+                )
+                if asr_session:
+                    asr_session.transcript_text = payload.stream_transcript_text
+
+        if "summary_title" in fields_set or "summary_paragraph" in fields_set:
+            summary = (
+                db.query(database.VolcMeetingSummary)
+                .filter(database.VolcMeetingSummary.meeting_id == meeting_id)
+                .first()
+            )
+            if summary is None:
+                summary = database.VolcMeetingSummary(
+                    meeting_id=meeting_id,
+                    title=payload.summary_title if "summary_title" in fields_set else None,
+                    paragraph=payload.summary_paragraph if "summary_paragraph" in fields_set else "",
+                    source_audio_id=session.source_audio_id,
+                )
+                db.add(summary)
+            else:
+                if "summary_title" in fields_set:
+                    summary.title = payload.summary_title
+                if "summary_paragraph" in fields_set:
+                    summary.paragraph = payload.summary_paragraph or ""
+
+        if "todos" in fields_set:
+            db.query(database.VolcMeetingTodo).filter(
+                database.VolcMeetingTodo.meeting_id == meeting_id
+            ).delete(synchronize_session=False)
+            for item in payload.todos or []:
+                db.add(
+                    database.VolcMeetingTodo(
+                        meeting_id=meeting_id,
+                        content=item.content,
+                        executor=item.executor,
+                        execution_time=item.execution_time,
+                        source_audio_id=item.source_audio_id or session.source_audio_id,
+                    )
+                )
 
     def save_upload_to_temp(self, upload_file) -> Path:
         suffix = Path(upload_file.filename or "audio").suffix or ".tmp"
@@ -1040,6 +1510,7 @@ class VolcMinutesService:
         source_asr_session_id: Optional[int] = None,
     ) -> database.VolcMeetingAudio:
         """将本地音频文件上传至 TOS，创建 VolcMeetingAudio 记录（供功能2使用）。"""
+        self._ensure_audio_upload_limit(db, meeting_id)
         object_key, file_url = self._upload_to_tos(meeting_id, local_path, original_name, content_type)
         audio_record = database.VolcMeetingAudio(
             meeting_id=meeting_id,

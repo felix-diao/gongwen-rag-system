@@ -280,6 +280,56 @@ class VolcTranscriptUpdate(BaseModel):
     transcript_text: str
 
 
+# ── 火山会议纪要会话历史 ───────────────────────────────────────────────────────
+
+class VolcSessionTodoItem(BaseModel):
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class VolcMeetingMinutesSessionBase(BaseModel):
+    session_no: Optional[str] = None
+    meeting_id: int
+    source_audio_id: Optional[int] = None
+    source_asr_session_id: Optional[int] = None
+    volc_task_id: Optional[str] = None
+    status: str
+    error_msg: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    transcript_text: Optional[str] = None
+    speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
+    summary_title: Optional[str] = None
+    summary_paragraph: Optional[str] = None
+    todos: List[VolcSessionTodoItem] = Field(default_factory=list)
+
+
+class VolcMeetingMinutesSessionInDB(VolcMeetingMinutesSessionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetimes(self, value: datetime) -> datetime:
+        return _ensure_utc_aware(value)
+
+
+class VolcMeetingMinutesSessionUpdate(BaseModel):
+    """
+    会话历史可编辑字段。仅更新请求中显式传入的字段。
+    """
+    status: Optional[str] = None
+    error_msg: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    transcript_text: Optional[str] = None
+    speaker_segments: Optional[List[SpeakerSegment]] = None
+    summary_title: Optional[str] = None
+    summary_paragraph: Optional[str] = None
+    todos: Optional[List[VolcSessionTodoItem]] = None
+
+
 # ── 流式 ASR 逐段文本 ─────────────────────────────────────────────────────────
 
 class VolcAudioTranscriptionBase(BaseModel):
@@ -368,6 +418,48 @@ class LocalMeetingTodoInDB(LocalMeetingTodoBase):
     updated_at: datetime
 
 
+class LocalSessionTodoItem(BaseModel):
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class LocalMeetingMinutesSessionBase(BaseModel):
+    session_no: Optional[str] = None
+    meeting_id: int
+    source_audio_id: Optional[int] = None
+    source_asr_session_id: Optional[int] = None
+    status: str
+    error_msg: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    transcript_text: Optional[str] = None
+    summary_title: Optional[str] = None
+    summary_paragraph: Optional[str] = None
+    todos: List[LocalSessionTodoItem] = Field(default_factory=list)
+
+
+class LocalMeetingMinutesSessionInDB(LocalMeetingMinutesSessionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetimes(self, value: datetime) -> datetime:
+        return _ensure_utc_aware(value)
+
+
+class LocalMeetingMinutesSessionUpdate(BaseModel):
+    status: Optional[str] = None
+    error_msg: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    transcript_text: Optional[str] = None
+    summary_title: Optional[str] = None
+    summary_paragraph: Optional[str] = None
+    todos: Optional[List[LocalSessionTodoItem]] = None
+
+
 class LocalAsrSessionBase(BaseModel):
     meeting_id: int
     session_type: str = "file"
@@ -384,6 +476,48 @@ class LocalAsrSessionInDB(LocalAsrSessionBase):
     id: int
     created_at: datetime
     updated_at: datetime
+
+
+class LocalSessionTodoItem(BaseModel):
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class LocalMeetingMinutesSessionBase(BaseModel):
+    session_no: Optional[str] = None
+    meeting_id: int
+    source_audio_id: Optional[int] = None
+    source_asr_session_id: Optional[int] = None
+    status: str
+    error_msg: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    transcript_text: Optional[str] = None
+    summary_title: Optional[str] = None
+    summary_paragraph: Optional[str] = None
+    todos: List[LocalSessionTodoItem] = Field(default_factory=list)
+
+
+class LocalMeetingMinutesSessionInDB(LocalMeetingMinutesSessionBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetimes(self, value: datetime) -> datetime:
+        return _ensure_utc_aware(value)
+
+
+class LocalMeetingMinutesSessionUpdate(BaseModel):
+    status: Optional[str] = None
+    error_msg: Optional[str] = None
+    stream_transcript_text: Optional[str] = None
+    transcript_text: Optional[str] = None
+    summary_title: Optional[str] = None
+    summary_paragraph: Optional[str] = None
+    todos: Optional[List[LocalSessionTodoItem]] = None
 
 
 class LocalMeetingMinutesResponse(BaseModel):

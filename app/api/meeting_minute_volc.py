@@ -173,6 +173,8 @@ def upload_audio(
             original_name=file.filename or "audio",
             content_type=file.content_type,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Upload audio failed meeting_id=%s: %s", meeting_id, exc)
         raise HTTPException(status_code=502, detail=f"上传至对象存储失败: {exc}") from exc
@@ -341,6 +343,76 @@ def get_minutes(
     return StandardResponse(success=True, data=minutes, message="获取会议纪要成功")
 
 
+@router.get(
+    "/volc/{meeting_id}/sessions",
+    response_model=StandardResponse[List[schemas2.VolcMeetingMinutesSessionInDB]],
+)
+def list_minutes_sessions(
+    meeting_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """查询火山纪要会话历史列表（每次提交妙记一条）。"""
+    _get_meeting_or_404(db, meeting_id)
+    sessions = volc_minutes_service.list_minutes_sessions(db, meeting_id)
+    return StandardResponse(success=True, data=sessions, message="获取会话历史成功")
+
+
+@router.get(
+    "/volc/{meeting_id}/sessions/{session_id}",
+    response_model=StandardResponse[schemas2.VolcMeetingMinutesSessionInDB],
+)
+def get_minutes_session(
+    meeting_id: int,
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """查询火山纪要会话历史详情。"""
+    _get_meeting_or_404(db, meeting_id)
+    session = volc_minutes_service.get_minutes_session(db, meeting_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话历史未找到")
+    return StandardResponse(success=True, data=session, message="获取会话详情成功")
+
+
+@router.put(
+    "/volc/{meeting_id}/sessions/{session_id}",
+    response_model=StandardResponse[schemas2.VolcMeetingMinutesSessionInDB],
+)
+def update_minutes_session(
+    meeting_id: int,
+    session_id: int,
+    payload: schemas2.VolcMeetingMinutesSessionUpdate = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """修改火山纪要会话历史详情（快照数据）。"""
+    _get_meeting_or_404(db, meeting_id)
+    session = volc_minutes_service.update_minutes_session(db, meeting_id, session_id, payload)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话历史未找到")
+    return StandardResponse(success=True, data=session, message="会话详情已更新")
+
+
+@router.delete(
+    "/volc/{meeting_id}/sessions/{session_id}",
+    response_model=StandardResponse[None],
+)
+def delete_minutes_session(
+    meeting_id: int,
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """删除火山纪要会话历史。"""
+    _get_meeting_or_404(db, meeting_id)
+    deleted = volc_minutes_service.delete_minutes_session(db, meeting_id, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="会话历史未找到")
+    return StandardResponse(success=True, data=None, message="会话历史已删除")
+
+
 @router.put(
     "/volc/{meeting_id}/transcript",
     response_model=StandardResponse[schemas2.VolcMeetingAudioInDB],
@@ -353,10 +425,10 @@ def update_transcript(
 ):
     """修改会议纯转写文本（写入最新一条 TOS 音频记录）。"""
     _get_meeting_or_404(db, meeting_id)
-    audio = _get_latest_audio_or_404(db, meeting_id)
-    audio.transcript_text = payload.transcript_text
-    db.commit()
-    db.refresh(audio)
+    try:
+        audio = volc_minutes_service.update_latest_transcript(db, meeting_id, payload.transcript_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StandardResponse(
         success=True,
         data=schemas2.VolcMeetingAudioInDB.model_validate(audio),

@@ -155,6 +155,8 @@ def upload_audio(
             original_name=file.filename or "audio",
             content_type=file.content_type,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Upload audio failed meeting_id=%s: %s", meeting_id, exc)
         raise HTTPException(status_code=502, detail=f"上传至对象存储失败: {exc}") from exc
@@ -430,6 +432,76 @@ def get_minutes(
     return StandardResponse(success=True, data=minutes, message="获取会议纪要成功")
 
 
+@router.get(
+    "/local/{meeting_id}/sessions",
+    response_model=StandardResponse[list[schemas2.LocalMeetingMinutesSessionInDB]],
+)
+def list_minutes_sessions(
+    meeting_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """查询本地纪要会话历史列表。"""
+    _get_meeting_or_404(db, meeting_id)
+    sessions = local_minutes_service.list_minutes_sessions(db, meeting_id)
+    return StandardResponse(success=True, data=sessions, message="获取会话历史成功")
+
+
+@router.get(
+    "/local/{meeting_id}/sessions/{session_id}",
+    response_model=StandardResponse[schemas2.LocalMeetingMinutesSessionInDB],
+)
+def get_minutes_session(
+    meeting_id: int,
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """查询本地纪要会话历史详情。"""
+    _get_meeting_or_404(db, meeting_id)
+    session = local_minutes_service.get_minutes_session(db, meeting_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话历史未找到")
+    return StandardResponse(success=True, data=session, message="获取会话详情成功")
+
+
+@router.put(
+    "/local/{meeting_id}/sessions/{session_id}",
+    response_model=StandardResponse[schemas2.LocalMeetingMinutesSessionInDB],
+)
+def update_minutes_session(
+    meeting_id: int,
+    session_id: int,
+    payload: schemas2.LocalMeetingMinutesSessionUpdate = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """修改本地纪要会话历史详情。"""
+    _get_meeting_or_404(db, meeting_id)
+    session = local_minutes_service.update_minutes_session(db, meeting_id, session_id, payload)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话历史未找到")
+    return StandardResponse(success=True, data=session, message="会话详情已更新")
+
+
+@router.delete(
+    "/local/{meeting_id}/sessions/{session_id}",
+    response_model=StandardResponse[None],
+)
+def delete_minutes_session(
+    meeting_id: int,
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """删除本地纪要会话历史。"""
+    _get_meeting_or_404(db, meeting_id)
+    deleted = local_minutes_service.delete_minutes_session(db, meeting_id, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="会话历史未找到")
+    return StandardResponse(success=True, data=None, message="会话历史已删除")
+
+
 @router.put(
     "/local/{meeting_id}/transcript",
     response_model=StandardResponse[schemas2.LocalMeetingAudioInDB],
@@ -442,10 +514,10 @@ def update_transcript(
 ):
     """修改会议转写文本。"""
     _get_meeting_or_404(db, meeting_id)
-    audio = _get_latest_audio_or_404(db, meeting_id)
-    audio.transcript_text = payload.transcript_text
-    db.commit()
-    db.refresh(audio)
+    try:
+        audio = local_minutes_service.update_latest_transcript(db, meeting_id, payload.transcript_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StandardResponse(
         success=True,
         data=schemas2.LocalMeetingAudioInDB.model_validate(audio),

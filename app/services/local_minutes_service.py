@@ -11,6 +11,7 @@ import re
 import shutil
 import tempfile
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -28,6 +29,7 @@ except ImportError:
     tos = None
 
 logger = get_logger("local_minutes_service")
+MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING = 10
 
 
 # ─── TOS 上传器（复用 volc TOS 基础设施，bucket 不同）─────────────────────────
@@ -122,10 +124,20 @@ class LocalMinutesService:
 
     # ── TOS 操作 ──────────────────────────────────────────────────────────────
 
+    def _ensure_audio_upload_limit(self, db: Session, meeting_id: int) -> None:
+        count = (
+            db.query(database.LocalMeetingAudio)
+            .filter(database.LocalMeetingAudio.meeting_id == meeting_id)
+            .count()
+        )
+        if count >= MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING:
+            raise ValueError(f"每个会议最多上传 {MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING} 个本地AI音频，请先删除旧音频后再上传")
+
     def upload_audio_fileobj(
         self, db: Session, meeting_id: int,
         upload_file, original_name: str, content_type: Optional[str],
     ) -> database.LocalMeetingAudio:
+        self._ensure_audio_upload_limit(db, meeting_id)
         uploader = self._ensure_uploader()
         object_key = self._build_object_key(meeting_id, original_name)
         try:
@@ -154,6 +166,7 @@ class LocalMinutesService:
         original_name: str, content_type: Optional[str],
         source_asr_session_id: Optional[int] = None,
     ) -> database.LocalMeetingAudio:
+        self._ensure_audio_upload_limit(db, meeting_id)
         uploader = self._ensure_uploader()
         object_key = self._build_object_key(meeting_id, original_name)
         file_url = uploader.upload_file(local_path, object_key, content_type)
@@ -197,10 +210,25 @@ class LocalMinutesService:
             .first()
         )
         if not audio or not audio.transcript_text:
+            err_msg = "该会议尚无转写文本，请先完成录音或音频转写"
             if latest_audio:
                 latest_audio.status = "failed"
                 db.commit()
-            raise ValueError("该会议尚无转写文本，请先完成录音或音频转写")
+                self._create_minutes_session_snapshot(
+                    db=db,
+                    meeting_id=meeting_id,
+                    audio=latest_audio,
+                    status="failed",
+                    error_msg=err_msg,
+                )
+            else:
+                # 兜底：即便当前未拿到音频记录，也要落一条失败会话，避免前端“只看到已完成会话”。
+                self._create_failed_minutes_session_without_audio(
+                    db=db,
+                    meeting_id=meeting_id,
+                    error_msg=err_msg,
+                )
+            raise ValueError(err_msg)
 
         meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
         meeting_title = meeting.title if meeting else "会议"
@@ -210,6 +238,13 @@ class LocalMinutesService:
         if not payload:
             audio.status = "failed"
             db.commit()
+            self._create_minutes_session_snapshot(
+                db=db,
+                meeting_id=meeting_id,
+                audio=audio,
+                status="failed",
+                error_msg="LLM 生成会议纪要失败，请重试",
+            )
             raise RuntimeError("LLM 生成会议纪要失败，请重试")
 
         # 清旧
@@ -256,6 +291,14 @@ class LocalMinutesService:
         db.refresh(summary_record)
         for t in todo_records:
             db.refresh(t)
+        self._create_minutes_session_snapshot(
+            db=db,
+            meeting_id=meeting_id,
+            audio=audio,
+            status="completed",
+            summary_record=summary_record,
+            todo_records=todo_records,
+        )
         logger.info("Local minutes generated meeting_id=%s summary_len=%d todos=%d",
                      meeting_id, len(summary_record.paragraph), len(todo_records))
         return summary_record, todo_records
@@ -506,6 +549,390 @@ class LocalMinutesService:
             todos=[schemas2.LocalMeetingTodoInDB.model_validate(t) for t in todos],
         )
 
+    # ── 会话历史 ───────────────────────────────────────────────────────────────
+
+    def list_minutes_sessions(
+        self,
+        db: Session,
+        meeting_id: int,
+    ) -> List[schemas2.LocalMeetingMinutesSessionInDB]:
+        sessions = (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingMinutesSession.created_at.asc())
+            .all()
+        )
+        return [self._build_session_schema(item) for item in sessions]
+
+    def get_minutes_session(
+        self,
+        db: Session,
+        meeting_id: int,
+        session_id: int,
+    ) -> Optional[schemas2.LocalMeetingMinutesSessionInDB]:
+        session = (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(
+                database.LocalMeetingMinutesSession.id == session_id,
+                database.LocalMeetingMinutesSession.meeting_id == meeting_id,
+            )
+            .first()
+        )
+        if not session:
+            return None
+        return self._build_session_schema(session)
+
+    def update_minutes_session(
+        self,
+        db: Session,
+        meeting_id: int,
+        session_id: int,
+        payload: schemas2.LocalMeetingMinutesSessionUpdate,
+    ) -> Optional[schemas2.LocalMeetingMinutesSessionInDB]:
+        session = (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(
+                database.LocalMeetingMinutesSession.id == session_id,
+                database.LocalMeetingMinutesSession.meeting_id == meeting_id,
+            )
+            .first()
+        )
+        if not session:
+            return None
+
+        fields_set = payload.model_fields_set
+        if "status" in fields_set:
+            session.status = payload.status or session.status
+        if "error_msg" in fields_set:
+            session.error_msg = payload.error_msg
+        if "stream_transcript_text" in fields_set:
+            session.stream_transcript_text = payload.stream_transcript_text
+        if "transcript_text" in fields_set:
+            session.transcript_text = payload.transcript_text
+        if "summary_title" in fields_set:
+            session.summary_title = payload.summary_title
+        if "summary_paragraph" in fields_set:
+            session.summary_paragraph = payload.summary_paragraph
+        if "todos" in fields_set:
+            todos_payload = [todo.model_dump() for todo in (payload.todos or [])]
+            session.todos_json = json.dumps(todos_payload, ensure_ascii=False)
+
+        is_latest = self._is_latest_minutes_session(db, meeting_id, session.id)
+        if is_latest:
+            self._apply_latest_session_to_current_minutes(db, session, payload, fields_set)
+
+        db.commit()
+        db.refresh(session)
+        return self._build_session_schema(session)
+
+    def delete_minutes_session(self, db: Session, meeting_id: int, session_id: int) -> bool:
+        session = (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(
+                database.LocalMeetingMinutesSession.id == session_id,
+                database.LocalMeetingMinutesSession.meeting_id == meeting_id,
+            )
+            .first()
+        )
+        if not session:
+            return False
+        db.delete(session)
+        db.commit()
+        return True
+
+    def _build_session_schema(
+        self,
+        item: database.LocalMeetingMinutesSession,
+    ) -> schemas2.LocalMeetingMinutesSessionInDB:
+        todos: List[schemas2.LocalSessionTodoItem] = []
+        for todo in self._safe_load_json(item.todos_json, []):
+            if isinstance(todo, dict):
+                try:
+                    todos.append(schemas2.LocalSessionTodoItem(**todo))
+                except Exception:
+                    continue
+        payload = {
+            "id": item.id,
+            "session_no": item.session_no,
+            "meeting_id": item.meeting_id,
+            "source_audio_id": item.source_audio_id,
+            "source_asr_session_id": item.source_asr_session_id,
+            "status": item.status,
+            "error_msg": item.error_msg,
+            "stream_transcript_text": item.stream_transcript_text,
+            "transcript_text": item.transcript_text,
+            "summary_title": item.summary_title,
+            "summary_paragraph": item.summary_paragraph,
+            "todos": todos,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+        }
+        return schemas2.LocalMeetingMinutesSessionInDB.model_validate(payload)
+
+    @staticmethod
+    def _safe_load_json(raw: Optional[str], default):
+        if not raw:
+            return default
+        try:
+            loaded = json.loads(raw)
+        except Exception:
+            return default
+        return loaded if loaded is not None else default
+
+    def _format_session_no(self, meeting_id: int, dt_value: datetime) -> str:
+        return f"LOCAL-{meeting_id}-{dt_value.strftime('%Y%m%d%H%M%S')}"
+
+    def _build_unique_session_no(
+        self,
+        db: Session,
+        meeting_id: int,
+        base_dt: Optional[datetime] = None,
+    ) -> str:
+        cursor = (base_dt or datetime.utcnow()).replace(microsecond=0)
+        while True:
+            candidate = self._format_session_no(meeting_id, cursor)
+            exists = (
+                db.query(database.LocalMeetingMinutesSession.id)
+                .filter(database.LocalMeetingMinutesSession.session_no == candidate)
+                .first()
+            )
+            if not exists:
+                return candidate
+            cursor = cursor + timedelta(seconds=1)
+
+    def _resolve_stream_transcript_text(
+        self,
+        db: Session,
+        audio: database.LocalMeetingAudio,
+    ) -> Optional[str]:
+        if audio.source_asr_session_id:
+            asr_session = (
+                db.query(database.LocalAsrSession)
+                .filter(database.LocalAsrSession.id == audio.source_asr_session_id)
+                .first()
+            )
+            if asr_session and asr_session.transcript_text:
+                return asr_session.transcript_text
+        return audio.transcript_text
+
+    def _create_minutes_session_snapshot(
+        self,
+        db: Session,
+        meeting_id: int,
+        audio: database.LocalMeetingAudio,
+        status: str,
+        error_msg: Optional[str] = None,
+        summary_record: Optional[database.LocalMeetingSummary] = None,
+        todo_records: Optional[List[database.LocalMeetingTodo]] = None,
+    ) -> database.LocalMeetingMinutesSession:
+        summary = summary_record
+        if summary is None:
+            summary = (
+                db.query(database.LocalMeetingSummary)
+                .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
+                .first()
+            )
+        todos = todo_records
+        if todos is None:
+            todos = (
+                db.query(database.LocalMeetingTodo)
+                .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
+                .order_by(database.LocalMeetingTodo.id.asc())
+                .all()
+            )
+        todos_payload = [
+            {
+                "content": item.content,
+                "executor": item.executor,
+                "execution_time": item.execution_time,
+                "source_audio_id": item.source_audio_id,
+            }
+            for item in todos
+        ]
+        session = database.LocalMeetingMinutesSession(
+            session_no=self._build_unique_session_no(db, meeting_id),
+            meeting_id=meeting_id,
+            source_audio_id=audio.id,
+            source_asr_session_id=audio.source_asr_session_id,
+            status=status,
+            error_msg=error_msg,
+            stream_transcript_text=self._resolve_stream_transcript_text(db, audio),
+            transcript_text=audio.transcript_text,
+            summary_title=summary.title if summary else None,
+            summary_paragraph=summary.paragraph if summary else None,
+            todos_json=json.dumps(todos_payload, ensure_ascii=False),
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        return session
+
+    def _create_failed_minutes_session_without_audio(
+        self,
+        db: Session,
+        meeting_id: int,
+        error_msg: str,
+    ) -> database.LocalMeetingMinutesSession:
+        summary = (
+            db.query(database.LocalMeetingSummary)
+            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
+            .first()
+        )
+        todos = (
+            db.query(database.LocalMeetingTodo)
+            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingTodo.id.asc())
+            .all()
+        )
+        todos_payload = [
+            {
+                "content": item.content,
+                "executor": item.executor,
+                "execution_time": item.execution_time,
+                "source_audio_id": item.source_audio_id,
+            }
+            for item in todos
+        ]
+        session = database.LocalMeetingMinutesSession(
+            session_no=self._build_unique_session_no(db, meeting_id),
+            meeting_id=meeting_id,
+            source_audio_id=None,
+            source_asr_session_id=None,
+            status="failed",
+            error_msg=error_msg,
+            stream_transcript_text=None,
+            transcript_text=None,
+            summary_title=summary.title if summary else None,
+            summary_paragraph=summary.paragraph if summary else None,
+            todos_json=json.dumps(todos_payload, ensure_ascii=False),
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        return session
+
+    def _is_latest_minutes_session(self, db: Session, meeting_id: int, session_id: int) -> bool:
+        latest = (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingMinutesSession.created_at.desc(), database.LocalMeetingMinutesSession.id.desc())
+            .first()
+        )
+        return bool(latest and latest.id == session_id)
+
+    def _apply_latest_session_to_current_minutes(
+        self,
+        db: Session,
+        session: database.LocalMeetingMinutesSession,
+        payload: schemas2.LocalMeetingMinutesSessionUpdate,
+        fields_set: set,
+    ) -> None:
+        meeting_id = session.meeting_id
+        audio = None
+        if session.source_audio_id:
+            audio = (
+                db.query(database.LocalMeetingAudio)
+                .filter(
+                    database.LocalMeetingAudio.id == session.source_audio_id,
+                    database.LocalMeetingAudio.meeting_id == meeting_id,
+                )
+                .first()
+            )
+        if not audio:
+            audio = (
+                db.query(database.LocalMeetingAudio)
+                .filter(database.LocalMeetingAudio.meeting_id == meeting_id)
+                .order_by(database.LocalMeetingAudio.updated_at.desc(), database.LocalMeetingAudio.id.desc())
+                .first()
+            )
+        if audio and "transcript_text" in fields_set:
+            audio.transcript_text = payload.transcript_text
+
+        if "summary_title" in fields_set or "summary_paragraph" in fields_set:
+            summary = (
+                db.query(database.LocalMeetingSummary)
+                .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
+                .first()
+            )
+            if summary is None:
+                summary = database.LocalMeetingSummary(
+                    meeting_id=meeting_id,
+                    title=payload.summary_title if "summary_title" in fields_set else None,
+                    paragraph=payload.summary_paragraph if "summary_paragraph" in fields_set else "",
+                    source_audio_id=session.source_audio_id,
+                )
+                db.add(summary)
+            else:
+                if "summary_title" in fields_set:
+                    summary.title = payload.summary_title
+                if "summary_paragraph" in fields_set:
+                    summary.paragraph = payload.summary_paragraph or ""
+
+        if "todos" in fields_set:
+            db.query(database.LocalMeetingTodo).filter(
+                database.LocalMeetingTodo.meeting_id == meeting_id
+            ).delete(synchronize_session=False)
+            for item in payload.todos or []:
+                db.add(
+                    database.LocalMeetingTodo(
+                        meeting_id=meeting_id,
+                        content=item.content,
+                        executor=item.executor,
+                        execution_time=item.execution_time,
+                        source_audio_id=item.source_audio_id or session.source_audio_id,
+                    )
+                )
+
+    def _sync_latest_session_from_current_minutes(self, db: Session, meeting_id: int) -> None:
+        session = (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingMinutesSession.created_at.desc(), database.LocalMeetingMinutesSession.id.desc())
+            .first()
+        )
+        if not session:
+            return
+        audio = (
+            db.query(database.LocalMeetingAudio)
+            .filter(database.LocalMeetingAudio.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingAudio.updated_at.desc(), database.LocalMeetingAudio.id.desc())
+            .first()
+        )
+        if not audio:
+            return
+        summary = (
+            db.query(database.LocalMeetingSummary)
+            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
+            .first()
+        )
+        todos = (
+            db.query(database.LocalMeetingTodo)
+            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingTodo.id.asc())
+            .all()
+        )
+        session.source_audio_id = audio.id
+        session.source_asr_session_id = audio.source_asr_session_id
+        session.status = audio.status or session.status
+        session.error_msg = audio.error_msg
+        session.stream_transcript_text = self._resolve_stream_transcript_text(db, audio)
+        session.transcript_text = audio.transcript_text
+        session.summary_title = summary.title if summary else None
+        session.summary_paragraph = summary.paragraph if summary else None
+        session.todos_json = json.dumps(
+            [
+                {
+                    "content": item.content,
+                    "executor": item.executor,
+                    "execution_time": item.execution_time,
+                    "source_audio_id": item.source_audio_id,
+                }
+                for item in todos
+            ],
+            ensure_ascii=False,
+        )
+        db.commit()
+
     # ── 清空 ─────────────────────────────────────────────────────────────────
 
     def clear_minutes(self, db: Session, meeting_id: int) -> None:
@@ -543,6 +970,7 @@ class LocalMinutesService:
             db.add(summary)
         db.commit()
         db.refresh(summary)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return summary
 
     # ── Todo CRUD ────────────────────────────────────────────────────────────
@@ -558,6 +986,7 @@ class LocalMinutesService:
         db.add(todo)
         db.commit()
         db.refresh(todo)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return todo
 
     def update_todo(
@@ -578,6 +1007,7 @@ class LocalMinutesService:
             todo.execution_time = payload.execution_time
         db.commit()
         db.refresh(todo)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return todo
 
     def delete_todo(self, db: Session, meeting_id: int, todo_id: int) -> bool:
@@ -590,7 +1020,28 @@ class LocalMinutesService:
             return False
         db.delete(todo)
         db.commit()
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return True
+
+    def update_latest_transcript(
+        self,
+        db: Session,
+        meeting_id: int,
+        transcript_text: str,
+    ) -> database.LocalMeetingAudio:
+        audio = (
+            db.query(database.LocalMeetingAudio)
+            .filter(database.LocalMeetingAudio.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingAudio.created_at.desc(), database.LocalMeetingAudio.id.desc())
+            .first()
+        )
+        if not audio:
+            raise ValueError("该会议尚无已上传的音频，请先完成录音或上传音频文件")
+        audio.transcript_text = transcript_text
+        db.commit()
+        db.refresh(audio)
+        self._sync_latest_session_from_current_minutes(db, meeting_id)
+        return audio
 
 
 local_minutes_service = LocalMinutesService()

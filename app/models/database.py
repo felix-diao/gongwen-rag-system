@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey, DateTime
+from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey, DateTime, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -277,6 +277,37 @@ class VolcMeetingSummary(Base):
     paragraph = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VolcMeetingMinutesSession(Base):
+    """火山会议纪要会话历史快照（每次提交妙记生成一条）。"""
+    __tablename__ = "volc_meeting_minutes_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_no = Column(String(64), index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    source_asr_session_id = Column(Integer, index=True)
+    volc_task_id = Column(String(128), index=True)
+    status = Column(String(32), default="submitted", nullable=False)
+    error_msg = Column(Text)
+
+    # 流式 ASR 结果（粗转写）
+    stream_transcript_text = Column(Text)
+    # 妙记精准转写结果
+    transcript_text = Column(Text)
+    # 说话人分段 JSON 字符串
+    speaker_segments_json = Column(Text)
+
+    # 会议摘要快照
+    summary_title = Column(String(255))
+    summary_paragraph = Column(Text)
+    # 待办快照 JSON 字符串
+    todos_json = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class VolcAsrSession(Base):
     """火山引擎大模型流式语音识别会话"""
     __tablename__ = "volc_asr_sessions"
@@ -369,6 +400,26 @@ class LocalMeetingTodo(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class LocalMeetingMinutesSession(Base):
+    """本地会议纪要会话历史快照（每次生成纪要一条）。"""
+    __tablename__ = "local_meeting_minutes_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_no = Column(String(64), index=True)
+    meeting_id = Column(Integer, index=True, nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    source_asr_session_id = Column(Integer, index=True)
+    status = Column(String(32), default="submitted", nullable=False)
+    error_msg = Column(Text)
+    stream_transcript_text = Column(Text)
+    transcript_text = Column(Text)
+    summary_title = Column(String(255))
+    summary_paragraph = Column(Text)
+    todos_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class LocalAsrSession(Base):
     """本地 Qwen3-ASR 流式语音识别会话"""
     __tablename__ = "local_asr_sessions"
@@ -388,6 +439,28 @@ class LocalAsrSession(Base):
 
 # 创建所有表
 Base.metadata.create_all(bind=engine)
+
+
+def _ensure_schema_compatibility() -> None:
+    """
+    轻量兼容迁移：为历史库补齐新增字段。
+    说明：项目目前未接入 Alembic，这里在启动时做幂等补丁。
+    """
+    inspector = inspect(engine)
+    table_name = "volc_meeting_minutes_sessions"
+    existing_tables = set(inspector.get_table_names())
+    if table_name not in existing_tables:
+        return
+
+    existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
+    if "session_no" in existing_columns:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN session_no VARCHAR(64)"))
+
+
+_ensure_schema_compatibility()
 
 def get_db():
     """数据库依赖"""
