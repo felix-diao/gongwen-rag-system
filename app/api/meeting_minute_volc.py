@@ -150,7 +150,7 @@ async def live_recording(
 
 @router.post(
     "/volc/{meeting_id}/upload",
-    response_model=StandardResponse[schemas2.VolcMeetingAudioInDB],
+    response_model=StandardResponse[schemas2.VolcAudioUploadTask],
 )
 def upload_audio(
     meeting_id: int,
@@ -166,7 +166,7 @@ def upload_audio(
     """
     _get_meeting_or_404(db, meeting_id)
     try:
-        record = volc_minutes_service.upload_audio_fileobj(
+        task = volc_minutes_service.start_upload_audio_task(
             db=db,
             meeting_id=meeting_id,
             upload_file=file,
@@ -181,9 +181,23 @@ def upload_audio(
 
     return StandardResponse(
         success=True,
-        data=schemas2.VolcMeetingAudioInDB.model_validate(record),
-        message="音频已上传至对象存储，请调用流式转写接口进行转写",
+        data=task,
+        message="音频上传任务已创建，请轮询任务状态",
     )
+
+@router.get(
+    "/volc/upload-tasks/{task_id}",
+    response_model=StandardResponse[schemas2.VolcAudioUploadTask],
+)
+def get_upload_audio_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    task = volc_minutes_service.get_upload_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="上传任务未找到")
+    return StandardResponse(success=True, data=task, message="获取上传任务状态成功")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,6 +282,10 @@ async def stream_asr(
 def submit_minutes(
     meeting_id: int,
     audio_id: Optional[int] = Query(None, description="指定要提交的音频 ID，不传则取该会议最新一条"),
+    source: Optional[str] = Query(
+        None,
+        description="提交来源：live（在线录音）或 existing_audio（基于已有音频）",
+    ),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -291,8 +309,15 @@ def submit_minutes(
     else:
         audio = _get_latest_audio_or_404(db, meeting_id)
 
+    if source is not None and source not in {"live", "existing_audio"}:
+        raise HTTPException(status_code=400, detail="source 仅支持 live 或 existing_audio")
+
     try:
-        record = volc_minutes_service.submit_audio(db=db, audio_id=audio.id)
+        record = volc_minutes_service.submit_audio(
+            db=db,
+            audio_id=audio.id,
+            source=source,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -302,6 +327,39 @@ def submit_minutes(
         success=True,
         data=schemas2.VolcMeetingAudioInDB.model_validate(record),
         message="已提交豆包语音妙记，处理中，完成后将通过 WebSocket 推送结果",
+    )
+
+
+@router.post(
+    "/volc/{meeting_id}/abandon",
+    response_model=StandardResponse[schemas2.VolcMeetingAudioInDB],
+)
+def abandon_minutes(
+    meeting_id: int,
+    audio_id: int = Query(..., description="要作废的音频任务 ID"),
+    reason: Optional[str] = Query(None, description="作废原因"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    用户离开页面时，主动作废当前纪要生成任务。
+    作废后任务不会继续产出纪要和会话历史。
+    """
+    _get_meeting_or_404(db, meeting_id)
+    try:
+        record = volc_minutes_service.abandon_audio_task(
+            db=db,
+            audio_id=audio_id,
+            meeting_id=meeting_id,
+            reason=reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return StandardResponse(
+        success=True,
+        data=schemas2.VolcMeetingAudioInDB.model_validate(record),
+        message="任务已作废",
     )
 
 
@@ -322,6 +380,27 @@ def clear_minutes(
     _get_meeting_or_404(db, meeting_id)
     volc_minutes_service.clear_minutes(db, meeting_id)
     return StandardResponse(success=True, data=None, message="已清空会议纪要")
+
+@router.post(
+    "/volc/{meeting_id}/discard",
+    response_model=StandardResponse[None],
+)
+def discard_workspace(
+    meeting_id: int,
+    reason: Optional[str] = Query(None, description="丢弃原因"),
+    current_audio_id: Optional[int] = Query(None, description="当前待丢弃的音频 ID"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """丢弃当前火山纪要工作区（重置/离开页面时使用，不保留当前会话）。"""
+    _get_meeting_or_404(db, meeting_id)
+    volc_minutes_service.discard_workspace(
+        db=db,
+        meeting_id=meeting_id,
+        reason=reason or "用户离开页面或重置，当前工作区内容已丢弃",
+        current_audio_id=current_audio_id,
+    )
+    return StandardResponse(success=True, data=None, message="已丢弃当前工作区")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

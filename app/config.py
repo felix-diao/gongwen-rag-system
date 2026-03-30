@@ -139,9 +139,6 @@ class Settings(BaseSettings):
     QWEN_ASR_LIVE_CHUNK_SEC: float = 6.0
     QWEN_ASR_LIVE_OVERLAP_SEC: float = 1.0
 
-    # 本地会议纪要 TOS 配置（复用 VOLC_TOS 的 endpoint/region/key，仅 bucket 不同）
-    LOCAL_TOS_BUCKET: str = "meeting-record-local-temp"
-
     class Config:
         env_file = ".env"
 

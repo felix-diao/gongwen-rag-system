@@ -99,7 +99,8 @@ async def live_recording(
     - 连接 URL：ws://.../api/minutes/local/{meeting_id}/live?token=<JWT>
     - 客户端发送（二进制）：PCM 音频帧（16kHz, 16-bit, 单声道）
     - 客户端发送（JSON）：
-        {"action": "stop"}
+        {"action": "stop"}     # 正常结束：保存 WAV、上传 TOS、转写与纪要
+        {"action": "discard"}  # 主动丢弃（如离开页面）：不保存/不上传，推送 discarded
         {"action": "config", "rate": 16000, "channels": 1}
     - 服务端推送（JSON）：
         {"type": "session_created", "session_id": 123}
@@ -107,6 +108,7 @@ async def live_recording(
         {"type": "final",     "text": "...", "accumulated": "..."}
         {"type": "saving_audio",   "session_id": 123}
         {"type": "uploading_audio", "session_id": 123}
+        {"type": "discarded", "session_id": 123}
         {"type": "completed", "session_id": 123, "audio_id": 456,
          "transcript": "...", "audio_uploaded": true, "duration_seconds": 60.0}
         {"type": "error",     "message": "..."}
@@ -392,6 +394,28 @@ def clear_minutes(
     return StandardResponse(success=True, data=None, message="已清空会议纪要")
 
 
+@router.post(
+    "/local/{meeting_id}/discard",
+    response_model=StandardResponse[None],
+)
+def discard_workspace(
+    meeting_id: int,
+    reason: Optional[str] = Query(None, description="丢弃原因"),
+    current_audio_id: Optional[int] = Query(None, description="当前待丢弃的音频 ID"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """丢弃当前本地纪要工作区（离开页面/重置时使用，不保留当前会话）。"""
+    _get_meeting_or_404(db, meeting_id)
+    local_minutes_service.discard_workspace(
+        db=db,
+        meeting_id=meeting_id,
+        reason=reason or "用户离开页面或重置，当前工作区内容已丢弃",
+        current_audio_id=current_audio_id,
+    )
+    return StandardResponse(success=True, data=None, message="已丢弃当前工作区")
+
+
 @router.get(
     "/local/asr/health",
     response_model=StandardResponse[dict],
@@ -478,7 +502,10 @@ def update_minutes_session(
 ):
     """修改本地纪要会话历史详情。"""
     _get_meeting_or_404(db, meeting_id)
-    session = local_minutes_service.update_minutes_session(db, meeting_id, session_id, payload)
+    try:
+        session = local_minutes_service.update_minutes_session(db, meeting_id, session_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not session:
         raise HTTPException(status_code=404, detail="会话历史未找到")
     return StandardResponse(success=True, data=session, message="会话详情已更新")

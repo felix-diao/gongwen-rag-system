@@ -11,7 +11,7 @@ import re
 import shutil
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -29,7 +29,10 @@ except ImportError:
     tos = None
 
 logger = get_logger("local_minutes_service")
+SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
 MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING = 10
+MINUTES_STATUS_COMPLETED = "completed"
+MINUTES_STATUS_FAILED = "failed"
 
 
 # ─── TOS 上传器（复用 volc TOS 基础设施，bucket 不同）─────────────────────────
@@ -116,6 +119,18 @@ class LocalMinutesService:
         if self._uploader is None:
             self._uploader = _LocalTosUploader()
         return self._uploader
+
+    @staticmethod
+    def _normalize_minutes_session_status(status: Optional[str], default: str = MINUTES_STATUS_FAILED) -> str:
+        if not status:
+            return MINUTES_STATUS_COMPLETED if default == MINUTES_STATUS_COMPLETED else MINUTES_STATUS_FAILED
+        raw = str(status).strip()
+        lower = raw.lower()
+        if lower in {"completed", "success", "succeeded", "successed", "finished", "done", "已完成"}:
+            return MINUTES_STATUS_COMPLETED
+        if lower in {"failed", "fail", "error", "失败"}:
+            return MINUTES_STATUS_FAILED
+        return MINUTES_STATUS_FAILED
 
     @staticmethod
     def _build_object_key(meeting_id: int, original_name: str) -> str:
@@ -214,38 +229,27 @@ class LocalMinutesService:
             if latest_audio:
                 latest_audio.status = "failed"
                 db.commit()
-                self._create_minutes_session_snapshot(
-                    db=db,
-                    meeting_id=meeting_id,
-                    audio=latest_audio,
-                    status="failed",
-                    error_msg=err_msg,
-                )
-            else:
-                # 兜底：即便当前未拿到音频记录，也要落一条失败会话，避免前端“只看到已完成会话”。
-                self._create_failed_minutes_session_without_audio(
-                    db=db,
-                    meeting_id=meeting_id,
-                    error_msg=err_msg,
-                )
             raise ValueError(err_msg)
 
         meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
         meeting_title = meeting.title if meeting else "会议"
         transcript = audio.transcript_text
+        source_audio_id = audio.id
 
         payload = self._call_llm(meeting_title, transcript)
         if not payload:
             audio.status = "failed"
             db.commit()
-            self._create_minutes_session_snapshot(
-                db=db,
-                meeting_id=meeting_id,
-                audio=audio,
-                status="failed",
-                error_msg="LLM 生成会议纪要失败，请重试",
-            )
             raise RuntimeError("LLM 生成会议纪要失败，请重试")
+
+        # 工作区可能在生成过程中被前端丢弃/重置：此时禁止回写摘要/待办和会话。
+        current_audio = (
+            db.query(database.LocalMeetingAudio)
+            .filter(database.LocalMeetingAudio.id == source_audio_id)
+            .first()
+        )
+        if (not current_audio) or (not current_audio.transcript_text) or (current_audio.transcript_text != transcript):
+            raise ValueError("当前工作区已被丢弃，请重新开始转写并生成会议纪要")
 
         # 清旧
         db.query(database.LocalMeetingSummary).filter(
@@ -286,7 +290,7 @@ class LocalMinutesService:
             db.add(todo)
             todo_records.append(todo)
 
-        audio.status = "completed"
+        current_audio.status = "completed"
         db.commit()
         db.refresh(summary_record)
         for t in todo_records:
@@ -294,7 +298,7 @@ class LocalMinutesService:
         self._create_minutes_session_snapshot(
             db=db,
             meeting_id=meeting_id,
-            audio=audio,
+            audio=current_audio,
             status="completed",
             summary_record=summary_record,
             todo_records=todo_records,
@@ -558,7 +562,13 @@ class LocalMinutesService:
     ) -> List[schemas2.LocalMeetingMinutesSessionInDB]:
         sessions = (
             db.query(database.LocalMeetingMinutesSession)
-            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
+            .filter(
+                database.LocalMeetingMinutesSession.meeting_id == meeting_id,
+                database.LocalMeetingMinutesSession.session_no.isnot(None),
+                database.LocalMeetingMinutesSession.status.in_(
+                    [MINUTES_STATUS_COMPLETED, "completed", "success", "succeeded", "finished"]
+                ),
+            )
             .order_by(database.LocalMeetingMinutesSession.created_at.asc())
             .all()
         )
@@ -599,10 +609,13 @@ class LocalMinutesService:
         )
         if not session:
             return None
+        normalized_status = self._normalize_minutes_session_status(session.status, default=session.status)
+        if normalized_status != MINUTES_STATUS_COMPLETED:
+            raise ValueError("仅已完成的会话允许编辑")
 
         fields_set = payload.model_fields_set
         if "status" in fields_set:
-            session.status = payload.status or session.status
+            session.status = self._normalize_minutes_session_status(payload.status, default=session.status)
         if "error_msg" in fields_set:
             session.error_msg = payload.error_msg
         if "stream_transcript_text" in fields_set:
@@ -657,7 +670,7 @@ class LocalMinutesService:
             "meeting_id": item.meeting_id,
             "source_audio_id": item.source_audio_id,
             "source_asr_session_id": item.source_asr_session_id,
-            "status": item.status,
+            "status": self._normalize_minutes_session_status(item.status),
             "error_msg": item.error_msg,
             "stream_transcript_text": item.stream_transcript_text,
             "transcript_text": item.transcript_text,
@@ -688,7 +701,13 @@ class LocalMinutesService:
         meeting_id: int,
         base_dt: Optional[datetime] = None,
     ) -> str:
-        cursor = (base_dt or datetime.utcnow()).replace(microsecond=0)
+        if base_dt is None:
+            cursor = datetime.now(SESSION_NO_TIMEZONE)
+        elif base_dt.tzinfo is None:
+            cursor = base_dt
+        else:
+            cursor = base_dt.astimezone(SESSION_NO_TIMEZONE)
+        cursor = cursor.replace(microsecond=0)
         while True:
             candidate = self._format_session_no(meeting_id, cursor)
             exists = (
@@ -754,54 +773,10 @@ class LocalMinutesService:
             meeting_id=meeting_id,
             source_audio_id=audio.id,
             source_asr_session_id=audio.source_asr_session_id,
-            status=status,
+            status=self._normalize_minutes_session_status(status),
             error_msg=error_msg,
             stream_transcript_text=self._resolve_stream_transcript_text(db, audio),
             transcript_text=audio.transcript_text,
-            summary_title=summary.title if summary else None,
-            summary_paragraph=summary.paragraph if summary else None,
-            todos_json=json.dumps(todos_payload, ensure_ascii=False),
-        )
-        db.add(session)
-        db.commit()
-        db.refresh(session)
-        return session
-
-    def _create_failed_minutes_session_without_audio(
-        self,
-        db: Session,
-        meeting_id: int,
-        error_msg: str,
-    ) -> database.LocalMeetingMinutesSession:
-        summary = (
-            db.query(database.LocalMeetingSummary)
-            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
-            .first()
-        )
-        todos = (
-            db.query(database.LocalMeetingTodo)
-            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
-            .order_by(database.LocalMeetingTodo.id.asc())
-            .all()
-        )
-        todos_payload = [
-            {
-                "content": item.content,
-                "executor": item.executor,
-                "execution_time": item.execution_time,
-                "source_audio_id": item.source_audio_id,
-            }
-            for item in todos
-        ]
-        session = database.LocalMeetingMinutesSession(
-            session_no=self._build_unique_session_no(db, meeting_id),
-            meeting_id=meeting_id,
-            source_audio_id=None,
-            source_asr_session_id=None,
-            status="failed",
-            error_msg=error_msg,
-            stream_transcript_text=None,
-            transcript_text=None,
             summary_title=summary.title if summary else None,
             summary_paragraph=summary.paragraph if summary else None,
             todos_json=json.dumps(todos_payload, ensure_ascii=False),
@@ -883,56 +858,6 @@ class LocalMinutesService:
                     )
                 )
 
-    def _sync_latest_session_from_current_minutes(self, db: Session, meeting_id: int) -> None:
-        session = (
-            db.query(database.LocalMeetingMinutesSession)
-            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
-            .order_by(database.LocalMeetingMinutesSession.created_at.desc(), database.LocalMeetingMinutesSession.id.desc())
-            .first()
-        )
-        if not session:
-            return
-        audio = (
-            db.query(database.LocalMeetingAudio)
-            .filter(database.LocalMeetingAudio.meeting_id == meeting_id)
-            .order_by(database.LocalMeetingAudio.updated_at.desc(), database.LocalMeetingAudio.id.desc())
-            .first()
-        )
-        if not audio:
-            return
-        summary = (
-            db.query(database.LocalMeetingSummary)
-            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
-            .first()
-        )
-        todos = (
-            db.query(database.LocalMeetingTodo)
-            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
-            .order_by(database.LocalMeetingTodo.id.asc())
-            .all()
-        )
-        session.source_audio_id = audio.id
-        session.source_asr_session_id = audio.source_asr_session_id
-        session.status = audio.status or session.status
-        session.error_msg = audio.error_msg
-        session.stream_transcript_text = self._resolve_stream_transcript_text(db, audio)
-        session.transcript_text = audio.transcript_text
-        session.summary_title = summary.title if summary else None
-        session.summary_paragraph = summary.paragraph if summary else None
-        session.todos_json = json.dumps(
-            [
-                {
-                    "content": item.content,
-                    "executor": item.executor,
-                    "execution_time": item.execution_time,
-                    "source_audio_id": item.source_audio_id,
-                }
-                for item in todos
-            ],
-            ensure_ascii=False,
-        )
-        db.commit()
-
     # ── 清空 ─────────────────────────────────────────────────────────────────
 
     def clear_minutes(self, db: Session, meeting_id: int) -> None:
@@ -947,6 +872,77 @@ class LocalMinutesService:
         ).update({"transcript_text": None}, synchronize_session=False)
         db.commit()
         logger.info("Cleared local minutes meeting_id=%s", meeting_id)
+
+    def _cleanup_asr_runtime_artifacts(self, db: Session, meeting_id: int) -> None:
+        asr_sessions = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.meeting_id == meeting_id)
+            .all()
+        )
+        for session in asr_sessions:
+            local_path = (session.audio_local_path or "").strip()
+            if not local_path:
+                continue
+            try:
+                Path(local_path).unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to remove local ASR audio file meeting_id=%s session_id=%s path=%s err=%s",
+                    meeting_id,
+                    session.id,
+                    local_path,
+                    exc,
+                )
+        db.query(database.LocalAsrSession).filter(
+            database.LocalAsrSession.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+
+    def discard_workspace(
+        self,
+        db: Session,
+        meeting_id: int,
+        reason: str = "用户离开页面或重置，当前工作区内容已丢弃",
+        current_audio_id: Optional[int] = None,
+    ) -> None:
+        """
+        丢弃本地纪要工作区：
+        - 清空摘要/待办/转写
+        - 清理 ASR 运行期产物
+        - 仅删除非最终态会话，保留已完成历史
+        - 可按 current_audio_id 强制删除当前会话，覆盖前后端竞态
+        """
+        self.clear_minutes(db, meeting_id)
+        self._cleanup_asr_runtime_artifacts(db, meeting_id)
+
+        audios = (
+            db.query(database.LocalMeetingAudio)
+            .filter(database.LocalMeetingAudio.meeting_id == meeting_id)
+            .all()
+        )
+        for audio in audios:
+            status_lower = str(audio.status or "").lower()
+            if status_lower in {"completed", "success", "succeeded", "finished"}:
+                continue
+            audio.status = "uploaded"
+            audio.error_msg = reason
+            audio.transcript_text = None
+            audio.source_asr_session_id = None
+
+        db.query(database.LocalMeetingMinutesSession).filter(
+            database.LocalMeetingMinutesSession.meeting_id == meeting_id,
+            ~database.LocalMeetingMinutesSession.status.in_(
+                [MINUTES_STATUS_COMPLETED, "completed", "success", "succeeded", "finished"]
+            ),
+        ).delete(synchronize_session=False)
+
+        if current_audio_id is not None:
+            db.query(database.LocalMeetingMinutesSession).filter(
+                database.LocalMeetingMinutesSession.meeting_id == meeting_id,
+                database.LocalMeetingMinutesSession.source_audio_id == current_audio_id,
+            ).delete(synchronize_session=False)
+
+        db.commit()
+        logger.info("Discarded local minutes workspace meeting_id=%s", meeting_id)
 
     # ── Summary CRUD ─────────────────────────────────────────────────────────
 
@@ -970,7 +966,6 @@ class LocalMinutesService:
             db.add(summary)
         db.commit()
         db.refresh(summary)
-        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return summary
 
     # ── Todo CRUD ────────────────────────────────────────────────────────────
@@ -986,7 +981,6 @@ class LocalMinutesService:
         db.add(todo)
         db.commit()
         db.refresh(todo)
-        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return todo
 
     def update_todo(
@@ -1007,7 +1001,6 @@ class LocalMinutesService:
             todo.execution_time = payload.execution_time
         db.commit()
         db.refresh(todo)
-        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return todo
 
     def delete_todo(self, db: Session, meeting_id: int, todo_id: int) -> bool:
@@ -1020,7 +1013,6 @@ class LocalMinutesService:
             return False
         db.delete(todo)
         db.commit()
-        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return True
 
     def update_latest_transcript(
@@ -1040,7 +1032,6 @@ class LocalMinutesService:
         audio.transcript_text = transcript_text
         db.commit()
         db.refresh(audio)
-        self._sync_latest_session_from_current_minutes(db, meeting_id)
         return audio
 
 

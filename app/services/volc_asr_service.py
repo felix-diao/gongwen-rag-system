@@ -167,6 +167,42 @@ def _finalize_session(
     return session
 
 
+def _upload_live_audio_to_tos(
+    meeting_id: int,
+    session_id: int,
+    audio_path: str,
+    transcript: str,
+) -> Optional[int]:
+    """
+    在线录音停止后的 TOS 上传在独立线程执行，避免阻塞 asyncio 事件循环。
+    返回上传后的 volc_meeting_audio.id，失败返回 None。
+    """
+    db = SessionLocal()
+    try:
+        from app.services.volc_minutes_service import volc_minutes_service
+
+        audio_record = volc_minutes_service.upload_from_local(
+            db=db,
+            meeting_id=meeting_id,
+            local_path=Path(audio_path),
+            original_name=f"live_{session_id}.wav",
+            content_type="audio/wav",
+            source_asr_session_id=session_id,
+        )
+        if transcript:
+            audio_record.transcript_text = transcript
+            db.commit()
+        return audio_record.id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to upload live audio to TOS (thread worker): %s", exc)
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # ─── 文件模式 ASR（后台任务） ──────────────────────────────────────────────────
 
 def _ensure_wav_on_disk(file_path: str) -> str:
@@ -335,6 +371,7 @@ class LiveAsrHandler:
         self._channels = 1
         self._sample_width = 2  # 16-bit
         self._ws_alive = True   # 前端连接是否仍然有效
+        self._discard_requested = False
 
     async def run(self) -> None:
         from fastapi.websockets import WebSocketDisconnect
@@ -414,6 +451,10 @@ class LiveAsrHandler:
                             if ctrl.get("action") == "stop":
                                 prefetch_stop.set()
                                 stop_event.set()
+                            elif ctrl.get("action") == "discard":
+                                self._discard_requested = True
+                                prefetch_stop.set()
+                                stop_event.set()
                         except (json.JSONDecodeError, KeyError):
                             pass
                     elif "bytes" in raw and raw["bytes"]:
@@ -489,6 +530,32 @@ class LiveAsrHandler:
         logger.info("LiveAsrHandler: Volc ASR done, saving audio meeting_id=%s session_id=%s chunks=%d",
                     self._meeting_id, self._session_id, len(self._audio_chunks))
 
+        if self._discard_requested:
+            # 用户主动丢弃：不保存本地 WAV、不上传 TOS、不保留本次逐段转写。
+            if self._session_id is not None:
+                self._db.query(VolcAudioTranscription).filter(
+                    VolcAudioTranscription.source_session_id == self._session_id
+                ).delete(synchronize_session=False)
+            _finalize_session(
+                self._db,
+                self._session_id,
+                "",
+                error_msg="用户主动丢弃，未保存音频与纪要",
+            )
+            self._audio_chunks.clear()
+            self._transcript_parts.clear()
+            if self._ws_alive:
+                try:
+                    await self._ws.send_json({"type": "discarded", "session_id": self._session_id})
+                except Exception:
+                    self._ws_alive = False
+            logger.info(
+                "LiveAsrHandler: discarded session meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+            return
+
         # 通知前端：开始保存音频（便于展示进度）
         if self._ws_alive:
             try:
@@ -529,20 +596,14 @@ class LiveAsrHandler:
         audio_id: Optional[int] = None
         if audio_path:
             try:
-                from app.services.volc_minutes_service import volc_minutes_service
-                audio_record = volc_minutes_service.upload_from_local(
-                    db=self._db,
-                    meeting_id=self._meeting_id,
-                    local_path=Path(audio_path),
-                    original_name=f"live_{self._session_id}.wav",
-                    content_type="audio/wav",
-                    source_asr_session_id=self._session_id,
+                # 关键：上传是阻塞 I/O，放到线程池中执行，避免阻塞整个事件循环。
+                audio_id = await asyncio.to_thread(
+                    _upload_live_audio_to_tos,
+                    self._meeting_id,
+                    int(self._session_id),
+                    audio_path,
+                    transcript,
                 )
-                # 同步粗转写文本到 audio 记录
-                if transcript:
-                    audio_record.transcript_text = transcript
-                    self._db.commit()
-                audio_id = audio_record.id
                 logger.info("Live audio uploaded to TOS audio_id=%s", audio_id)
             except Exception as exc:
                 logger.warning("Failed to upload live audio to TOS: %s", exc)
@@ -624,6 +685,15 @@ class LiveAsrHandler:
                         if ctrl.get("action") == "stop":
                             logger.info("LiveAsrHandler: client sent stop meeting_id=%s session_id=%s chunks=%d",
                                         self._meeting_id, self._session_id, chunk_count)
+                            stop_event.set()
+                        elif ctrl.get("action") == "discard":
+                            logger.info(
+                                "LiveAsrHandler: client sent discard meeting_id=%s session_id=%s chunks=%d",
+                                self._meeting_id,
+                                self._session_id,
+                                chunk_count,
+                            )
+                            self._discard_requested = True
                             stop_event.set()
                         elif ctrl.get("action") == "config":
                             self._sample_rate = ctrl.get("rate", self._sample_rate)

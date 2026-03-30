@@ -33,7 +33,7 @@ from difflib import SequenceMatcher
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -250,6 +250,61 @@ def _finalize_session(
     db.commit()
     db.refresh(session)
     return session
+
+
+def _upload_local_live_audio_and_minutes(
+    meeting_id: int,
+    session_id: int,
+    audio_path: str,
+    transcript: str,
+) -> Tuple[Optional[int], bool, Optional[str]]:
+    """
+    在线录音停止后的 TOS 上传与纪要生成在线程池执行，避免阻塞 asyncio 事件循环
+    （与火山 volc 版 asyncio.to_thread 对齐，防止上传阶段卡死整站 WS/HTTP）。
+    """
+    from app.services.local_minutes_service import local_minutes_service
+
+    db = SessionLocal()
+    audio_id: Optional[int] = None
+    minutes_generated = False
+    minutes_error: Optional[str] = None
+    try:
+        audio_record = local_minutes_service.upload_from_local(
+            db=db,
+            meeting_id=meeting_id,
+            local_path=Path(audio_path),
+            original_name=f"live_{session_id}.wav",
+            content_type="audio/wav",
+            source_asr_session_id=session_id,
+        )
+        if transcript:
+            audio_record.transcript_text = transcript
+            db.commit()
+        audio_id = audio_record.id
+        logger.info("Local live audio uploaded to TOS audio_id=%s (thread worker)", audio_id)
+        if transcript:
+            try:
+                local_minutes_service.generate_minutes_from_transcript(db, meeting_id)
+                minutes_generated = True
+                logger.info(
+                    "LocalLiveASR auto minutes generated meeting_id=%s (thread worker)",
+                    meeting_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                minutes_error = str(exc)
+                logger.warning(
+                    "LocalLiveASR auto minutes generation failed meeting_id=%s: %s",
+                    meeting_id,
+                    exc,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to upload local live audio / minutes (thread worker): %s", exc)
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return audio_id, minutes_generated, minutes_error
 
 
 # ─── Qwen3-ASR WebSocket 协议工具 ────────────────────────────────────────────
@@ -982,6 +1037,7 @@ class LocalLiveAsrHandler:
         self._ws_alive = True
         self._speech_active = False
         self._last_speech_ts = 0.0
+        self._discard_requested = False
 
     def _in_speech_window(self) -> bool:
         # 允许 speech_stopped 后短时间内继续接收尾部转写，避免误丢真实结尾
@@ -995,7 +1051,11 @@ class LocalLiveAsrHandler:
 
         try:
             from app.services.local_minutes_service import local_minutes_service
-            local_minutes_service.clear_minutes(self._db, self._meeting_id)
+            local_minutes_service.discard_workspace(
+                self._db,
+                self._meeting_id,
+                reason="开始新一轮在线录音，丢弃当前工作区",
+            )
         except Exception as exc:
             logger.warning("Failed to clear before live ASR meeting_id=%s: %s", self._meeting_id, exc)
 
@@ -1049,7 +1109,11 @@ class LocalLiveAsrHandler:
                         try:
                             ctrl = json.loads(raw["text"])
                             prefetch_ctrl.append(ctrl)
-                            if ctrl.get("action") == "stop":
+                            if ctrl.get("action") == "discard":
+                                self._discard_requested = True
+                                prefetch_stop.set()
+                                stop_event.set()
+                            elif ctrl.get("action") == "stop":
                                 prefetch_stop.set()
                                 stop_event.set()
                         except (json.JSONDecodeError, KeyError):
@@ -1152,6 +1216,27 @@ class LocalLiveAsrHandler:
             except asyncio.CancelledError:
                 pass
 
+        if self._discard_requested:
+            _finalize_session(
+                self._db,
+                int(self._session_id),
+                "",
+                error_msg="用户主动丢弃，未保存音频与纪要",
+            )
+            self._audio_chunks.clear()
+            self._merged_final_text = ""
+            if self._ws_alive:
+                try:
+                    await self._ws.send_json({"type": "discarded", "session_id": self._session_id})
+                except Exception:
+                    self._ws_alive = False
+            logger.info(
+                "LocalLiveASR: discarded session meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+            return
+
         # 保存音频
         if self._ws_alive:
             try:
@@ -1189,37 +1274,21 @@ class LocalLiveAsrHandler:
         transcript = self._merged_final_text
         _finalize_session(self._db, self._session_id, transcript, audio_local_path=audio_path, duration_seconds=duration)
 
-        # 上传到 TOS
+        # 上传到 TOS + 自动生成纪要（线程池，避免同步 IO 阻塞事件循环）
         audio_id: Optional[int] = None
         minutes_generated = False
         minutes_error: Optional[str] = None
         if audio_path:
             try:
-                from app.services.local_minutes_service import local_minutes_service
-                audio_record = local_minutes_service.upload_from_local(
-                    db=self._db, meeting_id=self._meeting_id,
-                    local_path=Path(audio_path),
-                    original_name=f"live_{self._session_id}.wav",
-                    content_type="audio/wav",
-                    source_asr_session_id=self._session_id,
+                audio_id, minutes_generated, minutes_error = await asyncio.to_thread(
+                    _upload_local_live_audio_and_minutes,
+                    self._meeting_id,
+                    int(self._session_id),
+                    audio_path,
+                    transcript,
                 )
-                if transcript:
-                    audio_record.transcript_text = transcript
-                    self._db.commit()
-                audio_id = audio_record.id
-                logger.info("Live audio uploaded to TOS audio_id=%s", audio_id)
-            except Exception as exc:
-                logger.warning("Failed to upload live audio to TOS: %s", exc)
-
-        if transcript:
-            try:
-                from app.services.local_minutes_service import local_minutes_service
-                local_minutes_service.generate_minutes_from_transcript(self._db, self._meeting_id)
-                minutes_generated = True
-                logger.info("LocalLiveASR auto minutes generated meeting_id=%s", self._meeting_id)
-            except Exception as exc:
-                minutes_error = str(exc)
-                logger.warning("LocalLiveASR auto minutes generation failed meeting_id=%s: %s", self._meeting_id, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Local live upload/minutes asyncio.to_thread failed: %s", exc)
 
         if self._ws_alive:
             try:
@@ -1361,7 +1430,10 @@ class LocalLiveAsrHandler:
             if "text" in raw and raw["text"]:
                 try:
                     ctrl = json.loads(raw["text"])
-                    if ctrl.get("action") == "stop":
+                    if ctrl.get("action") == "discard":
+                        self._discard_requested = True
+                        stop_event.set()
+                    elif ctrl.get("action") == "stop":
                         stop_event.set()
                     elif ctrl.get("action") == "config":
                         # 会话开始后不再动态修改采样参数，避免切片时间轴漂移
@@ -1391,6 +1463,9 @@ class LocalLiveAsrHandler:
         await seg_queue.put(None)
         await seg_queue.join()
         await worker_task
+
+        if self._discard_requested:
+            return
 
     async def _forward_audio(
         self, ds_ws, stop_event: asyncio.Event,
@@ -1422,7 +1497,10 @@ class LocalLiveAsrHandler:
                 if "text" in raw and raw["text"]:
                     try:
                         ctrl = json.loads(raw["text"])
-                        if ctrl.get("action") == "stop":
+                        if ctrl.get("action") == "discard":
+                            self._discard_requested = True
+                            stop_event.set()
+                        elif ctrl.get("action") == "stop":
                             stop_event.set()
                         elif ctrl.get("action") == "config":
                             self._sample_rate = ctrl.get("rate", self._sample_rate)
@@ -1528,7 +1606,12 @@ async def stream_local_file_asr(
     try:
         try:
             from app.services.local_minutes_service import local_minutes_service
-            local_minutes_service.clear_minutes(db, meeting_id)
+            local_minutes_service.discard_workspace(
+                db,
+                meeting_id,
+                reason="开始新一轮上传音频转写，丢弃当前工作区",
+                current_audio_id=audio_id,
+            )
         except Exception as exc:
             logger.warning("Failed to clear before SSE ASR meeting_id=%s: %s", meeting_id, exc)
 

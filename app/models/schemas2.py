@@ -218,6 +218,18 @@ class VolcMeetingAudioInDB(VolcMeetingAudioBase):
     updated_at: datetime
 
 
+class VolcAudioUploadTask(BaseModel):
+    """火山音频异步上传任务状态"""
+    task_id: str
+    meeting_id: int
+    file_name: str
+    status: str  # pending | running | completed | failed
+    audio_id: Optional[int] = None
+    error_msg: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 # ── 语音妙记结果（Todos / Summary）──────────────────────────────────────────
 
 class VolcMeetingTodoBase(BaseModel):
