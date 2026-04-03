@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from typing import List, Optional
+from pydantic import field_validator
 import os
 
 # 在导入配置之前就设置离线模式
@@ -11,6 +12,17 @@ class Settings(BaseSettings):
     APP_NAME: str = "公文大模型RAG系统"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, value):
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in {"release", "prod", "production", "0", "false", "off", "no"}:
+                return False
+            if raw in {"debug", "dev", "development", "1", "true", "on", "yes"}:
+                return True
+        return value
     
     # 数据库配置
     DATABASE_URL: str = "postgresql://gongwen_user:password123@localhost:5432/gongwen_rag"
@@ -139,7 +151,25 @@ class Settings(BaseSettings):
     QWEN_ASR_LIVE_CHUNK_SEC: float = 6.0
     QWEN_ASR_LIVE_OVERLAP_SEC: float = 1.0
 
+    # 本地会议纪要 TOS 配置（复用 VOLC_TOS 的 endpoint/region/key，仅 bucket 不同）
+    LOCAL_TOS_BUCKET: str = "meeting-record-local-temp"
+
     class Config:
         env_file = ".env"
+
+
+def is_postgresql_url(url: str) -> bool:
+    if not url:
+        return False
+    u = url.split(":", 1)[0].lower()
+    return u.startswith("postgresql")
+
+
+def sqlalchemy_connect_args(url: str) -> dict:
+    """PostgreSQL 连接时设置 search_path，避免空 search_path 下建表失败。"""
+    if not is_postgresql_url(url):
+        return {}
+    return {"options": "-c search_path=public"}
+
 
 settings = Settings()

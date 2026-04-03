@@ -1,13 +1,56 @@
-from sqlalchemy import create_engine, Column, String, Float, Boolean, TIMESTAMP, Integer, Text, ARRAY, ForeignKey, DateTime, inspect, text
+from sqlalchemy import (
+    ARRAY,
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Text,
+    TIMESTAMP,
+    create_engine,
+    event,
+    text,
+)
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import relationship, sessionmaker
 from datetime import datetime
-from sqlalchemy import Column, Date
-from app.config import settings
+import os
 
-Base = declarative_base()
-engine = create_engine(settings.DATABASE_URL, echo=settings.DEBUG)
+from app.config import is_postgresql_url, settings, sqlalchemy_connect_args
+
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+_is_pg = is_postgresql_url(settings.DATABASE_URL)
+_metadata_schema = "public" if _is_pg else None
+_metadata = MetaData(schema=_metadata_schema) if _metadata_schema else MetaData()
+Base = declarative_base(metadata=_metadata)
+
+if _is_sqlite:
+    engine = create_engine(
+        settings.DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        echo=settings.DEBUG,
+    )
+elif _is_pg:
+    engine = create_engine(
+        settings.DATABASE_URL,
+        echo=settings.DEBUG,
+        connect_args=sqlalchemy_connect_args(settings.DATABASE_URL),
+    )
+else:
+    engine = create_engine(settings.DATABASE_URL, echo=settings.DEBUG)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+if _is_pg:
+
+    @event.listens_for(engine, "connect")
+    def _pg_set_search_path(dbapi_conn, _connection_record):
+        with dbapi_conn.cursor() as cur:
+            cur.execute("SET search_path TO public")
 
 class Document(Base):
     """文档表"""
@@ -107,7 +150,33 @@ class KnowledgeItem(Base):
     document = relationship("Document", foreign_keys=[doc_id])
 
 
-    # 会议信息表
+    
+
+
+class PromptTemplate(Base):
+    """Prompt 模板表"""
+    __tablename__ = "prompt_templates"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(100), nullable=False, index=True)
+    category = Column(String(50), nullable=False, index=True)
+    description = Column(Text)
+    content = Column(Text, nullable=False)
+    variables = Column(ARRAY(String), default=[])  # 保持与你的风格一致，使用 ARRAY
+    is_active = Column(Boolean, default=True, index=True)
+
+    is_public = Column(Boolean, default=False, index=True, comment="是否为公共模板（管理员专用）")
+
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # 关联关系
+    user = relationship("User", foreign_keys=[user_id])
+
+# ========== 会议域模型（重构后的 meeting_domain 主定义） ==========
+
+# 会议主表。这里只保存会议基础信息，不直接承载纪要内容。
 class Meeting(Base):
     __tablename__ = "meetings"
     
@@ -127,7 +196,7 @@ class Meeting(Base):
     content_text = Column(Text)
     # 会议链接
     meeting_url = Column(String)
-    # 会议状态（pending、created、minutes_generated）
+    # 会议状态（如 created / processing / finished）
     status = Column(String, default="created")
     # 创建者ID
     creator_id = Column(String(64), index=True)
@@ -136,11 +205,8 @@ class Meeting(Base):
     # 更新时间
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
-    # 关联会议文件和纪要（逻辑关联，无外键约束）
-    # files = relationship("MeetingFile", back_populates="meeting")
-    # minutes = relationship("MeetingMinutes", back_populates="meeting")
-
-# 会议文件表
+# 会议文件表。
+# 这是旧会议体系仍在使用的附件表，不属于 meeting_domain 新纪要链路，因此保留不动。
 class MeetingFile(Base):
     __tablename__ = "meeting_files"
     
@@ -192,66 +258,40 @@ class MeetingDecisionItem(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-
-# 会议音频表
+# 统一会议音频表。local / volc 两种 provider 共用这一张表。
 class MeetingAudio(Base):
     __tablename__ = "meeting_audios"
 
     id = Column(Integer, primary_key=True, index=True)
-    meeting_id = Column(Integer, index=True)
-    filename = Column(String)
-    file_path = Column(String)
-    file_type = Column(String) 
-    uploaded_at = Column(DateTime, default=datetime.utcnow)
-    transcript_text = Column(Text)
-    language = Column(String(20), default="zh")
-    status = Column(String(20), default="pending")  # pending/processing/completed/failed
-    error_msg = Column(Text)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-class PromptTemplate(Base):
-    """Prompt 模板表"""
-    __tablename__ = "prompt_templates"
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(64), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
-    name = Column(String(100), nullable=False, index=True)
-    category = Column(String(50), nullable=False, index=True)
-    description = Column(Text)
-    content = Column(Text, nullable=False)
-    variables = Column(ARRAY(String), default=[])  # 保持与你的风格一致，使用 ARRAY
-    is_active = Column(Boolean, default=True, index=True)
-
-    is_public = Column(Boolean, default=False, index=True, comment="是否为公共模板（管理员专用）")
-
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # 关联关系
-    user = relationship("User", foreign_keys=[user_id])
-
-
-class VolcMeetingAudio(Base):
-    __tablename__ = "volc_meeting_audios"
-
-    id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, index=True, nullable=False)
-    file_name = Column(String(255), nullable=False)
-    object_key = Column(String(512), nullable=False)
-    file_url = Column(Text, nullable=False)
+    provider = Column(String(32), index=True, nullable=False, default="local")
+
+    # 统一音频元信息
+    file_name = Column(String(255))
+    object_key = Column(String(512))
+    file_url = Column(Text)
     file_type = Column(String(64))
     status = Column(String(32), default="uploaded", nullable=False)
     task_id = Column(String(128), index=True)
     error_msg = Column(Text)
-    # 语音妙记 返回的更精准转写文本（覆盖流式 ASR 结果）
+    # 当前音频关联的最新转写全文，便于前端列表和排障直接读取。
     transcript_text = Column(Text)
-    # 说话人分段转写（JSON 字符串）：[{"speaker":"说话人1","text":"...","start_ms":0,"end_ms":1500}, ...]
+    # 兼容旧火山纪要逻辑的说话人分段缓存；新 meeting_domain 主链路不依赖该字段。
     speaker_transcript = Column(Text)
-    # 关联的流式 ASR 会话（来源于 Functionality 1）
+    # 来源 ASR 会话 ID：实时录音完成后回填，便于串联日志和历史快照。
     source_asr_session_id = Column(Integer, index=True)
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __mapper_args__ = {
+        "polymorphic_on": provider,
+        "polymorphic_identity": "base",
+    }
+
+
+class VolcMeetingAudio(MeetingAudio):
+    """火山会议纪要音频（单表继承）。"""
+    __mapper_args__ = {"polymorphic_identity": "volc"}
 
 
 class VolcMeetingTodo(Base):
@@ -280,7 +320,7 @@ class VolcMeetingSummary(Base):
 
 
 class VolcMeetingMinutesSession(Base):
-    """火山会议纪要会话历史快照（每次提交妙记生成一条）。"""
+    """火山会议纪要历史快照（每次提交妙记生成一条）。"""
     __tablename__ = "volc_meeting_minutes_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -289,7 +329,7 @@ class VolcMeetingMinutesSession(Base):
     source_audio_id = Column(Integer, index=True)
     source_asr_session_id = Column(Integer, index=True)
     volc_task_id = Column(String(128), index=True)
-    status = Column(String(32), default="submitted", nullable=False)
+    status = Column(String(32), default="completed", nullable=False)
     error_msg = Column(Text)
 
     # 流式 ASR 结果（粗转写）
@@ -309,13 +349,14 @@ class VolcMeetingMinutesSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class VolcAsrSession(Base):
-    """火山引擎大模型流式语音识别会话"""
+    """火山流式 ASR 会话。"""
     __tablename__ = "volc_asr_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, index=True, nullable=False)
-    # "file"：上传音频文件后台转写；"live"：实时 WebSocket 录音转写
-    session_type = Column(String(32), default="file", nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    # 当前重构版主要创建 live 会话；保留类型字段是为了兼容文件转写与排障。
+    session_type = Column(String(32), default="live", nullable=False)
     # pending / processing / completed / failed
     status = Column(String(32), default="pending", nullable=False)
     # 累积的最终转写文本（流式 ASR 输出）
@@ -332,18 +373,18 @@ class VolcAsrSession(Base):
 
 
 class VolcAudioTranscription(Base):
-    """Volc 流式语音识别逐段结果存储"""
+    """火山语音识别/精准转写文本存储。"""
     __tablename__ = "volc_audio_transcriptions"
 
     id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, index=True, nullable=True)
-    # 关联 VolcAsrSession.id
+    # 兼容旧链路：可关联 VolcAsrSession.id
     source_session_id = Column(Integer, index=True, nullable=True)
-    # 兼容旧字段（可关联 meeting_audios.id）
+    # 新旧链路共用：关联 meeting_audios.id
     source_audio_id = Column(Integer, index=True, nullable=True)
-    # 来源标记
+    # 兼容旧链路：来源标记
     provider = Column(String(64), default="volc")
-    # 每一段的识别文本
+    # 每一段的识别文本；既可用于实时粗转写片段，也可用于最终整段精准转写。
     text = Column(Text, nullable=False)
     # 是否是当前 utterance 的最终确认段
     is_final = Column(Boolean, default=False)
@@ -353,24 +394,27 @@ class VolcAudioTranscription(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-# ── 本地会议纪要（Qwen3-ASR + LLM）────────────────────────────────────────
 
-class LocalMeetingAudio(Base):
-    """本地会议纪要 - TOS 音频记录"""
-    __tablename__ = "local_meeting_audios"
+class VolcSpeakerSegment(Base):
+    """火山妙记精准转写的说话人分段。"""
+    __tablename__ = "volc_speaker_segments"
 
     id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, index=True, nullable=False)
-    file_name = Column(String(255), nullable=False)
-    object_key = Column(String(512), nullable=False)
-    file_url = Column(Text, nullable=False)
-    file_type = Column(String(64))
-    status = Column(String(32), default="uploaded", nullable=False)
-    transcript_text = Column(Text)
-    source_asr_session_id = Column(Integer, index=True)
-    error_msg = Column(Text)
+    source_audio_id = Column(Integer, index=True, nullable=False)
+    segment_index = Column(Integer, nullable=False)
+    speaker = Column(String(128), nullable=False)
+    text = Column(Text, nullable=False)
+    start_ms = Column(Float)
+    end_ms = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# ── 本地会议纪要（Qwen3-ASR + LLM）────────────────────────────────────────
+
+class LocalMeetingAudio(MeetingAudio):
+    """本地会议纪要音频（单表继承）。"""
+    __mapper_args__ = {"polymorphic_identity": "local"}
 
 
 class LocalMeetingSummary(Base):
@@ -401,7 +445,7 @@ class LocalMeetingTodo(Base):
 
 
 class LocalMeetingMinutesSession(Base):
-    """本地会议纪要会话历史快照（每次生成纪要一条）。"""
+    """本地会议纪要历史快照（每次生成纪要一条）。"""
     __tablename__ = "local_meeting_minutes_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -409,9 +453,10 @@ class LocalMeetingMinutesSession(Base):
     meeting_id = Column(Integer, index=True, nullable=False)
     source_audio_id = Column(Integer, index=True)
     source_asr_session_id = Column(Integer, index=True)
-    status = Column(String(32), default="submitted", nullable=False)
+    status = Column(String(32), default="completed", nullable=False)
     error_msg = Column(Text)
     stream_transcript_text = Column(Text)
+    # 兼容旧链路：本地纪要没有独立精准转写阶段，这里通常为空。
     transcript_text = Column(Text)
     summary_title = Column(String(255))
     summary_paragraph = Column(Text)
@@ -421,12 +466,13 @@ class LocalMeetingMinutesSession(Base):
 
 
 class LocalAsrSession(Base):
-    """本地 Qwen3-ASR 流式语音识别会话"""
+    """本地流式 ASR 会话。"""
     __tablename__ = "local_asr_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, index=True, nullable=False)
-    session_type = Column(String(32), default="file", nullable=False)
+    source_audio_id = Column(Integer, index=True)
+    session_type = Column(String(32), default="live", nullable=False)
     status = Column(String(32), default="pending", nullable=False)
     transcript_text = Column(Text)
     audio_local_path = Column(String(512))
@@ -437,30 +483,38 @@ class LocalAsrSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-# 创建所有表
-Base.metadata.create_all(bind=engine)
+# 显式列出重构后 meeting_domain 关心的表。
+# 这样脚本只重建会议纪要相关表时，不会误伤数据库中的其他业务表。
+MEETING_DOMAIN_TABLES = [
+    Meeting.__table__,
+    MeetingAudio.__table__,
+    VolcMeetingSummary.__table__,
+    VolcMeetingTodo.__table__,
+    VolcAsrSession.__table__,
+    VolcAudioTranscription.__table__,
+    VolcSpeakerSegment.__table__,
+    LocalMeetingSummary.__table__,
+    LocalMeetingTodo.__table__,
+    LocalAsrSession.__table__,
+    LocalMeetingMinutesSession.__table__,
+    VolcMeetingMinutesSession.__table__,
+]
 
 
-def _ensure_schema_compatibility() -> None:
-    """
-    轻量兼容迁移：为历史库补齐新增字段。
-    说明：项目目前未接入 Alembic，这里在启动时做幂等补丁。
-    """
-    inspector = inspect(engine)
-    table_name = "volc_meeting_minutes_sessions"
-    existing_tables = set(inspector.get_table_names())
-    if table_name not in existing_tables:
-        return
-
-    existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
-    if "session_no" in existing_columns:
-        return
-
-    with engine.begin() as conn:
-        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN session_no VARCHAR(64)"))
+def create_all_tables() -> None:
+    """创建 ORM 表。PostgreSQL 在空 search_path 下须在同一条连接上先 SET 再 DDL。"""
+    if _is_pg:
+        with engine.begin() as conn:
+            conn.execute(text("SET search_path TO public"))
+            Base.metadata.create_all(bind=conn)
+    else:
+        Base.metadata.create_all(bind=engine)
 
 
-_ensure_schema_compatibility()
+# 仅在显式开启时自动建表，避免导入模块时把历史遗留表自动重建。
+if os.getenv("AUTO_CREATE_ALL_TABLES", "0").strip().lower() in {"1", "true", "yes", "on"}:
+    create_all_tables()
+
 
 def get_db():
     """数据库依赖"""
