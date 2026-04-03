@@ -784,18 +784,6 @@ class VolcTranscriptUpdate(BaseModel):
     transcript_text: str
 
 
-class VolcAudioUploadTask(BaseModel):
-    """火山音频上传任务响应。"""
-    task_id: str
-    meeting_id: int
-    file_name: str
-    status: Literal["pending", "running", "completed", "failed"]
-    audio_id: Optional[int] = None
-    error_msg: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-
-
 class VolcSpeakerSegmentInDB(BaseModel):
     """火山说话人分段响应模型。"""
     model_config = ConfigDict(from_attributes=True)
@@ -937,11 +925,6 @@ class LocalMeetingTodoInDB(LocalMeetingTodoBase):
 class LocalStreamTranscriptUpdate(BaseModel):
     """修改本地实时流式转写文本。"""
     stream_transcript_text: str
-
-
-class LocalTranscriptUpdate(BaseModel):
-    """修改本地会议音频转写文本。"""
-    transcript_text: str
 
 
 class LocalMeetingMinutesResponse(BaseModel):

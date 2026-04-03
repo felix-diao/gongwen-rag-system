@@ -1,6 +1,6 @@
-"""meeting_domain - 统一会议音频服务。
+"""统一会议音频服务。
 
-这个模块是 meeting_domain 中所有音频资产操作的唯一入口。
+这个模块是会议音频资产操作的唯一入口。
 
 核心职责：
 1. 校验 provider、会议归属和上传文件类型。
@@ -19,11 +19,10 @@ import os
 import shutil
 import tempfile
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -32,7 +31,7 @@ from sqlalchemy.orm import Session
 import tos  # type: ignore
 
 from app.config import settings
-from app.models.meeting_domain import database, schemas
+from app.models import database, schemas
 from app.utils.logger import get_logger
 
 logger = get_logger("meeting_audio_service")
@@ -142,6 +141,33 @@ class MeetingAudioService:
         self._upload_lock = threading.Lock()
 
     @staticmethod
+    def _assert_meeting_exists(db: Session, meeting_id: int) -> None:
+        meeting = db.query(database.Meeting.id).filter(database.Meeting.id == meeting_id).first()
+        if not meeting:
+            raise HTTPException(status_code=404, detail="会议未找到")
+
+    @staticmethod
+    def _assert_upload_quota(db: Session, meeting_id: int, provider: Provider) -> None:
+        upload_count = (
+            db.query(database.MeetingAudio)
+            .filter(
+                database.MeetingAudio.meeting_id == meeting_id,
+                database.MeetingAudio.provider == provider,
+            )
+            .count()
+        )
+        if provider == "local" and upload_count >= MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING:
+            raise HTTPException(
+                status_code=400,
+                detail=f"每个会议最多上传 {MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING} 个本地AI音频，请先删除旧音频后再上传",
+            )
+        if provider == "volc" and upload_count >= MAX_VOLC_MINUTES_AUDIOS_PER_MEETING:
+            raise HTTPException(
+                status_code=400,
+                detail=f"每个会议最多上传 {MAX_VOLC_MINUTES_AUDIOS_PER_MEETING} 个火山音频，请先删除旧音频后再上传",
+            )
+
+    @staticmethod
     def _validate_content_type(content_type: Optional[str]) -> str:
         raw = (content_type or "").strip().lower()
         if not raw:
@@ -151,15 +177,13 @@ class MeetingAudioService:
         raise HTTPException(status_code=400, detail=f"不支持的 MIME 类型: {content_type}")
 
     @staticmethod
-    # 步骤说明：标准化 provider 参数并做强校验，仅允许 local/volc。
     def normalize_provider(provider: str) -> Provider:
         raw = (provider or "").strip().lower()
         if raw not in {"local", "volc"}:
             raise HTTPException(status_code=400, detail="provider 仅支持 local 或 volc")
-        return raw  # type: ignore[return-value]
+        return cast(Provider, raw)
 
     @staticmethod
-    # 步骤说明：统一将 ORM 记录映射为 API 输出模型，避免路由层操作 ORM。
     def _to_schema(provider: Provider, record: database.MeetingAudio) -> schemas.MeetingAudioUnifiedInDB:
         return schemas.MeetingAudioUnifiedInDB(
             provider=provider,
@@ -172,15 +196,36 @@ class MeetingAudioService:
             status=record.status,
             task_id=getattr(record, "task_id", None),
             error_msg=getattr(record, "error_msg", None),
+            transcript_text=getattr(record, "transcript_text", None),
+            source_asr_session_id=getattr(record, "source_asr_session_id", None),
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
 
-    # 步骤说明：懒加载对象存储客户端，确保进程内复用单实例。
     def _get_uploader(self) -> _MeetingTosUploader:
         if self._uploader is None:
             self._uploader = _MeetingTosUploader()
         return self._uploader
+
+    @staticmethod
+    def _get_audio_record(
+        db: Session,
+        meeting_id: int,
+        provider: Provider,
+        audio_id: int,
+    ) -> database.MeetingAudio:
+        record = (
+            db.query(database.MeetingAudio)
+            .filter(
+                database.MeetingAudio.id == audio_id,
+                database.MeetingAudio.meeting_id == meeting_id,
+                database.MeetingAudio.provider == provider,
+            )
+            .first()
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="音频记录未找到")
+        return record
 
     def _save_upload_to_temp(self, upload_file: UploadFile) -> Path:
         """把上传流写入临时文件，供后台线程安全复用。
@@ -205,37 +250,13 @@ class MeetingAudioService:
         file_name: str,
         content_type: Optional[str],
     ) -> database.MeetingAudio:
-        # 步骤说明（本地文件直传对象存储）：
-        # 1) 校验会议、文件与配额；
-        # 2) 上传 source_path 到对象存储；
-        # 3) 写入 MeetingAudio 并返回 ORM 记录。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
+        self._assert_meeting_exists(db, meeting_id)
         if not source_path.exists() or not source_path.is_file():
             raise HTTPException(status_code=400, detail="本地音频文件不存在")
         if not file_name:
             raise HTTPException(status_code=400, detail="音频文件名不能为空")
         normalized_content_type = self._validate_content_type(content_type)
-
-        upload_count = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == provider,
-            )
-            .count()
-        )
-        if provider == "local" and upload_count >= MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING:
-            raise HTTPException(
-                status_code=400,
-                detail=f"每个会议最多上传 {MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING} 个本地AI音频，请先删除旧音频后再上传",
-            )
-        if provider == "volc" and upload_count >= MAX_VOLC_MINUTES_AUDIOS_PER_MEETING:
-            raise HTTPException(
-                status_code=400,
-                detail=f"每个会议最多上传 {MAX_VOLC_MINUTES_AUDIOS_PER_MEETING} 个火山音频，请先删除旧音频后再上传",
-            )
+        self._assert_upload_quota(db, meeting_id, provider)
 
         suffix = Path(file_name).suffix or source_path.suffix or ".bin"
         object_key = f"{meeting_id}/{provider}/{uuid4().hex}{suffix}"
@@ -254,95 +275,6 @@ class MeetingAudioService:
         db.refresh(record)
         return record
 
-    def create_audio(
-        self,
-        db: Session,
-        meeting_id: int,
-        provider: Provider,
-        upload_file: UploadFile,
-    ) -> schemas.MeetingAudioUnifiedInDB:
-        # 步骤说明（统一音频上传）：
-        # 1) 校验会议存在、文件有效、配额未超限；
-        # 2) 先落临时文件再上传对象存储；
-        # 3) 上传成功后写入 DB 并返回统一模型。
-        # 防止“孤儿音频”记录：会议不存在时不允许上传。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
-        if not upload_file or not upload_file.filename:
-            raise HTTPException(status_code=400, detail="音频文件不能为空")
-        normalized_content_type = self._validate_content_type(upload_file.content_type)
-        upload_count = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == provider,
-            )
-            .count()
-        )
-        if provider == "local" and upload_count >= MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING:
-            raise HTTPException(
-                status_code=400,
-                detail=f"每个会议最多上传 {MAX_LOCAL_MINUTES_AUDIOS_PER_MEETING} 个本地AI音频，请先删除旧音频后再上传",
-            )
-        if provider == "volc" and upload_count >= MAX_VOLC_MINUTES_AUDIOS_PER_MEETING:
-            raise HTTPException(
-                status_code=400,
-                detail=f"每个会议最多上传 {MAX_VOLC_MINUTES_AUDIOS_PER_MEETING} 个火山音频，请先删除旧音频后再上传",
-            )
-        upload_file.file.seek(0, os.SEEK_END)
-        size_bytes = int(upload_file.file.tell())
-        upload_file.file.seek(0)
-
-        logger.info(
-            "开始上传会议音频，模式=%s，会议ID=%s，文件名=%r，类型=%s，大小=%s 字节",
-            provider,
-            meeting_id,
-            upload_file.filename,
-            upload_file.content_type,
-            size_bytes,
-        )
-        started = time.monotonic()
-        try:
-            uploader = self._get_uploader()
-            object_key = f"{meeting_id}/{provider}/{uuid4().hex}{Path(upload_file.filename).suffix}"
-            upload_file.file.seek(0)
-            suffix = Path(upload_file.filename).suffix or ".bin"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                shutil.copyfileobj(upload_file.file, tmp_file)
-                tmp_path = Path(tmp_file.name)
-            try:
-                file_url = uploader.upload_file(tmp_path, object_key, normalized_content_type)
-            finally:
-                # 临时文件必须清理，避免磁盘残留。
-                tmp_path.unlink(missing_ok=True)
-
-            record = database.MeetingAudio(
-                meeting_id=meeting_id,
-                provider=provider,
-                file_name=upload_file.filename,
-                object_key=object_key,
-                file_url=file_url,
-                file_type=normalized_content_type,
-                status="uploaded",
-            )
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-        except Exception as exc:
-            logger.error("上传会议音频失败，模式=%s，会议ID=%s，错误=%s", provider, meeting_id, exc)
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        logger.info(
-            "上传会议音频完成，模式=%s，会议ID=%s，音频ID=%s，对象键=%r，耗时=%.3f秒",
-            provider,
-            meeting_id,
-            record.id,
-            record.object_key,
-            time.monotonic() - started,
-        )
-        return self._to_schema(provider, record)
-
     def _build_upload_task_schema(self, task: _UploadTask) -> schemas.MeetingAudioUnifiedInDB:
         # 任务态也复用统一音频模型，这样前端不需要为“处理中任务”定义单独卡片结构。
         return schemas.MeetingAudioUnifiedInDB(
@@ -350,6 +282,7 @@ class MeetingAudioService:
             id=task.audio_id,
             meeting_id=task.meeting_id,
             file_name=task.file_name,
+            file_type=task.content_type,
             status=task.status,
             task_id=task.task_id,
             error_msg=task.error_msg,
@@ -415,10 +348,6 @@ class MeetingAudioService:
             db.close()
             temp_path.unlink(missing_ok=True)
 
-    # 步骤说明（统一异步上传任务）：
-    # 1) 校验 provider + 上传文件；
-    # 2) 保存临时文件并创建任务快照；
-    # 3) 后台线程调用统一上传入口，完成后更新任务状态。
     def create_upload_task(
         self,
         db: Session,
@@ -428,6 +357,8 @@ class MeetingAudioService:
     ) -> schemas.MeetingAudioUnifiedInDB:
         if not upload_file or not upload_file.filename:
             raise HTTPException(status_code=400, detail="音频文件不能为空")
+        self._assert_meeting_exists(db, meeting_id)
+        self._assert_upload_quota(db, meeting_id, provider)
         normalized_content_type = self._validate_content_type(upload_file.content_type)
         temp_path = self._save_upload_to_temp(upload_file)
 
@@ -463,10 +394,6 @@ class MeetingAudioService:
         thread.start()
         return self._build_upload_task_schema(task)
 
-    # 步骤说明（统一任务查询）：
-    # 1) 查询任务快照；
-    # 2) 若已完成则返回完整音频元数据并补充 task 字段；
-    # 3) 若未完成则返回任务态最小集合。
     def get_upload_task(
         self,
         db: Session,
@@ -487,17 +414,14 @@ class MeetingAudioService:
     def list_audio(
         self, db: Session, meeting_id: int, provider: Provider
     ) -> list[schemas.MeetingAudioUnifiedInDB]:
-        # 步骤说明：按 meeting_id + provider 查询并按创建时间倒序返回。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
+        self._assert_meeting_exists(db, meeting_id)
         records = (
             db.query(database.MeetingAudio)
             .filter(
                 database.MeetingAudio.meeting_id == meeting_id,
                 database.MeetingAudio.provider == provider,
             )
-            .order_by(database.MeetingAudio.created_at.desc())
+            .order_by(database.MeetingAudio.created_at.desc(), database.MeetingAudio.id.desc())
             .all()
         )
         logger.info("查询会议音频列表完成，模式=%s，会议ID=%s，数量=%s", provider, meeting_id, len(records))
@@ -506,44 +430,15 @@ class MeetingAudioService:
     def get_audio(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
     ) -> schemas.MeetingAudioUnifiedInDB:
-        # 步骤说明：按 meeting_id + provider + audio_id 精确定位单条音频。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
-        record = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.id == audio_id,
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == provider,
-            )
-            .first()
-        )
-        if not record:
-            raise HTTPException(status_code=404, detail="音频记录未找到")
+        self._assert_meeting_exists(db, meeting_id)
+        record = self._get_audio_record(db, meeting_id, provider, audio_id)
         return self._to_schema(provider, record)
 
     def download_audio_to_temp(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
     ) -> Tuple[Path, str, str]:
-        # 步骤说明（音频下载到临时文件）：
-        # 1) 校验会议与音频记录；
-        # 2) 从对象存储下载到本地临时路径；
-        # 3) 返回 (临时路径, 文件名, MIME)，由 API 负责清理。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
-        record = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.id == audio_id,
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == provider,
-            )
-            .first()
-        )
-        if not record:
-            raise HTTPException(status_code=404, detail="音频记录未找到")
+        self._assert_meeting_exists(db, meeting_id)
+        record = self._get_audio_record(db, meeting_id, provider, audio_id)
         if not record.object_key:
             raise HTTPException(status_code=404, detail="音频文件未存储在对象存储中")
         if not record.file_name:
@@ -586,28 +481,11 @@ class MeetingAudioService:
     def delete_audio(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
     ) -> schemas.MeetingAudioUnifiedInDB:
-        # 步骤说明（单条删除）：
-        # 1) 校验记录归属；
-        # 2) 删除对象存储文件；
-        # 3) 删除数据库记录并返回删除前快照。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
-        record = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.id == audio_id,
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == provider,
-            )
-            .first()
-        )
-        if not record:
-            raise HTTPException(status_code=404, detail="音频记录未找到")
+        self._assert_meeting_exists(db, meeting_id)
+        record = self._get_audio_record(db, meeting_id, provider, audio_id)
         if record.object_key:
-            uploader = self._get_uploader()
             try:
-                uploader.delete_file(record.object_key)
+                self._get_uploader().delete_file(record.object_key)
             except Exception as exc:
                 logger.error(
                     "删除对象存储音频失败，模式=%s，会议ID=%s，音频ID=%s，对象键=%r，错误=%s",
@@ -625,56 +503,42 @@ class MeetingAudioService:
         return data
 
     def delete_all_audio_by_meeting(self, db: Session, meeting_id: int) -> None:
-        # 步骤说明（会议级批量删除）：
-        # 1) 按 provider 分组查询全部音频；
-        # 2) 逐条删除对象存储文件；
-        # 3) 删除数据库记录并一次提交。
-        # 注意：这里只处理音频表和对象存储对象；纪要摘要/待办/会话快照由对应 minutes service 负责清理。
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
-            raise HTTPException(status_code=404, detail="会议未找到")
-
-        local_records = (
+        self._assert_meeting_exists(db, meeting_id)
+        records = (
             db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == "local",
-            )
+            .filter(database.MeetingAudio.meeting_id == meeting_id)
             .all()
         )
-        volc_records = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == "volc",
-            )
-            .all()
-        )
+        uploader: Optional[_MeetingTosUploader] = None
+        counts = {"local": 0, "volc": 0}
 
-        uploader = self._get_uploader()
-        for provider, records in (("local", local_records), ("volc", volc_records)):
-            for record in records:
-                if record.object_key:
-                    try:
-                        uploader.delete_file(record.object_key)
-                    except Exception as exc:
-                        logger.error(
-                            "删除会议音频对象失败，模式=%s，会议ID=%s，音频ID=%s，对象键=%r，错误=%s",
-                            provider,
-                            meeting_id,
-                            record.id,
-                            record.object_key,
-                            exc,
-                        )
-                        raise HTTPException(status_code=502, detail=f"删除对象存储音频失败: {exc}") from exc
-                db.delete(record)
+        for record in records:
+            if record.provider in counts:
+                counts[record.provider] += 1
+            provider = cast(Provider, record.provider)
+            if record.object_key:
+                if uploader is None:
+                    uploader = self._get_uploader()
+                try:
+                    uploader.delete_file(record.object_key)
+                except Exception as exc:
+                    logger.error(
+                        "删除会议音频对象失败，模式=%s，会议ID=%s，音频ID=%s，对象键=%r，错误=%s",
+                        provider,
+                        meeting_id,
+                        record.id,
+                        record.object_key,
+                        exc,
+                    )
+                    raise HTTPException(status_code=502, detail=f"删除对象存储音频失败: {exc}") from exc
+            db.delete(record)
 
         db.commit()
         logger.info(
             "删除会议全部音频完成，会议ID=%s，本地数量=%s，火山数量=%s",
             meeting_id,
-            len(local_records),
-            len(volc_records),
+            counts["local"],
+            counts["volc"],
         )
 
 

@@ -1,4 +1,4 @@
-"""meeting_domain - 本地 AI 会议纪要服务。
+"""本地 AI 会议纪要服务。
 
 核心能力：
 1. 建立本地实时 ASR WebSocket，会话结束后把录音上传为统一音频。
@@ -28,17 +28,54 @@ import aiohttp
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models.meeting_domain import database, schemas
-from app.services.local_asr_events import (
-    _extract_transcription_text,
-    _is_final_transcription_event,
-    _is_partial_transcription_event,
-)
-from app.services.meeting_domain.meeting_audio_service import meeting_audio_service
+from app.models import database, schemas
+from app.services.meeting_audio_service import meeting_audio_service
 from app.utils.logger import get_logger
 
-logger = get_logger("meeting_domain_local_minutes_service")
+logger = get_logger("meeting_local_minutes_service")
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
+_TEXT_FIELDS = ("text", "transcript", "delta")
+_NESTED_FIELDS = ("item", "data", "result", "response")
+_FINAL_EVENT_TYPES = {"conversation.item.input_audio_transcription.completed"}
+_PARTIAL_EVENT_TYPES = {"conversation.item.input_audio_transcription.text"}
+
+
+def _extract_transcription_text(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    for key in _TEXT_FIELDS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    for parent in _NESTED_FIELDS:
+        child = payload.get(parent)
+        if not isinstance(child, dict):
+            continue
+        for key in _TEXT_FIELDS:
+            value = child.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _is_final_transcription_event(event_type: str) -> bool:
+    if event_type in _FINAL_EVENT_TYPES:
+        return True
+    return (
+        event_type.startswith("conversation.item.input_audio_transcription.")
+        and event_type.endswith(".completed")
+    )
+
+
+def _is_partial_transcription_event(event_type: str) -> bool:
+    if event_type in _PARTIAL_EVENT_TYPES:
+        return True
+    return (
+        event_type.startswith("conversation.item.input_audio_transcription.")
+        and event_type.endswith(".text")
+    )
 
 
 def _build_qwen_ws_url() -> str:
@@ -135,23 +172,18 @@ class LocalMeetingMinuteService:
         if not exists:
             raise ValueError("会议不存在")
 
-    def generate_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
-        logger.info("开始生成本地会议纪要 meeting_id=%s", meeting_id)
-        self._assert_meeting_exists(db, meeting_id)
-        asr_session = (
+    @staticmethod
+    def _latest_asr_session(db: Session, meeting_id: int) -> Optional[database.LocalAsrSession]:
+        return (
             db.query(database.LocalAsrSession)
             .filter(database.LocalAsrSession.meeting_id == meeting_id)
             .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
             .first()
         )
-        if not asr_session or not asr_session.transcript_text:
-            raise ValueError("当前会议尚无流式转写文本")
 
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        meeting_title = meeting.title if meeting else "会议"
-        payload = self._call_llm(meeting_title, asr_session.transcript_text)
-
-        latest_local_audio = (
+    @staticmethod
+    def _latest_local_audio(db: Session, meeting_id: int) -> Optional[database.MeetingAudio]:
+        return (
             db.query(database.MeetingAudio)
             .filter(
                 database.MeetingAudio.meeting_id == meeting_id,
@@ -160,6 +192,51 @@ class LocalMeetingMinuteService:
             .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
             .first()
         )
+
+    @staticmethod
+    def _meeting_summary(db: Session, meeting_id: int) -> Optional[database.LocalMeetingSummary]:
+        return (
+            db.query(database.LocalMeetingSummary)
+            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
+            .first()
+        )
+
+    @staticmethod
+    def _meeting_todos(db: Session, meeting_id: int) -> List[database.LocalMeetingTodo]:
+        return (
+            db.query(database.LocalMeetingTodo)
+            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
+            .order_by(database.LocalMeetingTodo.id.asc())
+            .all()
+        )
+
+    @staticmethod
+    def _latest_minutes_session(
+        db: Session,
+        meeting_id: int,
+    ) -> Optional[database.LocalMeetingMinutesSession]:
+        return (
+            db.query(database.LocalMeetingMinutesSession)
+            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
+            .order_by(
+                database.LocalMeetingMinutesSession.created_at.desc(),
+                database.LocalMeetingMinutesSession.id.desc(),
+            )
+            .first()
+        )
+
+    def generate_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
+        logger.info("开始生成本地会议纪要 meeting_id=%s", meeting_id)
+        self._assert_meeting_exists(db, meeting_id)
+        asr_session = self._latest_asr_session(db, meeting_id)
+        if not asr_session or not asr_session.transcript_text:
+            raise ValueError("当前会议尚无流式转写文本")
+
+        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
+        meeting_title = meeting.title if meeting else "会议"
+        payload = self._call_llm(meeting_title, asr_session.transcript_text)
+
+        latest_local_audio = self._latest_local_audio(db, meeting_id)
         source_audio_id = latest_local_audio.id if latest_local_audio else None
         if latest_local_audio:
             latest_local_audio.transcript_text = asr_session.transcript_text
@@ -214,49 +291,29 @@ class LocalMeetingMinuteService:
 
     def get_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
         self._assert_meeting_exists(db, meeting_id)
-        latest_session = (
-            db.query(database.LocalAsrSession)
-            .filter(database.LocalAsrSession.meeting_id == meeting_id)
-            .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
-            .first()
-        )
-        summary = (
-            db.query(database.LocalMeetingSummary)
-            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
-            .first()
-        )
-        todos = (
-            db.query(database.LocalMeetingTodo)
-            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
-            .order_by(database.LocalMeetingTodo.id.asc())
-            .all()
-        )
+        latest_session = self._latest_asr_session(db, meeting_id)
+        latest_audio = self._latest_local_audio(db, meeting_id)
+        summary = self._meeting_summary(db, meeting_id)
+        todos = self._meeting_todos(db, meeting_id)
         return schemas.LocalMeetingMinutesResponse(
+            transcript_text=(
+                latest_audio.transcript_text
+                if latest_audio and latest_audio.transcript_text
+                else latest_session.transcript_text if latest_session else None
+            ),
             stream_transcript_text=latest_session.transcript_text if latest_session else None,
+            audio_status=latest_audio.status if latest_audio else latest_session.status if latest_session else None,
             summary=schemas.LocalMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas.LocalMeetingTodoInDB.model_validate(x) for x in todos],
         )
 
     def update_stream_transcript(self, db: Session, meeting_id: int, text: str) -> None:
         self._assert_meeting_exists(db, meeting_id)
-        asr_session = (
-            db.query(database.LocalAsrSession)
-            .filter(database.LocalAsrSession.meeting_id == meeting_id)
-            .order_by(database.LocalAsrSession.created_at.desc(), database.LocalAsrSession.id.desc())
-            .first()
-        )
+        asr_session = self._latest_asr_session(db, meeting_id)
         if not asr_session:
             raise ValueError("流式转写会话不存在")
         asr_session.transcript_text = text
-        latest_audio = (
-            db.query(database.MeetingAudio)
-            .filter(
-                database.MeetingAudio.meeting_id == meeting_id,
-                database.MeetingAudio.provider == "local",
-            )
-            .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
-            .first()
-        )
+        latest_audio = self._latest_local_audio(db, meeting_id)
         if latest_audio:
             latest_audio.transcript_text = text
             latest_audio.source_asr_session_id = asr_session.id
@@ -327,6 +384,8 @@ class LocalMeetingMinuteService:
             session.error_msg = payload.error_msg
         if "stream_transcript_text" in fields_set:
             session.stream_transcript_text = payload.stream_transcript_text
+        if "transcript_text" in fields_set:
+            session.transcript_text = payload.transcript_text
         if "summary_title" in fields_set:
             session.summary_title = payload.summary_title
         if "summary_paragraph" in fields_set:
@@ -554,17 +613,8 @@ class LocalMeetingMinuteService:
         stream_transcript_text: Optional[str],
     ) -> database.LocalMeetingMinutesSession:
         # 会话快照用于“可回放”与“可编辑”：每次生成纪要后写入一条稳定版本。
-        summary = (
-            db.query(database.LocalMeetingSummary)
-            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
-            .first()
-        )
-        todos = (
-            db.query(database.LocalMeetingTodo)
-            .filter(database.LocalMeetingTodo.meeting_id == meeting_id)
-            .order_by(database.LocalMeetingTodo.id.asc())
-            .all()
-        )
+        summary = self._meeting_summary(db, meeting_id)
+        todos = self._meeting_todos(db, meeting_id)
         todos_payload = [
             {
                 "content": item.content,
@@ -582,6 +632,7 @@ class LocalMeetingMinuteService:
             status="completed",
             error_msg=None,
             stream_transcript_text=stream_transcript_text,
+            transcript_text=stream_transcript_text,
             summary_title=summary.title if summary else None,
             summary_paragraph=summary.paragraph if summary else None,
             todos_json=json.dumps(todos_payload, ensure_ascii=False),
@@ -632,6 +683,7 @@ class LocalMeetingMinuteService:
             status=item.status,
             error_msg=item.error_msg,
             stream_transcript_text=item.stream_transcript_text,
+            transcript_text=item.transcript_text,
             summary_title=item.summary_title,
             summary_paragraph=item.summary_paragraph,
             todos=todos,
@@ -640,15 +692,7 @@ class LocalMeetingMinuteService:
         )
 
     def _is_latest_minutes_session(self, db: Session, meeting_id: int, session_id: int) -> bool:
-        latest = (
-            db.query(database.LocalMeetingMinutesSession)
-            .filter(database.LocalMeetingMinutesSession.meeting_id == meeting_id)
-            .order_by(
-                database.LocalMeetingMinutesSession.created_at.desc(),
-                database.LocalMeetingMinutesSession.id.desc(),
-            )
-            .first()
-        )
+        latest = self._latest_minutes_session(db, meeting_id)
         return bool(latest and latest.id == session_id)
 
     def _apply_latest_session_to_current_minutes(
@@ -659,15 +703,8 @@ class LocalMeetingMinuteService:
         payload: schemas.LocalMeetingMinutesSessionUpdate,
         fields_set: set[str],
     ) -> None:
-        if "error_msg" in fields_set:
-            session.error_msg = payload.error_msg
         if "stream_transcript_text" in fields_set:
-            asr_session = (
-                db.query(database.LocalAsrSession)
-                .filter(database.LocalAsrSession.meeting_id == meeting_id)
-                .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
-                .first()
-            )
+            asr_session = self._latest_asr_session(db, meeting_id)
             if asr_session:
                 asr_session.transcript_text = payload.stream_transcript_text
                 if session.source_audio_id:
@@ -680,18 +717,27 @@ class LocalMeetingMinuteService:
                         audio.transcript_text = payload.stream_transcript_text
                         audio.source_asr_session_id = asr_session.id
 
+        if "transcript_text" in fields_set:
+            audio = None
+            if session.source_audio_id:
+                audio = (
+                    db.query(database.MeetingAudio)
+                    .filter(database.MeetingAudio.id == session.source_audio_id)
+                    .first()
+                )
+            if audio is None:
+                audio = self._latest_local_audio(db, meeting_id)
+            if audio:
+                audio.transcript_text = payload.transcript_text
+
         if "summary_title" in fields_set or "summary_paragraph" in fields_set:
-            summary = (
-                db.query(database.LocalMeetingSummary)
-                .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
-                .first()
-            )
+            summary = self._meeting_summary(db, meeting_id)
             if summary is None:
                 summary = database.LocalMeetingSummary(
                     meeting_id=meeting_id,
                     source_audio_id=session.source_audio_id,
-                    title=payload.summary_title if "summary_title" in fields_set else None,
-                    paragraph=payload.summary_paragraph or "",
+                    title=session.summary_title,
+                    paragraph=session.summary_paragraph or "",
                 )
                 db.add(summary)
             else:

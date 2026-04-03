@@ -7,35 +7,31 @@ import os
 
 from app.config import settings
 from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm, prompt
-from app.api.meeting_domain import (
+from app.api import (
     meeting,
     meeting_audio,
     meeting_minute_local,
     meeting_minute_local_session,
-    meeting_minute_structured,
     meeting_minute_volc,
     meeting_minute_volc_session,
 )
-from app.services.meeting_domain.websocket_manager import meeting_ws_manager
-from app.utils.logger import get_logger  # ← 修改：使用新 logger
+from app.services.websocket_manager import meeting_ws_manager
+from app.utils.logger import get_logger
 
-# 创建应用专属 logger
-logger = get_logger("app")  # ← 修改：创建 logger 实例
+logger = get_logger("app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
+    """应用生命周期管理。"""
     logger.info("=" * 60)
-    logger.info(f"🚀 {settings.APP_NAME} 启动中...")
-    logger.info(f"版本: {settings.APP_VERSION}")
-    logger.info(f"调试模式: {settings.DEBUG}")
+    logger.info("%s 启动中", settings.APP_NAME)
+    logger.info("版本: %s", settings.APP_VERSION)
+    logger.info("调试模式: %s", settings.DEBUG)
     logger.info("=" * 60)
     
     try:
-        # 初始化服务
         from app.services.vector_service import vector_service
         from app.services.embedding_service import embedding_service
-        from app.services.rag_service import rag_service
         from app.services.llm_service import llm_service
         
         logger.info("初始化 WebSocket 管理器...")
@@ -50,26 +46,26 @@ async def lifespan(app: FastAPI):
         vector_service.create_collection_if_not_exists("conversations", is_private=True)
         
         logger.info("=" * 60)
-        logger.info(f"✅ {settings.APP_NAME} 启动完成")
-        logger.info(f"📚 API 文档: http://0.0.0.0:8080/docs")
+        logger.info("%s 启动完成", settings.APP_NAME)
+        logger.info("API 文档: http://0.0.0.0:8080/docs")
         logger.info("=" * 60)
         
-    except Exception as e:
-        logger.critical(f"❌ 应用启动失败: {e}", exc_info=True)
+    except Exception:
+        logger.exception("应用启动失败")
         raise
     
     yield
     
     logger.info("=" * 60)
-    logger.info(f"👋 {settings.APP_NAME} 正在关闭...")
+    logger.info("%s 正在关闭", settings.APP_NAME)
     logger.info("=" * 60)
     
     try:
         await embedding_service.close()
         await llm_service.close()
-        logger.info("✅ 服务关闭完成")
-    except Exception as e:
-        logger.error(f"关闭服务时出错: {e}", exc_info=True)
+        logger.info("服务关闭完成")
+    except Exception:
+        logger.exception("关闭服务时出错")
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -118,7 +114,6 @@ app.include_router(meeting_minute_local.router)
 app.include_router(meeting_minute_volc.router)
 app.include_router(meeting_minute_local_session.router)
 app.include_router(meeting_minute_volc_session.router)
-app.include_router(meeting_minute_structured.router)
 app.include_router(embed.router)
 app.include_router(rag.router)
 app.include_router(conversations.router)

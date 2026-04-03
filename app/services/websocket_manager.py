@@ -1,4 +1,4 @@
-"""meeting_domain - 会议级 WebSocket 广播管理器。
+"""会议级 WebSocket 广播管理器。
 
 这个模块只做一件事：维护按 `meeting_id` 分组的 WebSocket 连接池，并向该会议的所有连接广播状态事件。
 
@@ -17,7 +17,7 @@ from fastapi import WebSocket
 
 from app.utils.logger import get_logger
 
-logger = get_logger("meeting_domain_ws_manager")
+logger = get_logger("meeting_ws_manager")
 
 
 class MeetingTranscriptionWSManager:

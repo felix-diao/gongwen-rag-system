@@ -1,4 +1,4 @@
-"""meeting_domain - 火山会议纪要服务。
+"""火山会议纪要服务。
 
 核心能力：
 1. 建立火山实时 ASR WebSocket，获取录音时的流式转写。
@@ -31,21 +31,13 @@ import aiohttp
 import requests
 from sqlalchemy.orm import Session
 
-from app.api.sauc_websocket_demo import (
-    CompressionType,
-    MessageType,
-    MessageTypeSpecificFlags,
-    ProtocolVersion,
-    ResponseParser,
-    SerializationType,
-)
 from app.config import settings
-from app.models.meeting_domain import database, schemas
-from app.services.meeting_domain.meeting_audio_service import meeting_audio_service
-from app.services.meeting_domain.websocket_manager import meeting_ws_manager
+from app.models import database, schemas
+from app.services.meeting_audio_service import meeting_audio_service
+from app.services.websocket_manager import meeting_ws_manager
 from app.utils.logger import get_logger
 
-logger = get_logger("meeting_domain_volc_minutes_service")
+logger = get_logger("meeting_volc_minutes_service")
 
 
 ASR_WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
@@ -53,6 +45,91 @@ MINUTES_RUNNING_STATUS = {"queued", "running", "processing"}
 MINUTES_SUCCESS_STATUS = {"success", "succeeded", "successed", "finished", "completed", "done"}
 MINUTES_FAILED_STATUS = {"failed", "error"}
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
+
+
+class ProtocolVersion:
+    V1 = 1
+
+
+class MessageType:
+    CLIENT_FULL_REQUEST = 1
+    CLIENT_AUDIO_ONLY_REQUEST = 2
+    SERVER_FULL_RESPONSE = 9
+    SERVER_ERROR_RESPONSE = 15
+
+
+class MessageTypeSpecificFlags:
+    NO_SEQUENCE = 0
+    POS_SEQUENCE = 1
+    NEG_SEQUENCE = 2
+    NEG_WITH_SEQUENCE = 3
+
+
+class SerializationType:
+    NO_SERIALIZATION = 0
+    JSON = 1
+
+
+class CompressionType:
+    GZIP = 1
+
+
+class _AsrResponse:
+    def __init__(self) -> None:
+        self.code = 0
+        self.event = 0
+        self.is_last_package = False
+        self.payload_sequence = 0
+        self.payload_size = 0
+        self.payload_msg: Optional[dict] = None
+
+
+class ResponseParser:
+    @staticmethod
+    def parse_response(msg: bytes) -> _AsrResponse:
+        response = _AsrResponse()
+        header_size = msg[0] & 0x0F
+        message_type = msg[1] >> 4
+        flags = msg[1] & 0x0F
+        serialization_method = msg[2] >> 4
+        compression_type = msg[2] & 0x0F
+        payload = msg[header_size * 4 :]
+
+        if flags & 0x01:
+            response.payload_sequence = struct.unpack(">i", payload[:4])[0]
+            payload = payload[4:]
+        if flags & 0x02:
+            response.is_last_package = True
+        if flags & 0x04:
+            response.event = struct.unpack(">i", payload[:4])[0]
+            payload = payload[4:]
+
+        if message_type == MessageType.SERVER_FULL_RESPONSE:
+            response.payload_size = struct.unpack(">I", payload[:4])[0]
+            payload = payload[4:]
+        elif message_type == MessageType.SERVER_ERROR_RESPONSE:
+            response.code = struct.unpack(">i", payload[:4])[0]
+            response.payload_size = struct.unpack(">I", payload[4:8])[0]
+            payload = payload[8:]
+
+        if not payload:
+            return response
+
+        if compression_type == CompressionType.GZIP:
+            try:
+                payload = gzip.decompress(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("火山 ASR 响应解压失败: %s", exc)
+                return response
+
+        if serialization_method == SerializationType.JSON:
+            try:
+                parsed = json.loads(payload.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    response.payload_msg = parsed
+            except Exception as exc:  # noqa: BLE001
+                logger.error("火山 ASR 响应解析失败: %s", exc)
+        return response
 
 
 def _guess_file_type(content_type: Optional[str]) -> str:
@@ -223,8 +300,80 @@ class VolcMeetingMinuteService:
             raise ValueError("会议不存在")
 
     def _volc_audio_query(self, db: Session):
-        # 统一封装 provider 过滤，避免在本文件各处反复手写 `provider == "volc"`。
         return db.query(database.MeetingAudio).filter(database.MeetingAudio.provider == "volc")
+
+    def _latest_volc_audio(self, db: Session, meeting_id: int) -> Optional[database.MeetingAudio]:
+        return (
+            self._volc_audio_query(db)
+            .filter(database.MeetingAudio.meeting_id == meeting_id)
+            .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _latest_asr_session(db: Session, meeting_id: int) -> Optional[database.VolcAsrSession]:
+        return (
+            db.query(database.VolcAsrSession)
+            .filter(database.VolcAsrSession.meeting_id == meeting_id)
+            .order_by(database.VolcAsrSession.updated_at.desc(), database.VolcAsrSession.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _meeting_summary(db: Session, meeting_id: int) -> Optional[database.VolcMeetingSummary]:
+        return (
+            db.query(database.VolcMeetingSummary)
+            .filter(database.VolcMeetingSummary.meeting_id == meeting_id)
+            .first()
+        )
+
+    @staticmethod
+    def _meeting_todos(db: Session, meeting_id: int) -> List[database.VolcMeetingTodo]:
+        return (
+            db.query(database.VolcMeetingTodo)
+            .filter(database.VolcMeetingTodo.meeting_id == meeting_id)
+            .order_by(database.VolcMeetingTodo.id.asc())
+            .all()
+        )
+
+    @staticmethod
+    def _latest_precise_transcription(
+        db: Session,
+        source_audio_id: int,
+    ) -> Optional[database.VolcAudioTranscription]:
+        return (
+            db.query(database.VolcAudioTranscription)
+            .filter(database.VolcAudioTranscription.source_audio_id == source_audio_id)
+            .order_by(database.VolcAudioTranscription.created_at.desc(), database.VolcAudioTranscription.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _speaker_segments_for_audio(
+        db: Session,
+        source_audio_id: int,
+    ) -> List[database.VolcSpeakerSegment]:
+        return (
+            db.query(database.VolcSpeakerSegment)
+            .filter(database.VolcSpeakerSegment.source_audio_id == source_audio_id)
+            .order_by(database.VolcSpeakerSegment.segment_index.asc(), database.VolcSpeakerSegment.id.asc())
+            .all()
+        )
+
+    @staticmethod
+    def _latest_minutes_session(
+        db: Session,
+        meeting_id: int,
+    ) -> Optional[database.VolcMeetingMinutesSession]:
+        return (
+            db.query(database.VolcMeetingMinutesSession)
+            .filter(database.VolcMeetingMinutesSession.meeting_id == meeting_id)
+            .order_by(
+                database.VolcMeetingMinutesSession.created_at.desc(),
+                database.VolcMeetingMinutesSession.id.desc(),
+            )
+            .first()
+        )
 
     def submit_minutes(
         self,
@@ -232,7 +381,6 @@ class VolcMeetingMinuteService:
         meeting_id: int,
         audio_id: int,
     ) -> database.MeetingAudio:
-        # 将已上传音频提交给“语音妙记”离线任务，随后启动轮询线程持续跟进状态。
         self._assert_meeting_exists(db, meeting_id)
         audio = (
             self._volc_audio_query(db)
@@ -609,59 +757,28 @@ class VolcMeetingMinuteService:
         return result
 
     def get_minutes(self, db: Session, meeting_id: int) -> schemas.VolcMeetingMinutesResponse:
-        # 聚合查询给前端：流式文本(ASR会话) + 精确转写(离线妙记) + 摘要 + 待办。
         self._assert_meeting_exists(db, meeting_id)
-        latest_audio = (
-            self._volc_audio_query(db)
-            .filter(database.MeetingAudio.meeting_id == meeting_id)
-            .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
-            .first()
-        )
+        latest_audio = self._latest_volc_audio(db, meeting_id)
         stream_text: Optional[str] = None
         transcript_text: Optional[str] = None
         speaker_segments: List[database.VolcSpeakerSegment] = []
-        asr_session = (
-            db.query(database.VolcAsrSession)
-            .filter(database.VolcAsrSession.meeting_id == meeting_id)
-            .order_by(database.VolcAsrSession.created_at.desc(), database.VolcAsrSession.id.desc())
-            .first()
-        )
+        asr_session = self._latest_asr_session(db, meeting_id)
         if asr_session:
             stream_text = asr_session.transcript_text
         if latest_audio:
-            precise = (
-                db.query(database.VolcAudioTranscription)
-                .filter(
-                    database.VolcAudioTranscription.source_audio_id == latest_audio.id,
-                )
-                .order_by(database.VolcAudioTranscription.created_at.desc(), database.VolcAudioTranscription.id.desc())
-                .first()
-            )
+            precise = self._latest_precise_transcription(db, latest_audio.id)
             if precise:
                 transcript_text = precise.text
             elif latest_audio.transcript_text:
                 transcript_text = latest_audio.transcript_text
-            speaker_segments = (
-                db.query(database.VolcSpeakerSegment)
-                .filter(database.VolcSpeakerSegment.source_audio_id == latest_audio.id)
-                .order_by(database.VolcSpeakerSegment.segment_index.asc(), database.VolcSpeakerSegment.id.asc())
-                .all()
-            )
+            speaker_segments = self._speaker_segments_for_audio(db, latest_audio.id)
 
-        summary = (
-            db.query(database.VolcMeetingSummary)
-            .filter(database.VolcMeetingSummary.meeting_id == meeting_id)
-            .first()
-        )
-        todos = (
-            db.query(database.VolcMeetingTodo)
-            .filter(database.VolcMeetingTodo.meeting_id == meeting_id)
-            .order_by(database.VolcMeetingTodo.id.asc())
-            .all()
-        )
+        summary = self._meeting_summary(db, meeting_id)
+        todos = self._meeting_todos(db, meeting_id)
         return schemas.VolcMeetingMinutesResponse(
             stream_transcript_text=stream_text,
             transcript_text=transcript_text,
+            audio_status=latest_audio.status if latest_audio else asr_session.status if asr_session else None,
             speaker_segments=[schemas.VolcSpeakerSegmentInDB.model_validate(x) for x in speaker_segments],
             summary=schemas.VolcMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas.VolcMeetingTodoInDB.model_validate(x) for x in todos],
@@ -669,21 +786,11 @@ class VolcMeetingMinuteService:
 
     def update_stream_transcript(self, db: Session, meeting_id: int, text: str) -> None:
         self._assert_meeting_exists(db, meeting_id)
-        asr_session = (
-            db.query(database.VolcAsrSession)
-            .filter(database.VolcAsrSession.meeting_id == meeting_id)
-            .order_by(database.VolcAsrSession.created_at.desc(), database.VolcAsrSession.id.desc())
-            .first()
-        )
+        asr_session = self._latest_asr_session(db, meeting_id)
         if not asr_session:
             raise ValueError("流式转写会话不存在")
         asr_session.transcript_text = text
-        latest_audio = (
-            self._volc_audio_query(db)
-            .filter(database.MeetingAudio.meeting_id == meeting_id)
-            .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
-            .first()
-        )
+        latest_audio = self._latest_volc_audio(db, meeting_id)
         if latest_audio:
             latest_audio.transcript_text = text
             latest_audio.source_asr_session_id = asr_session.id
@@ -691,12 +798,7 @@ class VolcMeetingMinuteService:
 
     def update_precise_transcript(self, db: Session, meeting_id: int, text: str) -> database.MeetingAudio:
         self._assert_meeting_exists(db, meeting_id)
-        latest_audio = (
-            self._volc_audio_query(db)
-            .filter(database.MeetingAudio.meeting_id == meeting_id)
-            .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
-            .first()
-        )
+        latest_audio = self._latest_volc_audio(db, meeting_id)
         if not latest_audio:
             raise ValueError("当前会议尚无音频记录")
         db.query(database.VolcAudioTranscription).filter(
@@ -939,32 +1041,10 @@ class VolcMeetingMinuteService:
         audio: database.MeetingAudio,
     ) -> database.VolcMeetingMinutesSession:
         # 火山纪要会话快照：记录“当次妙记结果”的稳定版本，便于历史回看与人工修订。
-        summary = (
-            db.query(database.VolcMeetingSummary)
-            .filter(database.VolcMeetingSummary.meeting_id == audio.meeting_id)
-            .first()
-        )
-        todos = (
-            db.query(database.VolcMeetingTodo)
-            .filter(database.VolcMeetingTodo.meeting_id == audio.meeting_id)
-            .order_by(database.VolcMeetingTodo.id.asc())
-            .all()
-        )
-        precise = (
-            db.query(database.VolcAudioTranscription)
-            .filter(database.VolcAudioTranscription.source_audio_id == audio.id)
-            .order_by(
-                database.VolcAudioTranscription.created_at.desc(),
-                database.VolcAudioTranscription.id.desc(),
-            )
-            .first()
-        )
-        speaker_segments = (
-            db.query(database.VolcSpeakerSegment)
-            .filter(database.VolcSpeakerSegment.source_audio_id == audio.id)
-            .order_by(database.VolcSpeakerSegment.segment_index.asc(), database.VolcSpeakerSegment.id.asc())
-            .all()
-        )
+        summary = self._meeting_summary(db, audio.meeting_id)
+        todos = self._meeting_todos(db, audio.meeting_id)
+        precise = self._latest_precise_transcription(db, audio.id)
+        speaker_segments = self._speaker_segments_for_audio(db, audio.id)
         asr_session = (
             db.query(database.VolcAsrSession)
             .filter(database.VolcAsrSession.source_audio_id == audio.id)
@@ -988,7 +1068,7 @@ class VolcMeetingMinuteService:
             status="completed",
             error_msg=audio.error_msg,
             stream_transcript_text=asr_session.transcript_text if asr_session else None,
-            transcript_text=precise.text if precise else None,
+            transcript_text=precise.text if precise else audio.transcript_text,
             speaker_segments_json=json.dumps(
                 [
                     {
@@ -1069,15 +1149,7 @@ class VolcMeetingMinuteService:
         )
 
     def _is_latest_minutes_session(self, db: Session, meeting_id: int, session_id: int) -> bool:
-        latest = (
-            db.query(database.VolcMeetingMinutesSession)
-            .filter(database.VolcMeetingMinutesSession.meeting_id == meeting_id)
-            .order_by(
-                database.VolcMeetingMinutesSession.created_at.desc(),
-                database.VolcMeetingMinutesSession.id.desc(),
-            )
-            .first()
-        )
+        latest = self._latest_minutes_session(db, meeting_id)
         return bool(latest and latest.id == session_id)
 
     def _apply_latest_session_to_current_minutes(
@@ -1089,24 +1161,12 @@ class VolcMeetingMinuteService:
         fields_set: set[str],
     ) -> None:
         source_audio_id = session.source_audio_id
-        if "error_msg" in fields_set:
-            session.error_msg = payload.error_msg
         if source_audio_id is None:
-            audio = (
-                self._volc_audio_query(db)
-                .filter(database.MeetingAudio.meeting_id == meeting_id)
-                .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
-                .first()
-            )
+            audio = self._latest_volc_audio(db, meeting_id)
             source_audio_id = audio.id if audio else None
 
         if "stream_transcript_text" in fields_set:
-            asr_session = (
-                db.query(database.VolcAsrSession)
-                .filter(database.VolcAsrSession.meeting_id == meeting_id)
-                .order_by(database.VolcAsrSession.updated_at.desc(), database.VolcAsrSession.id.desc())
-                .first()
-            )
+            asr_session = self._latest_asr_session(db, meeting_id)
             if asr_session:
                 asr_session.transcript_text = payload.stream_transcript_text
                 if source_audio_id:
@@ -1153,17 +1213,13 @@ class VolcMeetingMinuteService:
                 )
 
         if "summary_title" in fields_set or "summary_paragraph" in fields_set:
-            summary = (
-                db.query(database.VolcMeetingSummary)
-                .filter(database.VolcMeetingSummary.meeting_id == meeting_id)
-                .first()
-            )
+            summary = self._meeting_summary(db, meeting_id)
             if summary is None:
                 summary = database.VolcMeetingSummary(
                     meeting_id=meeting_id,
                     source_audio_id=source_audio_id,
-                    title=payload.summary_title if "summary_title" in fields_set else None,
-                    paragraph=payload.summary_paragraph or "",
+                    title=session.summary_title,
+                    paragraph=session.summary_paragraph or "",
                 )
                 db.add(summary)
             else:
@@ -1230,7 +1286,7 @@ class LiveVolcAsrHandler:
         header.append((SerializationType.JSON << 4) | CompressionType.GZIP)
         header.append(0x00)
         payload = {
-            "user": {"uid": "meeting_domain_live_user"},
+            "user": {"uid": "meeting_live_user"},
             "audio": {"format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1},
             "request": {
                 "model_name": "bigmodel",
@@ -1346,6 +1402,7 @@ class LiveVolcAsrHandler:
                     self._db.add(
                         database.VolcAudioTranscription(
                             meeting_id=self._meeting_id,
+                            source_session_id=self._session_id,
                             text=text,
                             is_final=is_last,
                         )

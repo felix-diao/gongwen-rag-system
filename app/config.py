@@ -77,12 +77,6 @@ class Settings(BaseSettings):
     TENCENT_MEETING_SECRET_KEY: str = ""
     TENCENT_MEETING_API_URL: str = "https://api.meeting.qq.com/v1"
 
-    # 语音转文字配置
-    WHISPER_MODEL_PATH: str
-    BEAM_SIZE: int
-    VAD_FILTER: bool
-    LANGUAGE: str
-
     # AI率配置
     AI_RATE_MODEL_DIR: str
     USE_LM: bool
