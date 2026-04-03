@@ -307,18 +307,6 @@ class LocalMeetingMinuteService:
             todos=[schemas.LocalMeetingTodoInDB.model_validate(x) for x in todos],
         )
 
-    def update_stream_transcript(self, db: Session, meeting_id: int, text: str) -> None:
-        self._assert_meeting_exists(db, meeting_id)
-        asr_session = self._latest_asr_session(db, meeting_id)
-        if not asr_session:
-            raise ValueError("流式转写会话不存在")
-        asr_session.transcript_text = text
-        latest_audio = self._latest_local_audio(db, meeting_id)
-        if latest_audio:
-            latest_audio.transcript_text = text
-            latest_audio.source_asr_session_id = asr_session.id
-        db.commit()
-
     def list_minutes_sessions(
         self,
         db: Session,
@@ -415,95 +403,6 @@ class LocalMeetingMinuteService:
         if not session:
             return False
         db.delete(session)
-        db.commit()
-        return True
-
-    def upsert_summary(
-        self,
-        db: Session,
-        meeting_id: int,
-        payload: schemas.LocalMeetingSummaryCreate,
-    ) -> database.LocalMeetingSummary:
-        self._assert_meeting_exists(db, meeting_id)
-        record = (
-            db.query(database.LocalMeetingSummary)
-            .filter(database.LocalMeetingSummary.meeting_id == meeting_id)
-            .first()
-        )
-        if record:
-            record.title = payload.title
-            record.paragraph = payload.paragraph
-            if payload.source_audio_id is not None:
-                record.source_audio_id = payload.source_audio_id
-        else:
-            record = database.LocalMeetingSummary(
-                meeting_id=meeting_id,
-                source_audio_id=payload.source_audio_id,
-                title=payload.title,
-                paragraph=payload.paragraph,
-            )
-            db.add(record)
-        db.commit()
-        db.refresh(record)
-        return record
-
-    def create_todo(
-        self,
-        db: Session,
-        meeting_id: int,
-        payload: schemas.LocalMeetingTodoCreate,
-    ) -> database.LocalMeetingTodo:
-        self._assert_meeting_exists(db, meeting_id)
-        todo = database.LocalMeetingTodo(
-            meeting_id=meeting_id,
-            source_audio_id=payload.source_audio_id,
-            content=payload.content,
-            executor=payload.executor,
-            execution_time=payload.execution_time,
-        )
-        db.add(todo)
-        db.commit()
-        db.refresh(todo)
-        return todo
-
-    def update_todo(
-        self,
-        db: Session,
-        meeting_id: int,
-        todo_id: int,
-        payload: schemas.LocalMeetingTodoCreate,
-    ) -> Optional[database.LocalMeetingTodo]:
-        todo = (
-            db.query(database.LocalMeetingTodo)
-            .filter(
-                database.LocalMeetingTodo.id == todo_id,
-                database.LocalMeetingTodo.meeting_id == meeting_id,
-            )
-            .first()
-        )
-        if not todo:
-            return None
-        todo.content = payload.content
-        todo.executor = payload.executor
-        todo.execution_time = payload.execution_time
-        if payload.source_audio_id is not None:
-            todo.source_audio_id = payload.source_audio_id
-        db.commit()
-        db.refresh(todo)
-        return todo
-
-    def delete_todo(self, db: Session, meeting_id: int, todo_id: int) -> bool:
-        todo = (
-            db.query(database.LocalMeetingTodo)
-            .filter(
-                database.LocalMeetingTodo.id == todo_id,
-                database.LocalMeetingTodo.meeting_id == meeting_id,
-            )
-            .first()
-        )
-        if not todo:
-            return False
-        db.delete(todo)
         db.commit()
         return True
 

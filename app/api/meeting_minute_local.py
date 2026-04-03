@@ -3,17 +3,17 @@
 该控制器负责本地实时纪要链路的 HTTP 与 WebSocket 入口，包括：
 1. 实时录音转写。
 2. 基于流式转写生成纪要。
-3. 当前纪要视图的摘要、待办、流式文本维护。
+3. 当前纪要视图只提供读取，不提供直接增删改。
 
 运维排障建议：
 1. 实时录音问题优先看 live WebSocket 的连接和关闭日志。
 2. 纪要生成问题优先看 generate 接口和 service 中的 LLM 日志。
-3. 人工修订问题优先看 summary / todo / stream-transcript 三类接口日志。
+3. 人工修订统一通过 session 控制器处理。
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket
 from sqlalchemy.orm import Session
 
 from app.models import database, schemas
@@ -111,139 +111,3 @@ def get_minutes(
     logger.info("获取本地纪要成功 meeting_id=%s", meeting_id)
     return StandardResponse(success=True, data=data, message="获取会议纪要成功")
 
-
-# 处理流程（更新流式转写）：
-# 1. 定位当前会议最新流式 ASR 会话。
-# 2. 覆盖 stream_transcript_text。
-# 3. 同步更新当前音频上的转写缓存。
-@router.put(
-    "/{meeting_id}/stream-transcript",
-    response_model=StandardResponse[None],
-)
-def update_stream_transcript(
-    meeting_id: int,
-    payload: schemas.LocalStreamTranscriptUpdate = Body(...),
-    db: Session = Depends(database.get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    logger.info(
-        "更新本地流式转写请求 meeting_id=%s text_length=%s",
-        meeting_id,
-        len(payload.stream_transcript_text or ""),
-    )
-    try:
-        local_meeting_minute_service.update_stream_transcript(
-            db, meeting_id, payload.stream_transcript_text
-        )
-    except ValueError as exc:
-        logger.warning("更新本地流式转写失败 meeting_id=%s error=%s", meeting_id, exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    logger.info("更新本地流式转写成功 meeting_id=%s", meeting_id)
-    return StandardResponse(success=True, data=None, message="流式转写已更新")
-
-
-# 处理流程（更新当前摘要）：
-# 1. 校验会议存在。
-# 2. 对当前摘要执行 upsert。
-# 3. 返回最新摘要实体。
-@router.put(
-    "/{meeting_id}/summary",
-    response_model=StandardResponse[schemas.LocalMeetingSummaryInDB],
-)
-def upsert_summary(
-    meeting_id: int,
-    payload: schemas.LocalMeetingSummaryCreate = Body(...),
-    db: Session = Depends(database.get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    logger.info("更新本地纪要摘要请求 meeting_id=%s source_audio_id=%s", meeting_id, payload.source_audio_id)
-    try:
-        summary = local_meeting_minute_service.upsert_summary(db, meeting_id, payload)
-    except ValueError as exc:
-        logger.warning("更新本地纪要摘要失败 meeting_id=%s error=%s", meeting_id, exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    logger.info("更新本地纪要摘要成功 meeting_id=%s summary_id=%s", meeting_id, summary.id)
-    return StandardResponse(
-        success=True,
-        data=schemas.LocalMeetingSummaryInDB.model_validate(summary),
-        message="会议摘要已更新",
-    )
-
-
-# 处理流程（新增待办）：
-# 1. 校验会议存在。
-# 2. 写入单条待办事项。
-# 3. 返回新增后的待办实体。
-@router.post(
-    "/{meeting_id}/todos",
-    response_model=StandardResponse[schemas.LocalMeetingTodoInDB],
-)
-def create_todo(
-    meeting_id: int,
-    payload: schemas.LocalMeetingTodoCreate = Body(...),
-    db: Session = Depends(database.get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    logger.info("新增本地纪要待办请求 meeting_id=%s source_audio_id=%s", meeting_id, payload.source_audio_id)
-    try:
-        todo = local_meeting_minute_service.create_todo(db, meeting_id, payload)
-    except ValueError as exc:
-        logger.warning("新增本地纪要待办失败 meeting_id=%s error=%s", meeting_id, exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    logger.info("新增本地纪要待办成功 meeting_id=%s todo_id=%s", meeting_id, todo.id)
-    return StandardResponse(
-        success=True,
-        data=schemas.LocalMeetingTodoInDB.model_validate(todo),
-        message="待办事项已新增",
-    )
-
-
-# 处理流程（更新待办）：
-# 1. 按 meeting_id + todo_id 定位待办记录。
-# 2. 覆盖待办内容、执行人和执行时间。
-# 3. 返回更新后的待办实体。
-@router.put(
-    "/{meeting_id}/todos/{todo_id}",
-    response_model=StandardResponse[schemas.LocalMeetingTodoInDB],
-)
-def update_todo(
-    meeting_id: int,
-    todo_id: int,
-    payload: schemas.LocalMeetingTodoCreate = Body(...),
-    db: Session = Depends(database.get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    logger.info("更新本地纪要待办请求 meeting_id=%s todo_id=%s", meeting_id, todo_id)
-    todo = local_meeting_minute_service.update_todo(db, meeting_id, todo_id, payload)
-    if not todo:
-        logger.warning("更新本地纪要待办失败：待办不存在 meeting_id=%s todo_id=%s", meeting_id, todo_id)
-        raise HTTPException(status_code=404, detail="待办事项不存在")
-    logger.info("更新本地纪要待办成功 meeting_id=%s todo_id=%s", meeting_id, todo_id)
-    return StandardResponse(
-        success=True,
-        data=schemas.LocalMeetingTodoInDB.model_validate(todo),
-        message="待办事项已更新",
-    )
-
-
-# 处理流程（删除待办）：
-# 1. 按 meeting_id + todo_id 定位待办记录。
-# 2. 删除记录。
-# 3. 返回空响应表示删除成功。
-@router.delete(
-    "/{meeting_id}/todos/{todo_id}",
-    response_model=StandardResponse[None],
-)
-def delete_todo(
-    meeting_id: int,
-    todo_id: int,
-    db: Session = Depends(database.get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    logger.info("删除本地纪要待办请求 meeting_id=%s todo_id=%s", meeting_id, todo_id)
-    deleted = local_meeting_minute_service.delete_todo(db, meeting_id, todo_id)
-    if not deleted:
-        logger.warning("删除本地纪要待办失败：待办不存在 meeting_id=%s todo_id=%s", meeting_id, todo_id)
-        raise HTTPException(status_code=404, detail="待办事项不存在")
-    logger.info("删除本地纪要待办成功 meeting_id=%s todo_id=%s", meeting_id, todo_id)
-    return StandardResponse(success=True, data=None, message="待办事项已删除")
