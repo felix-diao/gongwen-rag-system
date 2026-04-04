@@ -545,6 +545,9 @@ class VolcMeetingMinuteService:
                     if not audio:
                         raise RuntimeError(f"妙记任务缺少关联音频 source_audio_id={job.source_audio_id}")
                     self._consume_minutes_success_result(db, audio, data["Result"])
+                    # SessionLocal 关闭了 autoflush；先把当前视图里的精确转写/摘要/待办 flush 到事务里，
+                    # 再基于这些最新数据生成会话历史快照，避免快照读到旧值或空值。
+                    db.flush()
                     job.status = "completed"
                     job.error_msg = None
                     job.updated_at = datetime.utcnow()
