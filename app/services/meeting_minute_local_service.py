@@ -18,6 +18,9 @@ import base64
 import json
 import os
 import re
+import shutil
+import tempfile
+import threading
 import uuid
 import wave
 from datetime import datetime, timedelta, timezone
@@ -25,16 +28,107 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import database, schemas
+from app.models.database import SessionLocal
 from app.services.meeting_audio_service import meeting_audio_service
+from app.services.qwen_asr_incremental_http import (
+    _incremental_http_lock,
+    asr_http_runtime_params,
+    build_asr_requests_session,
+    get_incremental_http_public_base_and_port,
+    merge_pair,
+    post_served_wav_chunk,
+    start_chunk_http_server,
+    stop_chunk_http_server,
+    transcribe_audio_file_incremental,
+    validate_incremental_http_config,
+    write_pcm_as_wav_file,
+)
 from app.utils.logger import get_logger
 
 logger = get_logger("meeting_local_minutes_service")
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
+    asr_id = task["asr_session_id"]
+    meeting_id = task["meeting_id"]
+    audio_id = task["audio_id"]
+    db = SessionLocal()
+    tmp_path: Optional[Path] = None
+    try:
+        tmp_path, _, _ = meeting_audio_service.download_audio_to_temp(
+            db, meeting_id, "local", audio_id
+        )
+        merged, duration = transcribe_audio_file_incremental(tmp_path)
+        row = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.id == asr_id)
+            .first()
+        )
+        if not row:
+            return
+        row.stream_transcript_text = merged
+        row.duration_seconds = duration
+        row.source_audio_id = audio_id
+        row.status = "completed"
+        row.error_msg = None
+        db.commit()
+        logger.info(
+            "本地音频分段转写完成 meeting_id=%s audio_id=%s asr_session_id=%s len=%s",
+            meeting_id,
+            audio_id,
+            asr_id,
+            len(merged or ""),
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "本地音频分段转写失败(HTTP) meeting_id=%s audio_id=%s asr_session_id=%s detail=%s",
+            meeting_id,
+            audio_id,
+            asr_id,
+            exc.detail,
+        )
+        row = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.id == asr_id)
+            .first()
+        )
+        if row:
+            row.status = "failed"
+            detail = exc.detail
+            row.error_msg = detail if isinstance(detail, str) else repr(detail)
+            db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "本地音频分段转写失败 meeting_id=%s audio_id=%s asr_session_id=%s",
+            meeting_id,
+            audio_id,
+            asr_id,
+        )
+        row = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.id == asr_id)
+            .first()
+        )
+        if row:
+            row.status = "failed"
+            row.error_msg = str(exc)
+            db.commit()
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        db.close()
+
+
 _TEXT_FIELDS = ("text", "transcript", "delta")
 _NESTED_FIELDS = ("item", "data", "result", "response")
 _FINAL_EVENT_TYPES = {"conversation.item.input_audio_transcription.completed"}
@@ -196,6 +290,22 @@ class LocalMeetingMinuteService:
         )
 
     @staticmethod
+    def _latest_asr_session_with_transcript(
+        db: Session, meeting_id: int
+    ) -> Optional[database.LocalAsrSession]:
+        """用于生成纪要：跳过尚无正文的 processing 行，避免与异步文件转写抢最新空行。"""
+        rows = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.meeting_id == meeting_id)
+            .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
+            .all()
+        )
+        for row in rows:
+            if (row.stream_transcript_text or "").strip():
+                return row
+        return None
+
+    @staticmethod
     def _asr_session_for_minutes_snapshot(
         db: Session,
         meeting_id: int,
@@ -219,6 +329,62 @@ class LocalMeetingMinuteService:
             )
             .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
             .first()
+        )
+
+    @staticmethod
+    def _assert_local_audio(db: Session, meeting_id: int, audio_id: int) -> database.MeetingAudio:
+        rec = (
+            db.query(database.MeetingAudio)
+            .filter(
+                database.MeetingAudio.id == audio_id,
+                database.MeetingAudio.meeting_id == meeting_id,
+                database.MeetingAudio.provider == "local",
+            )
+            .first()
+        )
+        if not rec:
+            raise ValueError("本地音频记录不存在或不属于该会议")
+        return rec
+
+    def queue_transcribe_uploaded_local_audio(
+        self,
+        db: Session,
+        meeting_id: int,
+        audio_id: int,
+    ) -> schemas.LocalAsrTranscribeFromAudioResponse:
+        """对已上传的本地会议音频排队分段 HTTP 转写（异步写入 local_asr_sessions）。"""
+        self._assert_meeting_exists(db, meeting_id)
+        self._assert_local_audio(db, meeting_id, audio_id)
+        validate_incremental_http_config()
+
+        asr = database.LocalAsrSession(
+            meeting_id=meeting_id,
+            status="processing",
+            source_audio_id=audio_id,
+        )
+        db.add(asr)
+        db.commit()
+        db.refresh(asr)
+        asr_id = asr.id
+
+        task = {"asr_session_id": asr_id, "meeting_id": meeting_id, "audio_id": audio_id}
+        threading.Thread(
+            target=_run_local_uploaded_audio_transcribe_job,
+            args=(task,),
+            daemon=True,
+            name=f"local-asr-file-{asr_id}",
+        ).start()
+        logger.info(
+            "已排队本地音频分段转写 meeting_id=%s audio_id=%s asr_session_id=%s",
+            meeting_id,
+            audio_id,
+            asr_id,
+        )
+        return schemas.LocalAsrTranscribeFromAudioResponse(
+            asr_session_id=asr_id,
+            meeting_id=meeting_id,
+            source_audio_id=audio_id,
+            status="processing",
         )
 
     @staticmethod
@@ -256,12 +422,12 @@ class LocalMeetingMinuteService:
     def generate_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
         logger.info("开始生成本地会议纪要 meeting_id=%s", meeting_id)
         self._assert_meeting_exists(db, meeting_id)
-        asr_session = self._latest_asr_session(db, meeting_id)
-        if not asr_session or not asr_session.stream_transcript_text:
-            raise ValueError("当前会议尚无流式转写文本")
+        asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
+        if not asr_session:
+            raise ValueError("当前会议尚无可用转写文本（请完成实时录音、HTTP 分段录音或已上传音频转写）")
 
         meeting_title = self._get_meeting_title(db, meeting_id)
-        payload = self._call_llm(meeting_title, asr_session.stream_transcript_text)
+        payload = self._call_llm(meeting_title, asr_session.stream_transcript_text or "")
 
         source_audio_id = asr_session.source_audio_id
         if source_audio_id is None:
@@ -297,13 +463,14 @@ class LocalMeetingMinuteService:
                 )
             )
 
-        db.commit()
+        db.flush()
         self._create_minutes_session_snapshot(
             db=db,
             meeting_id=meeting_id,
             source_audio_id=source_audio_id,
             stream_transcript_text=asr_session.stream_transcript_text,
         )
+        db.commit()
         logger.info("本地会议纪要生成完成 meeting_id=%s source_audio_id=%s", meeting_id, source_audio_id)
         return self.get_minutes(db, meeting_id)
 
@@ -313,9 +480,16 @@ class LocalMeetingMinuteService:
         latest_audio = self._latest_local_audio(db, meeting_id)
         summary = self._meeting_summary(db, meeting_id)
         todos = self._meeting_todos(db, meeting_id)
+        # 最新 ASR 行可能尚在 processing 且无正文（如排队文件转写）；此时仍展示「最近一条有稿」避免 GET 空白
+        transcript: Optional[str] = None
+        if latest_session and (latest_session.stream_transcript_text or "").strip():
+            transcript = latest_session.stream_transcript_text
+        else:
+            with_text = self._latest_asr_session_with_transcript(db, meeting_id)
+            transcript = with_text.stream_transcript_text if with_text else None
         return schemas.LocalMeetingMinutesResponse(
-            transcript_text=latest_session.stream_transcript_text if latest_session else None,
-            stream_transcript_text=latest_session.stream_transcript_text if latest_session else None,
+            transcript_text=transcript,
+            stream_transcript_text=transcript,
             asr_session_id=latest_session.id if latest_session else None,
             audio_status=(
                 latest_audio.status
@@ -547,7 +721,7 @@ class LocalMeetingMinuteService:
             todos_json=json.dumps(todos_payload, ensure_ascii=False),
         )
         db.add(session)
-        db.commit()
+        db.flush()
         db.refresh(session)
         return session
 
@@ -593,12 +767,17 @@ class LocalMeetingMinuteService:
             ex = todo.get("executor")
             et = todo.get("execution_time")
             sid = todo.get("source_audio_id")
+            sid_int: Optional[int] = None
+            if isinstance(sid, int):
+                sid_int = sid
+            elif isinstance(sid, str) and sid.strip().isdigit():
+                sid_int = int(sid.strip())
             todos.append(
                 schemas.LocalSessionTodoItem(
                     content=content,
                     executor=str(ex).strip() if isinstance(ex, str) and ex.strip() else None,
                     execution_time=str(et).strip() if isinstance(et, str) and et.strip() else None,
-                    source_audio_id=int(sid) if isinstance(sid, int) else None,
+                    source_audio_id=sid_int,
                 )
             )
         return schemas.LocalMeetingMinutesSessionInDB(
@@ -677,11 +856,9 @@ class LocalMeetingMinuteService:
 class LiveLocalAsrHandler:
     """本地实时 ASR 处理器。
 
-    处理链路：
-    1. 接收前端 PCM 音频。
-    2. 转发给 Qwen 实时 ASR。
-    3. 将 partial/final 文本回推前端。
-    4. 录音结束后把 PCM 落为 WAV，并上传到统一音频表。
+    QWEN_ASR_LIVE_FORCE_HTTP_CHUNK 为真时对齐 qwen_asr_smoketest_incremental_merge.py：
+    按 QWEN_ASR_CHUNK_SEC / QWEN_ASR_OVERLAP_SEC 滑窗（step=chunk-overlap），每段 wav → audio_url → merge_pair，
+    WS 推送 delta 或 boundary_corrected 全量。为假时走 Qwen 实时 WS。结束写整轨 WAV 上传。
     """
 
     def __init__(
@@ -704,6 +881,8 @@ class LiveLocalAsrHandler:
         self._channels = 1
         self._sample_width = 2
         self._ws_alive = True
+        # HTTP 滑窗分段时 merge_pair 的累计稿，异常收尾时写入 DB 便于排障
+        self._live_http_merged: str = ""
 
     async def run(self) -> None:
         # `run` 是实时会话总入口，负责创建 ASR session、启动双向转发、并在结束时统一收尾。
@@ -722,22 +901,27 @@ class LiveLocalAsrHandler:
 
         try:
             logger.info("开始本地实时 ASR 会话 meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
-            ws_url = _build_qwen_ws_url()
-            headers = _build_qwen_ws_headers()
-            stop_event = asyncio.Event()
+            if settings.QWEN_ASR_LIVE_FORCE_HTTP_CHUNK:
+                await self._run_live_incremental_http()
+            else:
+                ws_url = _build_qwen_ws_url()
+                headers = _build_qwen_ws_headers()
+                stop_event = asyncio.Event()
 
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(ws_url, headers=headers) as qwen_ws:
-                    await qwen_ws.send_str(_session_update_event())
-                    send_task = asyncio.create_task(self._forward_audio(qwen_ws, stop_event))
-                    recv_task = asyncio.create_task(self._recv_asr_result(qwen_ws, stop_event))
-                    await asyncio.wait([send_task, recv_task], return_when=asyncio.ALL_COMPLETED)
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(ws_url, headers=headers) as qwen_ws:
+                        await qwen_ws.send_str(_session_update_event())
+                        send_task = asyncio.create_task(self._forward_audio(qwen_ws, stop_event))
+                        recv_task = asyncio.create_task(self._recv_asr_result(qwen_ws, stop_event))
+                        await asyncio.wait([send_task, recv_task], return_when=asyncio.ALL_COMPLETED)
 
-            await self._finalize()
+                await self._finalize_from_ws_transcript()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Local live ASR run failed meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
             asr_session.status = "failed"
-            asr_session.stream_transcript_text = "".join(self._final_parts)
+            asr_session.stream_transcript_text = (self._live_http_merged or "").strip() or "".join(
+                self._final_parts
+            )
             asr_session.error_msg = str(exc)
             self._db.commit()
             if self._ws_alive:
@@ -802,24 +986,12 @@ class LiveLocalAsrHandler:
                 break
         stop_event.set()
 
-    async def _finalize(self) -> None:
-        # 收尾阶段必须串行完成：
-        # 1. 更新 ASR session；
-        # 2. 落本地 WAV；
-        # 3. 上传对象存储；
-        # 4. 回填音频与会话关联。
-        transcript = "".join(self._final_parts)
-        asr_session = (
-            self._db.query(database.LocalAsrSession)
-            .filter(database.LocalAsrSession.id == self._session_id)
-            .first()
-        )
-        if not asr_session:
-            raise RuntimeError("ASR 会话不存在")
+    def _materialize_wav_path(self) -> tuple[Path, float]:
         if not self._audio_chunks:
             raise RuntimeError("未接收到任何音频数据，无法生成录音文件")
-
-        wav_dir = Path(settings.QWEN_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "local_asr_recordings"))
+        wav_dir = Path(
+            settings.QWEN_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "local_asr_recordings")
+        )
         wav_dir.mkdir(parents=True, exist_ok=True)
         wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
         logger.info(
@@ -835,9 +1007,19 @@ class LiveLocalAsrHandler:
             channels=self._channels,
             sample_width=self._sample_width,
         )
-        asr_session.status = "completed"
-        asr_session.duration_seconds = duration
+        return wav_path, duration
+
+    async def _finalize_common(self, transcript: str, duration: float, wav_path: Path) -> None:
+        """先落转写与时长（仍为 processing），TOS 上传成功后再标 completed，避免上传失败却已是 completed。"""
+        asr_session = (
+            self._db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.id == self._session_id)
+            .first()
+        )
+        if not asr_session:
+            raise RuntimeError("ASR 会话不存在")
         asr_session.stream_transcript_text = transcript
+        asr_session.duration_seconds = duration
         self._db.commit()
 
         if self._ws_alive:
@@ -853,13 +1035,25 @@ class LiveLocalAsrHandler:
                 file_name=f"live_{self._session_id}.wav",
                 content_type="audio/wav",
             )
+        except Exception as upload_exc:  # noqa: BLE001
+            logger.exception(
+                "本地实时录音上传失败 meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+            asr_session.status = "failed"
+            asr_session.error_msg = str(upload_exc)
+            self._db.commit()
+            raise
         finally:
             try:
                 wav_path.unlink(missing_ok=True)
             except OSError:
                 logger.warning("本地实时录音临时 WAV 清理失败 path=%s", wav_path)
 
+        asr_session.status = "completed"
         asr_session.source_audio_id = audio_record.id
+        asr_session.error_msg = None
         self._db.commit()
         logger.info(
             "本地实时 ASR 会话完成 meeting_id=%s session_id=%s audio_id=%s duration=%.3f",
@@ -880,6 +1074,201 @@ class LiveLocalAsrHandler:
                     "duration_seconds": duration,
                 }
             )
+
+    async def _finalize_from_ws_transcript(self) -> None:
+        transcript = "".join(self._final_parts)
+        wav_path, pcm_duration = self._materialize_wav_path()
+        await self._finalize_common(transcript, pcm_duration, wav_path)
+
+    async def _push_incremental_merge_ws(self, old_merged: str, merged: str, chunk_idx: int) -> None:
+        """对齐 smoketest incremental_transcribe_and_merge 269-276：追加 delta 或边界修正后全量 accumulated。"""
+        if not self._ws_alive:
+            return
+        if merged.startswith(old_merged):
+            delta = merged[len(old_merged) :]
+            await self._ws.send_json(
+                {
+                    "type": "partial",
+                    "text": delta,
+                    "accumulated": merged,
+                    "chunk_idx": chunk_idx,
+                }
+            )
+        else:
+            await self._ws.send_json(
+                {
+                    "type": "partial",
+                    "accumulated": merged,
+                    "chunk_idx": chunk_idx,
+                    "boundary_corrected": True,
+                }
+            )
+
+    async def _run_live_incremental_http(self) -> None:
+        """实时 HTTP 滑窗：与 qwen_asr_smoketest_incremental_merge 同源的分段请求 + merge_pair。"""
+        validate_incremental_http_config()
+        public_base, bind_port = get_incremental_http_public_base_and_port()
+        chat_url, model, headers, timeout, max_tokens = asr_http_runtime_params()
+
+        chunk_sec = float(settings.QWEN_ASR_CHUNK_SEC)
+        overlap_sec = float(settings.QWEN_ASR_OVERLAP_SEC)
+        step_sec = chunk_sec - overlap_sec
+        if step_sec <= 0:
+            raise ValueError("QWEN_ASR_CHUNK_SEC 必须大于 QWEN_ASR_OVERLAP_SEC")
+
+        frame = self._channels * self._sample_width
+        bytes_per_sec = self._sample_rate * frame
+        chunk_bytes = max(1, int(chunk_sec * bytes_per_sec))
+        step_bytes = max(1, int(step_sec * bytes_per_sec))
+        min_tail_bytes = max(frame, int(0.5 * bytes_per_sec))
+
+        work_root = Path(tempfile.mkdtemp(prefix="live_asr_inc_"))
+        chunks_dir = work_root / "chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        await asyncio.to_thread(lambda: _incremental_http_lock.acquire())
+        httpd: Optional[Any] = None
+        th: Optional[threading.Thread] = None
+        try:
+            httpd, th = start_chunk_http_server(chunks_dir, bind_port)
+            req_session = build_asr_requests_session()
+            pcm_total = bytearray()
+            cursor = 0
+            seg_idx = 0
+            merged_text = ""
+
+            async def flush_full_chunks() -> None:
+                nonlocal cursor, seg_idx, merged_text
+                while len(pcm_total) - cursor >= chunk_bytes:
+                    segment = bytes(pcm_total[cursor : cursor + chunk_bytes])
+                    fname = f"chunk_{seg_idx:04d}.wav"
+                    fpath = chunks_dir / fname
+                    await asyncio.to_thread(
+                        write_pcm_as_wav_file,
+                        fpath,
+                        segment,
+                        sample_rate=self._sample_rate,
+                        channels=self._channels,
+                        sample_width=self._sample_width,
+                    )
+
+                    def _post_one() -> str:
+                        try:
+                            return post_served_wav_chunk(
+                                req_session,
+                                chat_url,
+                                model,
+                                headers,
+                                public_base,
+                                fname,
+                                timeout,
+                                max_tokens,
+                            )
+                        except Exception as post_exc:  # noqa: BLE001
+                            # 与 transcribe_audio_file_incremental 一致：单段失败记日志并空串，由 merge_pair 承接
+                            logger.warning(
+                                "实时 HTTP 分段 ASR 失败 session_id=%s idx=%s: %s",
+                                self._session_id,
+                                seg_idx,
+                                post_exc,
+                            )
+                            return ""
+
+                    curr = await asyncio.to_thread(_post_one)
+                    old_m = merged_text
+                    merged_text, _info = merge_pair(merged_text, curr)
+                    self._live_http_merged = merged_text
+                    await self._push_incremental_merge_ws(old_m, merged_text, seg_idx)
+                    cursor += step_bytes
+                    seg_idx += 1
+
+            if self._ws_alive:
+                await self._ws.send_json(
+                    {
+                        "type": "transcribing",
+                        "session_id": self._session_id,
+                        "mode": "http_chunk_incremental",
+                    }
+                )
+
+            while True:
+                raw = await self._ws.receive()
+                msg_type = raw.get("type", "")
+                if msg_type in {"websocket.disconnect", "websocket.close"}:
+                    self._ws_alive = False
+                    break
+                if raw.get("text"):
+                    ctrl = json.loads(raw["text"])
+                    action = ctrl.get("action")
+                    if action == "stop":
+                        break
+                    if action == "config":
+                        self._sample_rate = int(ctrl.get("rate", self._sample_rate))
+                        self._channels = int(ctrl.get("channels", self._channels))
+                        # 与前端约定：config 应在首包 PCM 之前；若晚到则仅影响后续滑窗尺寸
+                        frame = self._channels * self._sample_width
+                        bytes_per_sec = self._sample_rate * frame
+                        chunk_bytes = max(1, int(chunk_sec * bytes_per_sec))
+                        step_bytes = max(1, int(step_sec * bytes_per_sec))
+                        min_tail_bytes = max(frame, int(0.5 * bytes_per_sec))
+                    continue
+                if raw.get("bytes"):
+                    pcm_total.extend(raw["bytes"])
+                    await flush_full_chunks()
+
+            await flush_full_chunks()
+
+            remainder = len(pcm_total) - cursor
+            if remainder >= min_tail_bytes:
+                segment = bytes(pcm_total[cursor:])
+                fname = f"chunk_{seg_idx:04d}.wav"
+                fpath = chunks_dir / fname
+                await asyncio.to_thread(
+                    write_pcm_as_wav_file,
+                    fpath,
+                    segment,
+                    sample_rate=self._sample_rate,
+                    channels=self._channels,
+                    sample_width=self._sample_width,
+                )
+
+                def _post_tail() -> str:
+                    try:
+                        return post_served_wav_chunk(
+                            req_session,
+                            chat_url,
+                            model,
+                            headers,
+                            public_base,
+                            fname,
+                            timeout,
+                            max_tokens,
+                        )
+                    except Exception as post_exc:  # noqa: BLE001
+                        logger.warning(
+                            "实时 HTTP 尾段 ASR 失败 session_id=%s: %s",
+                            self._session_id,
+                            post_exc,
+                        )
+                        return ""
+
+                curr = await asyncio.to_thread(_post_tail)
+                old_m = merged_text
+                merged_text, _info = merge_pair(merged_text, curr)
+                self._live_http_merged = merged_text
+                await self._push_incremental_merge_ws(old_m, merged_text, seg_idx)
+
+            if not pcm_total:
+                raise RuntimeError("未接收到任何音频数据，无法生成录音文件")
+
+            self._audio_chunks = [bytes(pcm_total)]
+            wav_path, pcm_duration = self._materialize_wav_path()
+            await self._finalize_common(merged_text, pcm_duration, wav_path)
+        finally:
+            if httpd is not None and th is not None:
+                stop_chunk_http_server(httpd, th)
+            shutil.rmtree(work_root, ignore_errors=True)
+            _incremental_http_lock.release()
 
 
 local_meeting_minute_service = LocalMeetingMinuteService()

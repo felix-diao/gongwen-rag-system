@@ -911,8 +911,8 @@ class LocalTranscriptUpdate(BaseModel):
 class LocalMeetingMinutesResponse(BaseModel):
     """本地会议纪要聚合响应。
 
-    transcript_text 与 stream_transcript_text 同源，便于客户端任选字段名。
-    asr_session_id 对应当前展示的 local_asr_sessions 主键。
+    transcript_text 与 stream_transcript_text 同源。asr_session_id 始终为「最新一条」local_asr_sessions；
+    若该行尚无正文（如异步转写中），转写字段回退为最近一条有稿的会话，避免轮询时空白。
     """
     transcript_text: Optional[str] = None
     stream_transcript_text: Optional[str] = None
@@ -920,6 +920,15 @@ class LocalMeetingMinutesResponse(BaseModel):
     audio_status: Optional[str] = None
     summary: Optional[LocalMeetingSummaryInDB] = None
     todos: List[LocalMeetingTodoInDB] = Field(default_factory=list)
+
+
+class LocalAsrTranscribeFromAudioResponse(BaseModel):
+    """对已上传的本地会议音频提交分段 HTTP 转写；异步完成后写入 local_asr_sessions。"""
+
+    asr_session_id: int
+    meeting_id: int
+    source_audio_id: int
+    status: Literal["processing"] = "processing"
 
 
 class LocalSessionTodoItem(BaseModel):

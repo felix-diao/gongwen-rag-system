@@ -1,8 +1,9 @@
 """本地 AI 会议纪要：实时转写 WebSocket、一键生成纪要、当前聚合视图与历史快照 CRUD。
 
-WebSocket 将 PCM 转发至 Qwen 实时 ASR，结束后落 WAV 并写入 meeting_audios；POST generate 基于最新流式稿调 LLM 写摘要/待办并落历史快照。
-GET 当前视图只读；sessions 表示某次生成后的整包快照（非 WS 连接），可编辑并在「最新快照」上回写当前摘要/待办/ASR 文本。
-排障：live 看 WS 日志；generate 看 LLM 与 ValueError/RuntimeError；快照与当前不一致看 PUT sessions。
+WebSocket：Qwen 实时 WS 或 QWEN_ASR_LIVE_FORCE_HTTP_CHUNK 下 HTTP 滑窗分段转写；均落 WAV 并写入 meeting_audios。
+POST transcribe-audio：对已上传本地音频排队异步分段转写，轮询 GET /{meeting_id} 查看 stream_transcript_text 与 audio_status。
+POST generate 基于最新可用转写稿调 LLM 写摘要/待办并落历史快照。
+GET 当前视图只读；sessions 为历史快照，可编辑并回写当前摘要/待办/ASR 文本。
 """
 
 from __future__ import annotations
@@ -120,6 +121,47 @@ def get_minutes(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     logger.info("获取本地纪要成功 meeting_id=%s", meeting_id)
     return StandardResponse(success=True, data=data, message="获取会议纪要成功")
+
+
+# 对已上传的本地会议音频（meeting_audios.provider=local）提交分段 HTTP 转写，异步写入新的 local_asr_sessions 行。
+# 成功后轮询 GET /{meeting_id}：stream_transcript_text、asr_session_id、audio_status；失败时该行 status=failed 且 error_msg 有说明。
+@router.post(
+    "/{meeting_id}/transcribe-audio",
+    response_model=StandardResponse[schemas.LocalAsrTranscribeFromAudioResponse],
+)
+def transcribe_uploaded_local_audio(
+    meeting_id: int,
+    audio_id: int = Query(..., description="meeting_audios 主键，须为本会议下 provider=local 的记录"),
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    logger.info("提交本地已上传音频分段转写 meeting_id=%s audio_id=%s", meeting_id, audio_id)
+    try:
+        data = local_meeting_minute_service.queue_transcribe_uploaded_local_audio(
+            db, meeting_id, audio_id
+        )
+    except ValueError as exc:
+        logger.warning("提交本地音频转写失败 meeting_id=%s audio_id=%s error=%s", meeting_id, audio_id, exc)
+        raise _http_from_local_minutes_value_error(exc) from exc
+    except RuntimeError as exc:
+        logger.warning(
+            "提交本地音频转写失败(配置) meeting_id=%s audio_id=%s error=%s",
+            meeting_id,
+            audio_id,
+            exc,
+        )
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    logger.info(
+        "已排队本地音频分段转写 meeting_id=%s audio_id=%s asr_session_id=%s",
+        meeting_id,
+        audio_id,
+        data.asr_session_id,
+    )
+    return StandardResponse(
+        success=True,
+        data=data,
+        message="已提交异步分段转写，请轮询 GET 当前纪要查看转写结果",
+    )
 
 
 # 列出本会下全部本地纪要历史快照（某次生成后的整包版本，非实时 WS）。

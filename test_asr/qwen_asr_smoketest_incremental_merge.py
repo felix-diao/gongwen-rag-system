@@ -20,7 +20,7 @@ AUDIO_URL = "https://meeting-record-temp2.tos-cn-beijing.volces.com/meetings/19/
 
 CHUNK_SEC = 6
 OVERLAP_SEC = 1
-PORT = 8001
+PORT = 8003
 SERVER_IP = "8.152.214.78"
 
 # 每段识别后是否打印整段调试信息
