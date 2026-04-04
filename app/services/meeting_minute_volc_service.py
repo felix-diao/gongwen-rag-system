@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 import requests
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -291,11 +292,10 @@ class VolcMeetingMinuteService:
         self._poll_lock = threading.Lock()
 
     def _assert_meeting_exists(self, db: Session, meeting_id: int) -> None:
-        exists = (
-            db.query(database.Meeting.id)
-            .filter(database.Meeting.id == meeting_id)
-            .first()
-        )
+        exists = db.execute(
+            text("SELECT 1 FROM meetings WHERE id = :meeting_id LIMIT 1"),
+            {"meeting_id": meeting_id},
+        ).first()
         if not exists:
             raise ValueError("会议不存在")
 
@@ -307,6 +307,15 @@ class VolcMeetingMinuteService:
             self._volc_audio_query(db)
             .filter(database.MeetingAudio.meeting_id == meeting_id)
             .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _latest_minutes_job(db: Session, meeting_id: int) -> Optional[database.VolcMinutesJob]:
+        return (
+            db.query(database.VolcMinutesJob)
+            .filter(database.VolcMinutesJob.meeting_id == meeting_id)
+            .order_by(database.VolcMinutesJob.updated_at.desc(), database.VolcMinutesJob.id.desc())
             .first()
         )
 
@@ -413,7 +422,7 @@ class VolcMeetingMinuteService:
         db: Session,
         meeting_id: int,
         audio_id: int,
-    ) -> database.MeetingAudio:
+    ) -> database.VolcMinutesJob:
         self._assert_meeting_exists(db, meeting_id)
         audio = (
             self._volc_audio_query(db)
@@ -431,91 +440,113 @@ class VolcMeetingMinuteService:
         logger.info("提交火山妙记任务 meeting_id=%s audio_id=%s file_url=%s", meeting_id, audio_id, audio.file_url)
         task_id = self._minutes_api.submit(audio.file_url, audio.file_type)
         audio.status = "submitted"
-        audio.task_id = task_id
-        audio.error_msg = None
+        job = database.VolcMinutesJob(
+            meeting_id=meeting_id,
+            source_audio_id=audio.id,
+            input_file_url=audio.file_url,
+            input_file_type=audio.file_type,
+            volc_task_id=task_id,
+            status="submitted",
+            error_msg=None,
+        )
+        db.add(job)
         db.commit()
-        db.refresh(audio)
+        db.refresh(job)
 
-        self._start_poller(audio.id)
-        return audio
+        self._start_poller(job.id)
+        return job
 
-    def _start_poller(self, audio_id: int) -> None:
-        # 同一 audio_id 只保留一个活跃轮询器；新轮询启动前会停掉旧轮询。
+    def _start_poller(self, job_id: int) -> None:
+        # 同一任务只保留一个活跃轮询器；新轮询启动前会停掉旧轮询。
         with self._poll_lock:
-            prev = self._poll_stop.get(audio_id)
+            prev = self._poll_stop.get(job_id)
             if prev:
                 prev.set()
             flag = threading.Event()
-            self._poll_stop[audio_id] = flag
+            self._poll_stop[job_id] = flag
 
         thread = threading.Thread(
             target=self._poll_loop,
-            args=(audio_id, flag),
+            args=(job_id, flag),
             daemon=True,
-            name=f"meeting-domain-volc-poll-{audio_id}",
+            name=f"meeting-domain-volc-poll-{job_id}",
         )
         thread.start()
-        logger.info("已启动火山妙记轮询器 audio_id=%s thread=%s", audio_id, thread.name)
+        logger.info("已启动火山妙记轮询器 job_id=%s thread=%s", job_id, thread.name)
 
-    def _poll_loop(self, audio_id: int, stop_flag: threading.Event) -> None:
+    def _poll_loop(self, job_id: int, stop_flag: threading.Event) -> None:
         # 轮询职责：
         # 1) 查询妙记任务状态；
-        # 2) 把状态同步到 MeetingAudio；
+        # 2) 把状态同步到 VolcMinutesJob 与 MeetingAudio；
         # 3) 成功后落库摘要/待办/转写并通过 websocket 广播结果。
         db = database.SessionLocal()
         try:
             while not stop_flag.is_set():
-                audio = (
-                    self._volc_audio_query(db)
-                    .filter(database.MeetingAudio.id == audio_id)
+                job = (
+                    db.query(database.VolcMinutesJob)
+                    .filter(database.VolcMinutesJob.id == job_id)
                     .first()
                 )
-                if not audio or not audio.task_id:
+                if not job or not job.volc_task_id:
                     break
+                audio = None
+                if job.source_audio_id is not None:
+                    audio = (
+                        self._volc_audio_query(db)
+                        .filter(database.MeetingAudio.id == job.source_audio_id)
+                        .first()
+                    )
 
-                result = self._minutes_api.query(audio.task_id)
+                result = self._minutes_api.query(job.volc_task_id)
                 data = result["Data"]
                 status_raw = str(data["Status"]).strip()
                 status = status_raw.lower()
                 logger.info(
                     "火山妙记轮询状态更新 audio_id=%s meeting_id=%s task_id=%s status=%s",
-                    audio.id,
-                    audio.meeting_id,
-                    audio.task_id,
+                    audio.id if audio else job.source_audio_id,
+                    job.meeting_id,
+                    job.volc_task_id,
                     status_raw,
                 )
 
                 if status in MINUTES_RUNNING_STATUS:
-                    audio.status = status_raw
+                    job.status = status_raw
+                    if audio:
+                        audio.status = status_raw
                     db.commit()
                 elif status in MINUTES_FAILED_STATUS:
-                    audio.status = "failed"
-                    audio.error_msg = str(data["ErrMessage"])
+                    job.status = "failed"
+                    job.error_msg = str(data["ErrMessage"])
+                    if audio:
+                        audio.status = "failed"
                     db.commit()
                     meeting_ws_manager.notify_from_thread(
-                        audio.meeting_id,
+                        job.meeting_id,
                         {
                             "type": "volc_minutes_failed",
-                            "meeting_id": audio.meeting_id,
-                            "audio_id": audio.id,
-                            "task_id": audio.task_id,
-                            "error": audio.error_msg,
+                            "meeting_id": job.meeting_id,
+                            "audio_id": audio.id if audio else job.source_audio_id,
+                            "task_id": job.volc_task_id,
+                            "error": job.error_msg,
                         },
                     )
                     break
                 elif status in MINUTES_SUCCESS_STATUS:
+                    if not audio:
+                        raise RuntimeError(f"妙记任务缺少关联音频 source_audio_id={job.source_audio_id}")
                     self._consume_minutes_success_result(db, audio, data["Result"])
                     audio.status = "completed"
-                    audio.error_msg = None
+                    job.status = "completed"
+                    job.error_msg = None
                     self._create_minutes_session_snapshot(db, audio)
                     db.commit()
                     meeting_ws_manager.notify_from_thread(
-                        audio.meeting_id,
+                        job.meeting_id,
                         {
                             "type": "volc_minutes_completed",
-                            "meeting_id": audio.meeting_id,
+                            "meeting_id": job.meeting_id,
                             "audio_id": audio.id,
-                            "task_id": audio.task_id,
+                            "task_id": job.volc_task_id,
                         },
                     )
                     break
@@ -524,34 +555,44 @@ class VolcMeetingMinuteService:
                 time.sleep(5)
         except Exception as exc:  # noqa: BLE001
             try:
-                audio = (
-                    self._volc_audio_query(db)
-                    .filter(database.MeetingAudio.id == audio_id)
+                job = (
+                    db.query(database.VolcMinutesJob)
+                    .filter(database.VolcMinutesJob.id == job_id)
                     .first()
                 )
+                audio = None
+                if job and job.source_audio_id is not None:
+                    audio = (
+                        self._volc_audio_query(db)
+                        .filter(database.MeetingAudio.id == job.source_audio_id)
+                        .first()
+                    )
+                if job:
+                    job.status = "failed"
+                    job.error_msg = str(exc)
                 if audio:
                     audio.status = "failed"
-                    audio.error_msg = str(exc)
+                if job or audio:
                     db.commit()
                     meeting_ws_manager.notify_from_thread(
-                        audio.meeting_id,
+                        job.meeting_id if job else (audio.meeting_id if audio else 0),
                         {
                             "type": "volc_minutes_failed",
-                            "meeting_id": audio.meeting_id,
-                            "audio_id": audio.id,
-                            "task_id": audio.task_id,
-                            "error": audio.error_msg,
+                            "meeting_id": job.meeting_id if job else (audio.meeting_id if audio else None),
+                            "audio_id": audio.id if audio else (job.source_audio_id if job else None),
+                            "task_id": job.volc_task_id if job else None,
+                            "error": job.error_msg if job else str(exc),
                         },
                     )
             except Exception:  # noqa: BLE001
-                logger.exception("minutes poller failed to persist error audio_id=%s", audio_id)
-            logger.exception("minutes poller crashed audio_id=%s error=%s", audio_id, exc)
+                logger.exception("minutes poller failed to persist error job_id=%s", job_id)
+            logger.exception("minutes poller crashed job_id=%s error=%s", job_id, exc)
         finally:
             db.close()
             with self._poll_lock:
-                current = self._poll_stop.get(audio_id)
+                current = self._poll_stop.get(job_id)
                 if current is stop_flag:
-                    self._poll_stop.pop(audio_id, None)
+                    self._poll_stop.pop(job_id, None)
 
     def _consume_minutes_success_result(
         self,
@@ -567,7 +608,6 @@ class VolcMeetingMinuteService:
         transcript_payload = self._fetch_json(result["TranscriptionFile"])
         transcript_text = self._normalize_transcript_text(transcript_payload)
         speaker_segments = self._normalize_speaker_segments(transcript_payload)
-        audio.transcript_text = transcript_text
         db.query(database.VolcAccurateTranscription).filter(
             database.VolcAccurateTranscription.source_audio_id == audio.id,
         ).delete(synchronize_session=False)
@@ -787,18 +827,17 @@ class VolcMeetingMinuteService:
     def get_minutes(self, db: Session, meeting_id: int) -> schemas.VolcMeetingMinutesResponse:
         self._assert_meeting_exists(db, meeting_id)
         latest_audio = self._latest_volc_audio(db, meeting_id)
+        latest_job = self._latest_minutes_job(db, meeting_id)
         stream_text: Optional[str] = None
         transcript_text: Optional[str] = None
         speaker_segment_models: List[schemas.VolcSpeakerSegmentInDB] = []
         asr_session = self._latest_asr_session(db, meeting_id)
         if asr_session:
-            stream_text = asr_session.transcript_text
+            stream_text = asr_session.stream_transcript_text
         if latest_audio:
             precise = self._latest_precise_transcription(db, latest_audio.id)
             if precise:
                 transcript_text = precise.accurate_transcript_text
-            elif latest_audio.transcript_text:
-                transcript_text = latest_audio.transcript_text
             speaker_segment_models = self._speaker_segment_models_for_audio(db, latest_audio.id)
 
         summary = self._meeting_summary(db, meeting_id)
@@ -806,7 +845,7 @@ class VolcMeetingMinuteService:
         return schemas.VolcMeetingMinutesResponse(
             stream_transcript_text=stream_text,
             transcript_text=transcript_text,
-            audio_status=latest_audio.status if latest_audio else asr_session.status if asr_session else None,
+            audio_status=latest_job.status if latest_job else (latest_audio.status if latest_audio else asr_session.status if asr_session else None),
             speaker_segments=[
                 schemas.SpeakerSegment.model_validate(m.model_dump())
                 for m in speaker_segment_models
@@ -830,6 +869,9 @@ class VolcMeetingMinuteService:
         ).delete(synchronize_session=False)
         db.query(database.VolcMeetingMinutesSession).filter(
             database.VolcMeetingMinutesSession.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+        db.query(database.VolcMinutesJob).filter(
+            database.VolcMinutesJob.meeting_id == meeting_id
         ).delete(synchronize_session=False)
         db.query(database.VolcAsrSession).filter(
             database.VolcAsrSession.meeting_id == meeting_id
@@ -895,14 +937,10 @@ class VolcMeetingMinuteService:
             return None
 
         fields_set = payload.model_fields_set
-        if "status" in fields_set:
-            session.status = payload.status or session.status
-        if "error_msg" in fields_set:
-            session.error_msg = payload.error_msg
         if "stream_transcript_text" in fields_set:
             session.stream_transcript_text = payload.stream_transcript_text
         if "transcript_text" in fields_set:
-            session.transcript_text = payload.transcript_text
+            session.accurate_transcript_text = payload.transcript_text
         if "speaker_segments" in fields_set:
             segments_payload = [item.model_dump() for item in (payload.speaker_segments or [])]
             session.speaker_segments_json = json.dumps(segments_payload, ensure_ascii=False)
@@ -970,12 +1008,8 @@ class VolcMeetingMinuteService:
             session_no=self._build_unique_session_no(db, audio.meeting_id),
             meeting_id=audio.meeting_id,
             source_audio_id=audio.id,
-            source_asr_session_id=audio.source_asr_session_id,
-            volc_task_id=audio.task_id,
-            status="completed",
-            error_msg=audio.error_msg,
-            stream_transcript_text=asr_session.transcript_text if asr_session else None,
-            transcript_text=precise.accurate_transcript_text if precise else audio.transcript_text,
+            stream_transcript_text=asr_session.stream_transcript_text if asr_session else None,
+            accurate_transcript_text=precise.accurate_transcript_text if precise else None,
             speaker_segments_json=speaker_segments_snapshot,
             summary_title=summary.title if summary else None,
             summary_paragraph=summary.paragraph if summary else None,
@@ -1030,12 +1064,9 @@ class VolcMeetingMinuteService:
             session_no=item.session_no,
             meeting_id=item.meeting_id,
             source_audio_id=item.source_audio_id,
-            source_asr_session_id=item.source_asr_session_id,
-            volc_task_id=item.volc_task_id,
-            status=item.status,
-            error_msg=item.error_msg,
+            status="completed",
             stream_transcript_text=item.stream_transcript_text,
-            transcript_text=item.transcript_text,
+            transcript_text=item.accurate_transcript_text,
             speaker_segments=speaker_segments,
             summary_title=item.summary_title,
             summary_paragraph=item.summary_paragraph,
@@ -1064,16 +1095,7 @@ class VolcMeetingMinuteService:
         if "stream_transcript_text" in fields_set:
             asr_session = self._latest_asr_session(db, meeting_id)
             if asr_session:
-                asr_session.transcript_text = payload.stream_transcript_text
-                if source_audio_id:
-                    audio = (
-                        db.query(database.MeetingAudio)
-                        .filter(database.MeetingAudio.id == source_audio_id)
-                        .first()
-                    )
-                    if audio:
-                        audio.transcript_text = payload.stream_transcript_text
-                        audio.source_asr_session_id = asr_session.id
+                asr_session.stream_transcript_text = payload.stream_transcript_text
 
         if source_audio_id and "transcript_text" in fields_set:
             row = (
@@ -1092,9 +1114,6 @@ class VolcMeetingMinuteService:
                         speaker_segments_json=None,
                     )
                 )
-            audio = db.query(database.MeetingAudio).filter(database.MeetingAudio.id == source_audio_id).first()
-            if audio:
-                audio.transcript_text = payload.transcript_text or ""
 
         if source_audio_id and "speaker_segments" in fields_set:
             row = (
@@ -1247,7 +1266,6 @@ class LiveVolcAsrHandler:
         await self._ws.accept()
         asr_session = database.VolcAsrSession(
             meeting_id=self._meeting_id,
-            session_type="live",
             status="processing",
         )
         self._db.add(asr_session)
@@ -1274,7 +1292,7 @@ class LiveVolcAsrHandler:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Volc live ASR run failed meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
             asr_session.status = "failed"
-            asr_session.transcript_text = "".join(self._transcript_parts)
+            asr_session.stream_transcript_text = "".join(self._transcript_parts)
             asr_session.error_msg = str(exc)
             self._db.commit()
             if self._ws_alive:
@@ -1373,9 +1391,7 @@ class LiveVolcAsrHandler:
         )
         asr_session.status = "completed"
         asr_session.duration_seconds = duration
-        asr_session.transcript_text = transcript
-        asr_session.audio_local_path = str(wav_path)
-        asr_session.audio_filename = wav_path.name
+        asr_session.stream_transcript_text = transcript
 
         if self._ws_alive:
             await self._ws.send_json({"type": "saving_audio", "session_id": self._session_id})
@@ -1397,8 +1413,6 @@ class LiveVolcAsrHandler:
             except OSError:
                 logger.warning("火山实时录音临时 WAV 清理失败 path=%s", wav_path)
         asr_session.source_audio_id = audio_record.id
-        audio_record.source_asr_session_id = asr_session.id
-        audio_record.transcript_text = transcript
         self._db.commit()
         logger.info(
             "火山实时 ASR 会话完成 meeting_id=%s session_id=%s audio_id=%s duration=%.3f",

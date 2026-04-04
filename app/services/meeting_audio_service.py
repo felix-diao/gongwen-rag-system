@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 import tos  # type: ignore
 
@@ -143,8 +144,11 @@ class MeetingAudioService:
 
     @staticmethod
     def _assert_meeting_exists(db: Session, meeting_id: int) -> None:
-        meeting = db.query(database.Meeting.id).filter(database.Meeting.id == meeting_id).first()
-        if not meeting:
+        exists = db.execute(
+            text("SELECT 1 FROM meetings WHERE id = :meeting_id LIMIT 1"),
+            {"meeting_id": meeting_id},
+        ).first()
+        if not exists:
             raise HTTPException(status_code=404, detail="会议未找到")
 
     @staticmethod
@@ -185,8 +189,8 @@ class MeetingAudioService:
         return cast(Provider, raw)
 
     @staticmethod
-    def _to_schema(record: database.MeetingAudio) -> schemas.MeetingAudioUnifiedInDB:
-        return schemas.MeetingAudioUnifiedInDB(
+    def _to_schema(record: database.MeetingAudio) -> schemas.MeetingAudioInDB:
+        return schemas.MeetingAudioInDB(
             provider=cast(Provider, record.provider),
             id=record.id,
             meeting_id=record.meeting_id,
@@ -196,10 +200,6 @@ class MeetingAudioService:
             file_url=record.file_url,
             file_type=record.file_type,
             status=record.status,
-            task_id=record.task_id,
-            error_msg=record.error_msg,
-            transcript_text=record.transcript_text,
-            source_asr_session_id=record.source_asr_session_id,
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
@@ -279,18 +279,22 @@ class MeetingAudioService:
         db.refresh(record)
         return record
 
-    def _build_upload_task_schema(self, task: _UploadTask) -> schemas.MeetingAudioUnifiedInDB:
-        # 任务态也复用统一音频模型，这样前端不需要为“处理中任务”定义单独卡片结构。
-        return schemas.MeetingAudioUnifiedInDB(
+    def _build_upload_task_schema(
+        self,
+        task: _UploadTask,
+        audio: Optional[schemas.MeetingAudioInDB] = None,
+    ) -> schemas.MeetingAudioUploadTask:
+        return schemas.MeetingAudioUploadTask(
             provider=task.provider,
-            id=task.audio_id,
+            task_id=task.task_id,
             meeting_id=task.meeting_id,
             creator_id=task.creator_id,
             file_name=task.file_name,
             file_type=task.content_type,
             status=task.status,
-            task_id=task.task_id,
+            audio_id=task.audio_id,
             error_msg=task.error_msg,
+            audio=audio,
             created_at=task.created_at,
             updated_at=task.updated_at,
         )
@@ -361,7 +365,7 @@ class MeetingAudioService:
         provider: Provider,
         creator_id: Optional[str],
         upload_file: UploadFile,
-    ) -> schemas.MeetingAudioUnifiedInDB:
+    ) -> schemas.MeetingAudioUploadTask:
         if not upload_file or not upload_file.filename:
             raise HTTPException(status_code=400, detail="音频文件不能为空")
         self._assert_meeting_exists(db, meeting_id)
@@ -406,8 +410,8 @@ class MeetingAudioService:
         self,
         db: Session,
         task_id: str,
-    ) -> Optional[schemas.MeetingAudioUnifiedInDB]:
-        # 已完成任务需要回查数据库拿到完整音频元数据；未完成任务则直接返回任务快照。
+    ) -> Optional[schemas.MeetingAudioUploadTask]:
+        # 已完成任务需要回查数据库拿到正式音频记录；未完成任务返回任务快照。
         with self._upload_lock:
             task = self._upload_tasks.get(task_id)
             if not task:
@@ -416,12 +420,12 @@ class MeetingAudioService:
 
         if snapshot.status == "completed" and snapshot.audio_id is not None:
             audio = self.get_audio(db, snapshot.meeting_id, snapshot.provider, snapshot.audio_id)
-            return audio.model_copy(update={"task_id": snapshot.task_id, "error_msg": snapshot.error_msg})
+            return self._build_upload_task_schema(snapshot, audio=audio)
         return self._build_upload_task_schema(snapshot)
 
     def list_audio(
         self, db: Session, meeting_id: int, provider: Provider
-    ) -> list[schemas.MeetingAudioUnifiedInDB]:
+    ) -> list[schemas.MeetingAudioInDB]:
         self._assert_meeting_exists(db, meeting_id)
         records = (
             db.query(database.MeetingAudio)
@@ -437,7 +441,7 @@ class MeetingAudioService:
 
     def get_audio(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
-    ) -> schemas.MeetingAudioUnifiedInDB:
+    ) -> schemas.MeetingAudioInDB:
         self._assert_meeting_exists(db, meeting_id)
         record = self._get_audio_record(db, meeting_id, provider, audio_id)
         return self._to_schema(record)
@@ -488,7 +492,7 @@ class MeetingAudioService:
 
     def delete_audio(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
-    ) -> schemas.MeetingAudioUnifiedInDB:
+    ) -> schemas.MeetingAudioInDB:
         self._assert_meeting_exists(db, meeting_id)
         record = self._get_audio_record(db, meeting_id, provider, audio_id)
         if record.object_key:

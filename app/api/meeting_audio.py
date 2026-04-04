@@ -33,7 +33,7 @@ router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 # 1. 标准化 provider 参数。
 # 2. 交给 service 创建后台上传任务。
 # 3. 立即返回任务快照给前端轮询。
-@router.post("/audio/{meeting_id}/upload-task", response_model=StandardResponse[schemas.MeetingAudioUnifiedInDB])
+@router.post("/audio/{meeting_id}/upload-task", response_model=StandardResponse[schemas.MeetingAudioUploadTask])
 def create_upload_task(
     meeting_id: int,
     provider: str = Query(..., description="local 或 volc"),
@@ -68,7 +68,7 @@ def create_upload_task(
 # 1. 读取进程内任务快照。
 # 2. 任务不存在时返回 404。
 # 3. 返回任务态或已完成的音频详情。
-@router.get("/audio/upload-tasks/{task_id}", response_model=StandardResponse[schemas.MeetingAudioUnifiedInDB])
+@router.get("/audio/upload-tasks/{task_id}", response_model=StandardResponse[schemas.MeetingAudioUploadTask])
 def get_upload_task(
     task_id: str,
     db: Session = Depends(database.get_db),
@@ -87,7 +87,7 @@ def get_upload_task(
 # 1. 标准化 provider 参数。
 # 2. 查询 meeting + provider 维度的音频记录。
 # 3. 返回统一音频列表模型。
-@router.get("/audio/{meeting_id}", response_model=StandardResponse[List[schemas.MeetingAudioUnifiedInDB]])
+@router.get("/audio/{meeting_id}", response_model=StandardResponse[List[schemas.MeetingAudioInDB]])
 def list_meeting_audio(
     meeting_id: int,
     provider: str = Query(..., description="local 或 volc"),
@@ -110,7 +110,7 @@ def list_meeting_audio(
 # 1. 标准化 provider 参数。
 # 2. 校验音频归属关系。
 # 3. 返回单条统一音频模型。
-@router.get("/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas.MeetingAudioUnifiedInDB])
+@router.get("/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas.MeetingAudioInDB])
 def get_meeting_audio(
     meeting_id: int,
     audio_id: int,
@@ -176,7 +176,7 @@ def download_meeting_audio(
 # 1. 标准化 provider 参数。
 # 2. 校验音频归属关系并删除对象存储文件。
 # 3. 删除数据库记录并返回删除前快照。
-@router.delete("/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas.MeetingAudioUnifiedInDB])
+@router.delete("/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas.MeetingAudioInDB])
 def delete_meeting_audio(
     meeting_id: int,
     audio_id: int,

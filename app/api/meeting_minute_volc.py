@@ -73,10 +73,10 @@ async def live_recording(websocket: WebSocket, meeting_id: int, token: str = Que
 # 处理流程（提交妙记任务）：
 # 1. 校验 meeting/audio 归属关系。
 # 2. 提交火山语音妙记离线任务。
-# 3. 返回已提交的音频记录，后续由后台轮询更新状态。
+# 3. 返回已提交的离线任务记录，后续由后台轮询更新状态。
 @router.post(
     "/{meeting_id}/submit",
-    response_model=StandardResponse[schemas.MeetingAudioUnifiedInDB],
+    response_model=StandardResponse[schemas.VolcMinutesJobInDB],
 )
 def submit_minutes(
     meeting_id: int,
@@ -99,11 +99,11 @@ def submit_minutes(
         "提交火山妙记成功 meeting_id=%s audio_id=%s task_id=%s",
         meeting_id,
         audio_id,
-        record.task_id,
+        record.volc_task_id,
     )
     return StandardResponse(
         success=True,
-        data=schemas.MeetingAudioUnifiedInDB.model_validate(record),
+        data=schemas.VolcMinutesJobInDB.model_validate(record),
         message="已提交语音妙记，后台处理中",
     )
 

@@ -659,26 +659,41 @@ class MeetingInDB(MeetingBase):
 
 
 
-class MeetingAudioUnifiedInDB(BaseModel):
-    """统一音频响应模型。
-
-    meeting_domain 新链路的音频接口直接返回这一套字段。
-    """
-    model_config = ConfigDict(from_attributes=True)
+class MeetingAudioBase(BaseModel):
+    """会议音频公共字段。"""
 
     provider: Literal["local", "volc"]
-    id: Optional[int] = None
     meeting_id: int
     creator_id: Optional[str] = None
     file_name: Optional[str] = None
     object_key: Optional[str] = None
     file_url: Optional[str] = None
     file_type: Optional[str] = None
-    status: Optional[str] = None
-    task_id: Optional[str] = None
+    status: str
+
+
+class MeetingAudioInDB(MeetingAudioBase):
+    """持久化后的会议音频响应模型。"""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class MeetingAudioUploadTask(BaseModel):
+    """会议音频上传任务响应模型。"""
+
+    task_id: str
+    provider: Literal["local", "volc"]
+    meeting_id: int
+    creator_id: Optional[str] = None
+    file_name: str
+    file_type: Optional[str] = None
+    status: Literal["pending", "running", "completed", "failed"]
+    audio_id: Optional[int] = None
     error_msg: Optional[str] = None
-    transcript_text: Optional[str] = None
-    source_asr_session_id: Optional[int] = None
+    audio: Optional["MeetingAudioInDB"] = None
     created_at: datetime
     updated_at: datetime
 
@@ -733,13 +748,18 @@ class VolcTranscriptUpdate(BaseModel):
     transcript_text: str
 
 
-class VolcAudioUploadTask(BaseModel):
-    """火山音频上传任务响应。"""
-    task_id: str
+class VolcMinutesJobInDB(BaseModel):
+    """火山妙记离线任务响应模型。"""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
     meeting_id: int
-    file_name: str
-    status: Literal["pending", "running", "completed", "failed"]
-    audio_id: Optional[int] = None
+    source_audio_id: Optional[int] = None
+    input_file_url: str
+    input_file_type: Optional[str] = None
+    volc_task_id: Optional[str] = None
+    status: str
+    error_msg: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -824,7 +844,6 @@ class VolcMeetingMinutesSessionInDB(BaseModel):
 
 class VolcMeetingMinutesSessionUpdate(BaseModel):
     """修改火山纪要历史快照。"""
-    status: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     speaker_segments: Optional[List[VolcSessionSpeakerSegment]] = None
