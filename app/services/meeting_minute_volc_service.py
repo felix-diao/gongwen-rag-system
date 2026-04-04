@@ -46,6 +46,7 @@ MINUTES_RUNNING_STATUS = {"queued", "running", "processing"}
 MINUTES_SUCCESS_STATUS = {"success", "succeeded", "successed", "finished", "completed", "done"}
 MINUTES_FAILED_STATUS = {"failed", "error"}
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
+EMPTY_SUMMARY_HINT = "摘要为空，可能因录音内容较短或有效信息不足，暂未生成摘要。"
 
 
 class ProtocolVersion:
@@ -607,7 +608,28 @@ class VolcMeetingMinuteService:
         # 2) 覆盖当前摘要；
         # 3) 覆盖当前待办列表。
         # 注意：这里覆盖的是“当前纪要视图”；历史快照由调用方在成功后额外写一份。
-        transcript_payload = self._fetch_json(result["TranscriptionFile"])
+        if not isinstance(result, dict):
+            raise TypeError(f"火山妙记 Result 格式非法: {type(result).__name__}")
+
+        logger.info(
+            "火山妙记成功结果 meeting_id=%s audio_id=%s result_keys=%s",
+            audio.meeting_id,
+            audio.id,
+            list(result.keys()),
+        )
+
+        transcript_payload = self._fetch_json(
+            self._pick_result_source(
+                result,
+                (
+                    "TranscriptionFile",
+                    "AudioTranscriptionFile",
+                    "TranscriptFile",
+                    "AudioTranscriptionResult",
+                ),
+                "转写结果",
+            )
+        )
         transcript_text = self._normalize_transcript_text(transcript_payload)
         speaker_segments = self._normalize_speaker_segments(transcript_payload)
         db.query(database.VolcAccurateTranscription).filter(
@@ -632,7 +654,19 @@ class VolcMeetingMinuteService:
             )
         )
 
-        summary_payload = self._fetch_json(result["SummarizationFile"])
+        summary_payload = self._fetch_json(
+            self._pick_result_source(
+                result,
+                ("SummarizationFile", "SummaryFile", "SummarizationResult"),
+                "摘要结果",
+            )
+        )
+        logger.info(
+            "火山摘要结果结构 meeting_id=%s audio_id=%s shape=%s",
+            audio.meeting_id,
+            audio.id,
+            self._describe_payload_shape(summary_payload),
+        )
         db.query(database.VolcMeetingSummary).filter(
             database.VolcMeetingSummary.meeting_id == audio.meeting_id
         ).delete(synchronize_session=False)
@@ -646,7 +680,17 @@ class VolcMeetingMinuteService:
             )
         )
 
-        todos_payload = self._fetch_json(result["InformationExtractionFile"])
+        todos_payload = self._fetch_json(
+            self._pick_result_source(
+                result,
+                (
+                    "InformationExtractionFile",
+                    "TodoFile",
+                    "InformationExtractionResult",
+                ),
+                "待办结果",
+            )
+        )
         db.query(database.VolcMeetingTodo).filter(
             database.VolcMeetingTodo.meeting_id == audio.meeting_id
         ).delete(synchronize_session=False)
@@ -662,16 +706,68 @@ class VolcMeetingMinuteService:
             )
 
     @staticmethod
-    def _fetch_json(url: str) -> Any:
-        if not url:
-            raise ValueError("妙记结果文件 URL 为空")
-        try:
-            resp = requests.get(url, timeout=settings.VOLC_MINUTES_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("下载火山妙记结果文件失败 url=%s", url)
-            raise RuntimeError(f"下载妙记结果文件失败: {url}") from exc
+    def _pick_result_source(result: Dict[str, Any], candidates: tuple[str, ...], label: str) -> Any:
+        for key in candidates:
+            value = result.get(key)
+            if value not in (None, "", [], {}):
+                return value
+        raise KeyError(f"{label} 缺失，可用字段: {list(result.keys())}")
+
+    @staticmethod
+    def _fetch_json(source: Any) -> Any:
+        if isinstance(source, list):
+            return source
+
+        if isinstance(source, dict):
+            for key in (
+                "url",
+                "Url",
+                "file_url",
+                "FileUrl",
+                "download_url",
+                "DownloadUrl",
+            ):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    source = value.strip()
+                    break
+            else:
+                return source
+
+        if isinstance(source, str):
+            raw = source.strip()
+            if not raw:
+                raise ValueError("妙记结果文件内容为空")
+
+            if raw.startswith("{") or raw.startswith("["):
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+
+            try:
+                resp = requests.get(raw, timeout=settings.VOLC_MINUTES_TIMEOUT)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("下载火山妙记结果文件失败 source=%s", raw)
+                raise RuntimeError(f"下载妙记结果文件失败: {raw}") from exc
+
+        raise TypeError(f"妙记结果文件格式非法: {type(source).__name__}")
+
+    @staticmethod
+    def _describe_payload_shape(payload: Any) -> str:
+        if isinstance(payload, dict):
+            keys = list(payload.keys())
+            preview = json.dumps(payload, ensure_ascii=False)[:1000]
+            return f"dict keys={keys} preview={preview}"
+        if isinstance(payload, list):
+            first = payload[0] if payload else None
+            first_type = type(first).__name__ if first is not None else "None"
+            preview = json.dumps(first, ensure_ascii=False)[:500] if first is not None else "None"
+            return f"list len={len(payload)} first_type={first_type} first_preview={preview}"
+        preview = str(payload)
+        return f"{type(payload).__name__} preview={preview[:500]}"
 
     @staticmethod
     def _normalize_transcript_text(payload: Any) -> str:
@@ -773,7 +869,18 @@ class VolcMeetingMinuteService:
             if "Result" in payload:
                 return VolcMeetingMinuteService._normalize_summary(payload["Result"])
             title = payload.get("title")
-            paragraph = _require_text_field(payload, ("paragraph", "summary", "content", "text"), "SummarizationFile")
+            paragraph, has_candidate = VolcMeetingMinuteService._extract_summary_text(payload)
+            if paragraph is None:
+                if has_candidate:
+                    logger.warning(
+                        "SummarizationFile 文本为空，回退提示文案 payload=%s",
+                        VolcMeetingMinuteService._describe_payload_shape(payload),
+                    )
+                    paragraph = EMPTY_SUMMARY_HINT
+                else:
+                    raise KeyError(
+                        "SummarizationFile 缺少可用文本字段: ('paragraph', 'summary', 'content', 'text')"
+                    )
             return title, paragraph
         if isinstance(payload, list):
             if not payload:
@@ -782,9 +889,32 @@ class VolcMeetingMinuteService:
             if not isinstance(first, dict):
                 raise TypeError("SummarizationFile 列表项格式非法")
             title = first.get("title")
-            paragraph = _require_text_field(first, ("paragraph", "summary", "content", "text"), "SummarizationFile")
+            paragraph, has_candidate = VolcMeetingMinuteService._extract_summary_text(first)
+            if paragraph is None:
+                if has_candidate:
+                    logger.warning(
+                        "SummarizationFile 列表首项文本为空，回退提示文案 payload=%s",
+                        VolcMeetingMinuteService._describe_payload_shape(first),
+                    )
+                    paragraph = EMPTY_SUMMARY_HINT
+                else:
+                    raise KeyError(
+                        "SummarizationFile 缺少可用文本字段: ('paragraph', 'summary', 'content', 'text')"
+                    )
             return title, paragraph
         raise TypeError("SummarizationFile JSON 格式非法")
+
+    @staticmethod
+    def _extract_summary_text(item: dict) -> tuple[Optional[str], bool]:
+        has_candidate = False
+        for key in ("paragraph", "summary", "content", "text"):
+            if key not in item:
+                continue
+            has_candidate = True
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), True
+        return None, has_candidate
 
     @staticmethod
     def _normalize_todos(payload: Any) -> List[Dict[str, Optional[str]]]:
