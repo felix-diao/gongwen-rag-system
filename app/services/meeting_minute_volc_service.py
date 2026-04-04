@@ -654,47 +654,67 @@ class VolcMeetingMinuteService:
             )
         )
 
-        summary_payload = self._fetch_json(
-            self._pick_result_source(
-                result,
-                ("SummarizationFile", "SummaryFile", "SummarizationResult"),
-                "摘要结果",
+        summary_title: Optional[str] = None
+        summary_paragraph = EMPTY_SUMMARY_HINT
+        try:
+            summary_payload = self._fetch_json(
+                self._pick_result_source(
+                    result,
+                    ("SummarizationFile", "SummaryFile", "SummarizationResult"),
+                    "摘要结果",
+                )
             )
-        )
-        logger.info(
-            "火山摘要结果结构 meeting_id=%s audio_id=%s shape=%s",
-            audio.meeting_id,
-            audio.id,
-            self._describe_payload_shape(summary_payload),
-        )
+            logger.info(
+                "火山摘要结果结构 meeting_id=%s audio_id=%s shape=%s",
+                audio.meeting_id,
+                audio.id,
+                self._describe_payload_shape(summary_payload),
+            )
+            summary_title, summary_paragraph = self._normalize_summary(summary_payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "火山摘要结果不可用，回退提示文案 meeting_id=%s audio_id=%s error=%s",
+                audio.meeting_id,
+                audio.id,
+                exc,
+            )
         db.query(database.VolcMeetingSummary).filter(
             database.VolcMeetingSummary.meeting_id == audio.meeting_id
         ).delete(synchronize_session=False)
-        title, paragraph = self._normalize_summary(summary_payload)
         db.add(
             database.VolcMeetingSummary(
                 meeting_id=audio.meeting_id,
                 source_audio_id=audio.id,
-                title=title,
-                paragraph=paragraph,
+                title=summary_title,
+                paragraph=summary_paragraph,
             )
         )
 
-        todos_payload = self._fetch_json(
-            self._pick_result_source(
-                result,
-                (
-                    "InformationExtractionFile",
-                    "TodoFile",
-                    "InformationExtractionResult",
-                ),
-                "待办结果",
+        todos_items: List[Dict[str, Optional[str]]] = []
+        try:
+            todos_payload = self._fetch_json(
+                self._pick_result_source(
+                    result,
+                    (
+                        "InformationExtractionFile",
+                        "TodoFile",
+                        "InformationExtractionResult",
+                    ),
+                    "待办结果",
+                )
             )
-        )
+            todos_items = self._normalize_todos(todos_payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "火山待办结果不可用，按空列表处理 meeting_id=%s audio_id=%s error=%s",
+                audio.meeting_id,
+                audio.id,
+                exc,
+            )
         db.query(database.VolcMeetingTodo).filter(
             database.VolcMeetingTodo.meeting_id == audio.meeting_id
         ).delete(synchronize_session=False)
-        for item in self._normalize_todos(todos_payload):
+        for item in todos_items:
             db.add(
                 database.VolcMeetingTodo(
                     meeting_id=audio.meeting_id,
@@ -920,21 +940,29 @@ class VolcMeetingMinuteService:
     def _normalize_todos(payload: Any) -> List[Dict[str, Optional[str]]]:
         # 火山 InformationExtractionFile 的字段命名不稳定，这里统一折叠成前端约定的 content/executor/execution_time。
         if not isinstance(payload, dict):
-            raise TypeError("InformationExtractionFile JSON 格式非法")
-        items = payload["todo_list"]
+            logger.warning("InformationExtractionFile JSON 格式非法，按空待办处理 payload=%s", type(payload).__name__)
+            return []
+        items = payload.get("todo_list")
         if not isinstance(items, list):
-            raise TypeError("InformationExtractionFile JSON 格式非法")
+            logger.warning(
+                "InformationExtractionFile.todo_list 缺失或非法，按空待办处理 payload=%s",
+                VolcMeetingMinuteService._describe_payload_shape(payload),
+            )
+            return []
         result: List[Dict[str, Optional[str]]] = []
-        for item in items:
+        for idx, item in enumerate(items):
             if not isinstance(item, dict):
-                raise TypeError("InformationExtractionFile JSON 格式非法")
+                logger.warning("InformationExtractionFile.todo_list[%s] 非对象，已跳过", idx)
+                continue
             polished = item.get("polished_res")
             if polished is not None and not isinstance(polished, dict):
-                raise TypeError("InformationExtractionFile.polished_res 格式非法")
+                logger.warning("InformationExtractionFile.todo_list[%s].polished_res 非对象，已忽略", idx)
+                polished = None
             polished_dict = polished if isinstance(polished, dict) else {}
             content = item.get("content") or polished_dict.get("content")
             if not isinstance(content, str) or not content.strip():
-                raise KeyError("InformationExtractionFile.todo_list.content 缺失")
+                logger.warning("InformationExtractionFile.todo_list[%s].content 缺失，已跳过", idx)
+                continue
             executor = item.get("executor") or polished_dict.get("executor")
             execution_time = (
                 item.get("execution_time")
