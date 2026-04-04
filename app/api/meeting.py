@@ -1,12 +1,8 @@
-"""会议主对象 API。
+"""提供会议主表（meetings）的创建、列表、详情、更新与删除。
 
-该控制器只负责会议主记录的生命周期管理，不直接处理音频上传、
-实时转写或纪要生成。会议删除时会协调会议相关的音频与纪要数据清理。
-
-运维排障建议：
-1. 先看这里的会议主记录是否存在。
-2. 再看音频控制器和纪要控制器是否返回对应数据。
-3. 删除失败时重点看级联清理阶段的日志。
+不负责音频上传、流式转写与纪要生成；删除会议时按顺序清理本地纪要、火山纪要、会议音频及对象存储中的文件，最后删除主表行。
+列表依赖鉴权上下文中的 user_id，缺失时返回 401；主记录不存在时多为 404。
+排障：先确认 meetings 是否有对应 id；删除失败时逐级查看 local/volc 纪要清理与 meeting_audio_service 日志。
 """
 
 from typing import List
@@ -28,10 +24,10 @@ logger = get_logger("meeting_api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
 
-# 处理流程（创建会议）：
-# 1. 从登录上下文提取创建者 user_id。
-# 2. 调用 meeting_service 创建会议主记录。
-# 3. 返回创建后的会议实体。
+# 创建会议并落库，返回完整会议实体。
+# 1. 从当前用户上下文取 creator_id（user_id）。
+# 2. meeting_service 向 meetings 表插入一行。
+# 3. 将 RETURNING 结果封装为 MeetingInDB 返回。
 @router.post("", response_model=StandardResponse[schemas.MeetingInDB])
 def create_meeting(
     meeting: schemas.MeetingCreate,
@@ -45,10 +41,10 @@ def create_meeting(
     return StandardResponse(success=True, data=result, message="会议创建成功")
 
 
-# 处理流程（会议列表）：
-# 1. 从鉴权上下文提取 user_id。
-# 2. 按创建者查询会议列表。
-# 3. 返回按时间倒序排列的会议集合。
+# 列出当前登录用户作为创建者的全部会议。
+# 1. 读取 user_id，未登录或无 user_id 时 401。
+# 2. 按 creator_id 查询 meetings，按 date、id 倒序。
+# 3. 返回 MeetingInDB 列表。
 @router.get("", response_model=StandardResponse[List[schemas.MeetingInDB]])
 def get_all_meetings(
     db: Session = Depends(database.get_db),
@@ -64,10 +60,10 @@ def get_all_meetings(
     return StandardResponse(success=True, data=meetings, message="获取会议列表成功")
 
 
-# 处理流程（会议详情）：
-# 1. 按 meeting_id 查询会议主记录。
-# 2. 不存在则返回 404。
-# 3. 返回单个会议详情。
+# 按主键查询单条会议详情。
+# 1. meeting_service.get_meeting 按 id 查 meetings。
+# 2. 无行则 404。
+# 3. 有行则返回 MeetingInDB。
 @router.get("/{meeting_id}", response_model=StandardResponse[schemas.MeetingInDB])
 def get_meeting(
     meeting_id: int,
@@ -83,10 +79,10 @@ def get_meeting(
     return StandardResponse(success=True, data=db_meeting, message="获取会议详情成功")
 
 
-# 处理流程（更新会议）：
-# 1. 按 meeting_id 定位会议主记录。
-# 2. 仅更新前端显式传入的字段。
-# 3. 返回更新后的会议实体。
+# 部分更新会议字段。
+# 1. meeting_update 仅包含客户端 set 过的字段。
+# 2. meeting_service 执行 UPDATE 并刷新 updated_at。
+# 3. 无匹配行则 404；成功则返回最新 MeetingInDB。
 @router.put("/{meeting_id}", response_model=StandardResponse[schemas.MeetingInDB])
 def update_meeting(
     meeting_id: int,
@@ -103,12 +99,12 @@ def update_meeting(
     return StandardResponse(success=True, data=db_meeting, message="会议更新成功")
 
 
-# 处理流程（删除会议）：
-# 1. 校验会议主记录存在。
-# 2. 清理本地纪要与火山纪要关联数据。
-# 3. 清理会议音频及对象存储文件。
-# 4. 删除会议主记录。
-# 5. 返回删除完成结果。
+# 删除会议及其关联的纪要数据、音频元数据与对象存储文件。
+# 1. 确认 meetings 中存在该 id。
+# 2. local_meeting_minute_service 删除本会相关本地纪要表数据。
+# 3. volc_meeting_minute_service 删除本会相关火山纪要表数据。
+# 4. meeting_audio_service 删除本会所有音频行并删 TOS 对象。
+# 5. meeting_service 删除 meetings 行；失败则 404。
 @router.delete("/{meeting_id}", response_model=StandardResponse[None])
 def delete_meeting(
     meeting_id: int,

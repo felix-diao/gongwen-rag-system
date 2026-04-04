@@ -801,6 +801,7 @@ class VolcMeetingMinutesResponse(BaseModel):
     """火山会议纪要聚合响应。"""
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
+    minutes_job_status: Optional[str] = None
     audio_status: Optional[str] = None
     speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
     summary: Optional[VolcMeetingSummaryInDB] = None
@@ -908,9 +909,14 @@ class LocalTranscriptUpdate(BaseModel):
 
 
 class LocalMeetingMinutesResponse(BaseModel):
-    """本地会议纪要聚合响应。"""
+    """本地会议纪要聚合响应。
+
+    transcript_text 与 stream_transcript_text 同源，便于客户端任选字段名。
+    asr_session_id 对应当前展示的 local_asr_sessions 主键。
+    """
     transcript_text: Optional[str] = None
     stream_transcript_text: Optional[str] = None
+    asr_session_id: Optional[int] = None
     audio_status: Optional[str] = None
     summary: Optional[LocalMeetingSummaryInDB] = None
     todos: List[LocalMeetingTodoInDB] = Field(default_factory=list)
@@ -932,7 +938,6 @@ class LocalMeetingMinutesSessionInDB(BaseModel):
     session_no: Optional[str] = None
     meeting_id: int
     source_audio_id: Optional[int] = None
-    status: str
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     summary_title: Optional[str] = None
@@ -944,7 +949,6 @@ class LocalMeetingMinutesSessionInDB(BaseModel):
 
 class LocalMeetingMinutesSessionUpdate(BaseModel):
     """修改本地纪要历史快照。"""
-    status: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     summary_title: Optional[str] = None

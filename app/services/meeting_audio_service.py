@@ -264,7 +264,8 @@ class MeetingAudioService:
         suffix = Path(file_name).suffix or source_path.suffix or ".bin"
         object_key = f"{meeting_id}/{provider}/{uuid4().hex}{suffix}"
         file_url = self._get_uploader().upload_file(source_path, object_key, normalized_content_type)
-        record = database.MeetingAudio(
+        audio_cls = database.LocalMeetingAudio if provider == "local" else database.VolcMeetingAudio
+        record = audio_cls(
             meeting_id=meeting_id,
             provider=provider,
             creator_id=creator_id,

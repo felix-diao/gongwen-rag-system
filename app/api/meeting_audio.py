@@ -1,13 +1,9 @@
-"""统一会议音频 API。
+"""会议音频的上传任务、列表/详情/下载/删除及会议内广播 WebSocket。
 
-该控制器承接会议音频的统一入口，local 与 volc 两种模式共用同一套路由。
-控制器层只负责 HTTP / WebSocket 协议转换，音频表读写与对象存储操作统一交给
-`meeting_audio_service` 处理。
-
-运维排障建议：
-1. 上传问题优先看 upload-task 创建日志和后台任务日志。
-2. 下载或删除失败优先看 object_key 和对象存储相关日志。
-3. WebSocket 广播问题优先看连接建立和断开日志。
+HTTP 仅做鉴权、参数规范化与 StandardResponse/FileResponse；读写 meeting_audios 与 TOS 均在 meeting_audio_service。
+provider=local|volc 区分业务线，物理共用 meeting_audios 表。
+WebSocket `/audio/ws/{meeting_id}` 用于同会议多端推送，由 meeting_ws_manager 维护连接表。
+排障：上传看 upload-task 与后台线程；下载/删除看 object_key 与 TOS 日志；WS 看连接与断开日志。
 """
 
 from typing import List
@@ -29,10 +25,10 @@ logger = get_logger("meeting_audio_api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
 
-# 处理流程（创建上传任务）：
-# 1. 标准化 provider 参数。
-# 2. 交给 service 创建后台上传任务。
-# 3. 立即返回任务快照给前端轮询。
+# 创建异步上传任务，立即返回 task_id 供轮询。
+# 1. normalize_provider 校验 local/volc。
+# 2. 将上传流落临时文件，注册进程内任务，后台线程上传 TOS 并插入 meeting_audios。
+# 3. 返回 MeetingAudioUploadTask（pending/running/…）。
 @router.post("/audio/{meeting_id}/upload-task", response_model=StandardResponse[schemas.MeetingAudioUploadTask])
 def create_upload_task(
     meeting_id: int,
@@ -64,10 +60,10 @@ def create_upload_task(
     return StandardResponse(success=True, data=data, message="音频上传任务已创建")
 
 
-# 处理流程（查询上传任务）：
-# 1. 读取进程内任务快照。
-# 2. 任务不存在时返回 404。
-# 3. 返回任务态或已完成的音频详情。
+# 按 task_id 查询上传任务状态；完成后附带音频详情。
+# 1. 从进程内 _upload_tasks 取快照。
+# 2. 无记录则 404。
+# 3. 若已完成则回查 DB 填充 audio 字段。
 @router.get("/audio/upload-tasks/{task_id}", response_model=StandardResponse[schemas.MeetingAudioUploadTask])
 def get_upload_task(
     task_id: str,
@@ -83,10 +79,10 @@ def get_upload_task(
     return StandardResponse(success=True, data=data, message="获取上传任务状态成功")
 
 
-# 处理流程（音频列表）：
-# 1. 标准化 provider 参数。
-# 2. 查询 meeting + provider 维度的音频记录。
-# 3. 返回统一音频列表模型。
+# 列出某会议下指定 provider 的全部音频元数据。
+# 1. normalize_provider。
+# 2. 校验会议存在后按 meeting_id、provider 查询 meeting_audios。
+# 3. 返回 MeetingAudioInDB 列表（时间倒序）。
 @router.get("/audio/{meeting_id}", response_model=StandardResponse[List[schemas.MeetingAudioInDB]])
 def list_meeting_audio(
     meeting_id: int,
@@ -106,10 +102,10 @@ def list_meeting_audio(
     return StandardResponse(success=True, data=data, message="获取音频列表成功")
 
 
-# 处理流程（音频详情）：
-# 1. 标准化 provider 参数。
-# 2. 校验音频归属关系。
-# 3. 返回单条统一音频模型。
+# 查询单条音频元数据。
+# 1. normalize_provider。
+# 2. 校验 meeting_id、provider、audio_id 三元组命中一行。
+# 3. 返回 MeetingAudioInDB；未找到则 service 抛 404。
 @router.get("/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas.MeetingAudioInDB])
 def get_meeting_audio(
     meeting_id: int,
@@ -131,10 +127,10 @@ def get_meeting_audio(
     return StandardResponse(success=True, data=data, message="获取音频详情成功")
 
 
-# 处理流程（音频下载）：
-# 1. 标准化 provider 参数。
-# 2. 将对象存储文件下载到临时路径。
-# 3. 响应完成后清理临时文件。
+# 从 TOS 拉取音频文件并以附件形式响应。
+# 1. normalize_provider 并定位记录与 object_key。
+# 2. download_audio_to_temp 下载到本地临时文件。
+# 3. FileResponse 返回文件，BackgroundTask 删除临时文件。
 @router.get("/audio/download/{meeting_id}/{audio_id}")
 def download_meeting_audio(
     meeting_id: int,
@@ -157,12 +153,9 @@ def download_meeting_audio(
     )
 
     def cleanup() -> None:
-        try:
-            if tmp_file_path.exists():
-                tmp_file_path.unlink()
-                logger.info("下载临时音频清理成功 path=%s", tmp_file_path)
-        except Exception as exc:
-            logger.warning("下载临时音频清理失败 path=%s error=%s", tmp_file_path, exc)
+        if tmp_file_path.exists():
+            tmp_file_path.unlink(missing_ok=True)
+            logger.info("下载临时音频清理 path=%s", tmp_file_path)
 
     return FileResponse(
         path=str(tmp_file_path),
@@ -172,10 +165,10 @@ def download_meeting_audio(
     )
 
 
-# 处理流程（音频删除）：
-# 1. 标准化 provider 参数。
-# 2. 校验音频归属关系并删除对象存储文件。
-# 3. 删除数据库记录并返回删除前快照。
+# 删除 TOS 对象与 meeting_audios 行，返回删除前快照。
+# 1. normalize_provider 并加载记录。
+# 2. 有 object_key 则 delete_object。
+# 3. DB delete 并 commit，响应 MeetingAudioInDB。
 @router.delete("/audio/{meeting_id}/{audio_id}", response_model=StandardResponse[schemas.MeetingAudioInDB])
 def delete_meeting_audio(
     meeting_id: int,
@@ -191,10 +184,10 @@ def delete_meeting_audio(
     return StandardResponse(success=True, data=data, message="音频删除成功")
 
 
-# 处理流程（会议音频广播 WebSocket）：
-# 1. 建立 meeting 维度的广播连接。
-# 2. 持续接收文本心跳保持连接活跃。
-# 3. 断开或异常时主动清理连接池。
+# 会议维度音频相关事件的广播通道（文本心跳保活）。
+# 1. accept 后加入 meeting_ws_manager 的连接池。
+# 2. 循环 receive_text 维持连接。
+# 3. 断开或异常时 disconnect 释放槽位。
 @router.websocket("/audio/ws/{meeting_id}")
 async def meeting_audio_ws(meeting_id: int, websocket: WebSocket):
     logger.info("会议音频 WS 连接尝试 meeting_id=%s client=%s", meeting_id, websocket.client)
