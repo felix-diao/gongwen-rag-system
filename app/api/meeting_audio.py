@@ -52,6 +52,7 @@ def create_upload_task(
         db=db,
         meeting_id=meeting_id,
         provider=normalized_provider,
+        creator_id=current_user.get("user_id"),
         upload_file=file,
     )
     logger.info(

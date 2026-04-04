@@ -671,11 +671,19 @@ class LiveLocalAsrHandler:
     4. 录音结束后把 PCM 落为 WAV，并上传到统一音频表。
     """
 
-    def __init__(self, websocket, db: Session, meeting_id: int, service: LocalMeetingMinuteService):
+    def __init__(
+        self,
+        websocket,
+        db: Session,
+        meeting_id: int,
+        service: LocalMeetingMinuteService,
+        creator_id: Optional[str] = None,
+    ):
         self._ws = websocket
         self._db = db
         self._meeting_id = meeting_id
         self._service = service
+        self._creator_id = creator_id
         self._audio_chunks: List[bytes] = []
         self._final_parts: List[str] = []
         self._session_id: Optional[int] = None
@@ -830,6 +838,7 @@ class LiveLocalAsrHandler:
                 db=self._db,
                 meeting_id=self._meeting_id,
                 provider="local",
+                creator_id=self._creator_id,
                 source_path=wav_path,
                 file_name=f"live_{self._session_id}.wav",
                 content_type="audio/wav",

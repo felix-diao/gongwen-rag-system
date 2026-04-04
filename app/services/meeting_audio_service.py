@@ -50,6 +50,7 @@ class _UploadTask:
     task_id: str
     provider: Provider
     meeting_id: int
+    creator_id: Optional[str]
     file_name: str
     content_type: Optional[str]
     status: str
@@ -184,20 +185,21 @@ class MeetingAudioService:
         return cast(Provider, raw)
 
     @staticmethod
-    def _to_schema(provider: Provider, record: database.MeetingAudio) -> schemas.MeetingAudioUnifiedInDB:
+    def _to_schema(record: database.MeetingAudio) -> schemas.MeetingAudioUnifiedInDB:
         return schemas.MeetingAudioUnifiedInDB(
-            provider=provider,
+            provider=cast(Provider, record.provider),
             id=record.id,
             meeting_id=record.meeting_id,
+            creator_id=record.creator_id,
             file_name=record.file_name,
             object_key=record.object_key,
             file_url=record.file_url,
             file_type=record.file_type,
             status=record.status,
-            task_id=getattr(record, "task_id", None),
-            error_msg=getattr(record, "error_msg", None),
-            transcript_text=getattr(record, "transcript_text", None),
-            source_asr_session_id=getattr(record, "source_asr_session_id", None),
+            task_id=record.task_id,
+            error_msg=record.error_msg,
+            transcript_text=record.transcript_text,
+            source_asr_session_id=record.source_asr_session_id,
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
@@ -246,6 +248,7 @@ class MeetingAudioService:
         db: Session,
         meeting_id: int,
         provider: Provider,
+        creator_id: Optional[str],
         source_path: Path,
         file_name: str,
         content_type: Optional[str],
@@ -264,6 +267,7 @@ class MeetingAudioService:
         record = database.MeetingAudio(
             meeting_id=meeting_id,
             provider=provider,
+            creator_id=creator_id,
             file_name=file_name,
             object_key=object_key,
             file_url=file_url,
@@ -281,6 +285,7 @@ class MeetingAudioService:
             provider=task.provider,
             id=task.audio_id,
             meeting_id=task.meeting_id,
+            creator_id=task.creator_id,
             file_name=task.file_name,
             file_type=task.content_type,
             status=task.status,
@@ -316,6 +321,7 @@ class MeetingAudioService:
                 db=db,
                 meeting_id=task.meeting_id,
                 provider=task.provider,
+                creator_id=task.creator_id,
                 source_path=temp_path,
                 file_name=task.file_name,
                 content_type=task.content_type,
@@ -353,6 +359,7 @@ class MeetingAudioService:
         db: Session,
         meeting_id: int,
         provider: Provider,
+        creator_id: Optional[str],
         upload_file: UploadFile,
     ) -> schemas.MeetingAudioUnifiedInDB:
         if not upload_file or not upload_file.filename:
@@ -367,6 +374,7 @@ class MeetingAudioService:
             task_id=uuid4().hex,
             provider=provider,
             meeting_id=meeting_id,
+            creator_id=creator_id,
             file_name=upload_file.filename,
             content_type=normalized_content_type,
             status="pending",
@@ -425,14 +433,14 @@ class MeetingAudioService:
             .all()
         )
         logger.info("查询会议音频列表完成，模式=%s，会议ID=%s，数量=%s", provider, meeting_id, len(records))
-        return [self._to_schema(provider, item) for item in records]
+        return [self._to_schema(item) for item in records]
 
     def get_audio(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
     ) -> schemas.MeetingAudioUnifiedInDB:
         self._assert_meeting_exists(db, meeting_id)
         record = self._get_audio_record(db, meeting_id, provider, audio_id)
-        return self._to_schema(provider, record)
+        return self._to_schema(record)
 
     def download_audio_to_temp(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
@@ -496,7 +504,7 @@ class MeetingAudioService:
                     exc,
                 )
                 raise HTTPException(status_code=502, detail=f"删除对象存储音频失败: {exc}") from exc
-        data = self._to_schema(provider, record)
+        data = self._to_schema(record)
         db.delete(record)
         db.commit()
         logger.info("删除会议音频完成，模式=%s，会议ID=%s，音频ID=%s", provider, meeting_id, audio_id)

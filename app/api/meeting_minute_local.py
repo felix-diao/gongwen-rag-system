@@ -40,15 +40,22 @@ router = APIRouter(prefix="/api/meetings/minutes/local", tags=["meeting_local_mi
 async def live_recording(websocket: WebSocket, meeting_id: int, token: str = Query(...)):
     logger.info("本地实时纪要 WS 连接尝试 meeting_id=%s client=%s", meeting_id, websocket.client)
     try:
-        decode_access_token(token)
+        payload = decode_access_token(token)
     except HTTPException:
         logger.warning("本地实时纪要 WS 鉴权失败 meeting_id=%s client=%s", meeting_id, websocket.client)
         await websocket.close(code=4001)
         return
+    creator_id = payload.get("sub")
 
     db = SessionLocal()
     try:
-        handler = LiveLocalAsrHandler(websocket, db, meeting_id, local_meeting_minute_service)
+        handler = LiveLocalAsrHandler(
+            websocket,
+            db,
+            meeting_id,
+            local_meeting_minute_service,
+            creator_id=creator_id,
+        )
         logger.info("本地实时纪要 WS 开始处理 meeting_id=%s", meeting_id)
         await handler.run()
         logger.info("本地实时纪要 WS 处理完成 meeting_id=%s", meeting_id)
@@ -110,4 +117,3 @@ def get_minutes(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     logger.info("获取本地纪要成功 meeting_id=%s", meeting_id)
     return StandardResponse(success=True, data=data, message="获取会议纪要成功")
-

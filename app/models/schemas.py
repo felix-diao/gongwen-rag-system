@@ -1,7 +1,7 @@
 # app/models/schemas.py
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, List, Literal, Generic, TypeVar
-from datetime import datetime
+from datetime import date, datetime
 import re
 
 # ========== 文档相关 Schema ==========
@@ -642,7 +642,7 @@ class MeetingCreate(MeetingBase):
 class MeetingUpdate(MeetingBase):
     """更新会议请求体。
 
-    更新接口支持部分更新，因此重写必填字段为可选。
+    meeting_domain 支持部分更新，因此重写必填字段为可选。
     """
     title: Optional[str] = None
     date: Optional[datetime] = None
@@ -658,16 +658,18 @@ class MeetingInDB(MeetingBase):
     updated_at: datetime
 
 
+
 class MeetingAudioUnifiedInDB(BaseModel):
     """统一音频响应模型。
 
-    会议音频相关接口统一返回这一套字段。
+    meeting_domain 新链路的音频接口直接返回这一套字段。
     """
     model_config = ConfigDict(from_attributes=True)
 
     provider: Literal["local", "volc"]
     id: Optional[int] = None
     meeting_id: int
+    creator_id: Optional[str] = None
     file_name: Optional[str] = None
     object_key: Optional[str] = None
     file_url: Optional[str] = None
@@ -681,35 +683,69 @@ class MeetingAudioUnifiedInDB(BaseModel):
     updated_at: datetime
 
 
-class VolcMeetingSummaryInDB(BaseModel):
+class VolcMeetingSummaryBase(BaseModel):
+    """火山纪要摘要公共字段。"""
+    title: Optional[str] = None
+    paragraph: str
+    source_audio_id: Optional[int] = None
+
+
+class VolcMeetingSummaryCreate(VolcMeetingSummaryBase):
+    """创建或更新火山纪要摘要。"""
+    pass
+
+
+class VolcMeetingSummaryInDB(VolcMeetingSummaryBase):
     """火山纪要摘要响应模型。"""
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     meeting_id: int
-    title: Optional[str] = None
-    paragraph: str
-    source_audio_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
 
-class VolcMeetingTodoInDB(BaseModel):
+class VolcMeetingTodoBase(BaseModel):
+    """火山纪要待办公共字段。"""
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class VolcMeetingTodoCreate(VolcMeetingTodoBase):
+    """创建或更新火山纪要待办。"""
+    pass
+
+
+class VolcMeetingTodoInDB(VolcMeetingTodoBase):
     """火山纪要待办响应模型。"""
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     meeting_id: int
-    content: str
-    executor: Optional[str] = None
-    execution_time: Optional[str] = None
-    source_audio_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class VolcTranscriptUpdate(BaseModel):
+    """修改火山纪要转写文本。"""
+    transcript_text: str
+
+
+class VolcAudioUploadTask(BaseModel):
+    """火山音频上传任务响应。"""
+    task_id: str
+    meeting_id: int
+    file_name: str
+    status: Literal["pending", "running", "completed", "failed"]
+    audio_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
 
 class VolcSpeakerSegmentInDB(BaseModel):
-    """火山说话人分段响应模型。"""
+    """火山说话人分段响应模型（由 volc_accurate_transcriptions.speaker_segments_json 解析展开）。"""
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -724,12 +760,29 @@ class VolcSpeakerSegmentInDB(BaseModel):
     updated_at: datetime
 
 
+class SpeakerSegment(BaseModel):
+    """宽松版说话人分段模型。
+
+    旧火山接口只关心说话人和文本，新链路还会带分段主键与审计字段。
+    """
+    id: Optional[int] = None
+    meeting_id: Optional[int] = None
+    source_audio_id: Optional[int] = None
+    segment_index: Optional[int] = None
+    speaker: str
+    text: str
+    start_ms: Optional[float] = None
+    end_ms: Optional[float] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 class VolcMeetingMinutesResponse(BaseModel):
     """火山会议纪要聚合响应。"""
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     audio_status: Optional[str] = None
-    speaker_segments: List[VolcSpeakerSegmentInDB] = Field(default_factory=list)
+    speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
     summary: Optional[VolcMeetingSummaryInDB] = None
     todos: List[VolcMeetingTodoInDB] = Field(default_factory=list)
 
@@ -758,10 +811,7 @@ class VolcMeetingMinutesSessionInDB(BaseModel):
     session_no: Optional[str] = None
     meeting_id: int
     source_audio_id: Optional[int] = None
-    source_asr_session_id: Optional[int] = None
-    volc_task_id: Optional[str] = None
     status: str
-    error_msg: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     speaker_segments: List[VolcSessionSpeakerSegment] = Field(default_factory=list)
@@ -775,7 +825,6 @@ class VolcMeetingMinutesSessionInDB(BaseModel):
 class VolcMeetingMinutesSessionUpdate(BaseModel):
     """修改火山纪要历史快照。"""
     status: Optional[str] = None
-    error_msg: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     speaker_segments: Optional[List[VolcSessionSpeakerSegment]] = None
@@ -784,31 +833,59 @@ class VolcMeetingMinutesSessionUpdate(BaseModel):
     todos: Optional[List[VolcSessionTodoItem]] = None
 
 
-class LocalMeetingSummaryInDB(BaseModel):
+class LocalMeetingSummaryBase(BaseModel):
+    """本地纪要摘要公共字段。"""
+    title: Optional[str] = None
+    paragraph: str
+    source_audio_id: Optional[int] = None
+
+
+class LocalMeetingSummaryCreate(LocalMeetingSummaryBase):
+    """创建或更新本地纪要摘要。"""
+    pass
+
+
+class LocalMeetingSummaryInDB(LocalMeetingSummaryBase):
     """本地纪要摘要响应模型。"""
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     meeting_id: int
-    title: Optional[str] = None
-    paragraph: str
-    source_audio_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
 
-class LocalMeetingTodoInDB(BaseModel):
+class LocalMeetingTodoBase(BaseModel):
+    """本地纪要待办公共字段。"""
+    content: str
+    executor: Optional[str] = None
+    execution_time: Optional[str] = None
+    source_audio_id: Optional[int] = None
+
+
+class LocalMeetingTodoCreate(LocalMeetingTodoBase):
+    """创建或更新本地纪要待办。"""
+    pass
+
+
+class LocalMeetingTodoInDB(LocalMeetingTodoBase):
     """本地纪要待办响应模型。"""
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     meeting_id: int
-    content: str
-    executor: Optional[str] = None
-    execution_time: Optional[str] = None
-    source_audio_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
+
+
+class LocalStreamTranscriptUpdate(BaseModel):
+    """修改本地实时流式转写文本。"""
+    stream_transcript_text: str
+
+
+class LocalTranscriptUpdate(BaseModel):
+    """修改本地会议音频转写文本。"""
+    transcript_text: str
 
 
 class LocalMeetingMinutesResponse(BaseModel):
@@ -836,9 +913,7 @@ class LocalMeetingMinutesSessionInDB(BaseModel):
     session_no: Optional[str] = None
     meeting_id: int
     source_audio_id: Optional[int] = None
-    source_asr_session_id: Optional[int] = None
     status: str
-    error_msg: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     summary_title: Optional[str] = None
@@ -851,12 +926,13 @@ class LocalMeetingMinutesSessionInDB(BaseModel):
 class LocalMeetingMinutesSessionUpdate(BaseModel):
     """修改本地纪要历史快照。"""
     status: Optional[str] = None
-    error_msg: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
     summary_title: Optional[str] = None
     summary_paragraph: Optional[str] = None
     todos: Optional[List[LocalSessionTodoItem]] = None
+
+
 
 
 # 统一保留 schemas.py 作为唯一 schema 入口

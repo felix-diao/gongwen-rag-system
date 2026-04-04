@@ -340,25 +340,58 @@ class VolcMeetingMinuteService:
     def _latest_precise_transcription(
         db: Session,
         source_audio_id: int,
-    ) -> Optional[database.VolcAudioTranscription]:
+    ) -> Optional[database.VolcAccurateTranscription]:
         return (
-            db.query(database.VolcAudioTranscription)
-            .filter(database.VolcAudioTranscription.source_audio_id == source_audio_id)
-            .order_by(database.VolcAudioTranscription.created_at.desc(), database.VolcAudioTranscription.id.desc())
+            db.query(database.VolcAccurateTranscription)
+            .filter(database.VolcAccurateTranscription.source_audio_id == source_audio_id)
             .first()
         )
 
     @staticmethod
-    def _speaker_segments_for_audio(
+    def _speaker_segment_models_for_audio(
         db: Session,
         source_audio_id: int,
-    ) -> List[database.VolcSpeakerSegment]:
-        return (
-            db.query(database.VolcSpeakerSegment)
-            .filter(database.VolcSpeakerSegment.source_audio_id == source_audio_id)
-            .order_by(database.VolcSpeakerSegment.segment_index.asc(), database.VolcSpeakerSegment.id.asc())
-            .all()
+    ) -> List[schemas.VolcSpeakerSegmentInDB]:
+        row = (
+            db.query(database.VolcAccurateTranscription)
+            .filter(database.VolcAccurateTranscription.source_audio_id == source_audio_id)
+            .first()
         )
+        return VolcMeetingMinuteService._speaker_segment_models_from_row(row, source_audio_id)
+
+    @staticmethod
+    def _speaker_segment_models_from_row(
+        row: Optional[database.VolcAccurateTranscription],
+        source_audio_id: int,
+    ) -> List[schemas.VolcSpeakerSegmentInDB]:
+        if not row or not row.speaker_segments_json or not str(row.speaker_segments_json).strip():
+            return []
+        try:
+            items = json.loads(row.speaker_segments_json)
+        except ValueError:
+            logger.warning("speaker_segments_json 解析失败 source_audio_id=%s", source_audio_id)
+            return []
+        if not isinstance(items, list):
+            return []
+        out: List[schemas.VolcSpeakerSegmentInDB] = []
+        for idx, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                continue
+            out.append(
+                schemas.VolcSpeakerSegmentInDB(
+                    id=(row.id * 100000 + idx) if row.id is not None else idx,
+                    meeting_id=row.meeting_id,
+                    source_audio_id=source_audio_id,
+                    segment_index=idx,
+                    speaker=str(raw.get("speaker") or ""),
+                    text=str(raw.get("text") or ""),
+                    start_ms=raw.get("start_ms"),
+                    end_ms=raw.get("end_ms"),
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                )
+            )
+        return out
 
     @staticmethod
     def _latest_minutes_session(
@@ -535,32 +568,27 @@ class VolcMeetingMinuteService:
         transcript_text = self._normalize_transcript_text(transcript_payload)
         speaker_segments = self._normalize_speaker_segments(transcript_payload)
         audio.transcript_text = transcript_text
-        db.query(database.VolcAudioTranscription).filter(
-            database.VolcAudioTranscription.source_audio_id == audio.id,
+        db.query(database.VolcAccurateTranscription).filter(
+            database.VolcAccurateTranscription.source_audio_id == audio.id,
         ).delete(synchronize_session=False)
+        seg_payload = [
+            {
+                "speaker": seg["speaker"],
+                "text": seg["text"],
+                "start_ms": seg.get("start_ms"),
+                "end_ms": seg.get("end_ms"),
+            }
+            for seg in speaker_segments
+        ]
+        seg_json = json.dumps(seg_payload, ensure_ascii=False) if seg_payload else None
         db.add(
-            database.VolcAudioTranscription(
+            database.VolcAccurateTranscription(
                 meeting_id=audio.meeting_id,
                 source_audio_id=audio.id,
-                text=transcript_text,
-                is_final=True,
+                accurate_transcript_text=transcript_text,
+                speaker_segments_json=seg_json,
             )
         )
-        db.query(database.VolcSpeakerSegment).filter(
-            database.VolcSpeakerSegment.source_audio_id == audio.id
-        ).delete(synchronize_session=False)
-        for idx, seg in enumerate(speaker_segments):
-            db.add(
-                database.VolcSpeakerSegment(
-                    meeting_id=audio.meeting_id,
-                    source_audio_id=audio.id,
-                    segment_index=idx,
-                    speaker=seg["speaker"],
-                    text=seg["text"],
-                    start_ms=seg["start_ms"],
-                    end_ms=seg["end_ms"],
-                )
-            )
 
         summary_payload = self._fetch_json(result["SummarizationFile"])
         db.query(database.VolcMeetingSummary).filter(
@@ -761,17 +789,17 @@ class VolcMeetingMinuteService:
         latest_audio = self._latest_volc_audio(db, meeting_id)
         stream_text: Optional[str] = None
         transcript_text: Optional[str] = None
-        speaker_segments: List[database.VolcSpeakerSegment] = []
+        speaker_segment_models: List[schemas.VolcSpeakerSegmentInDB] = []
         asr_session = self._latest_asr_session(db, meeting_id)
         if asr_session:
             stream_text = asr_session.transcript_text
         if latest_audio:
             precise = self._latest_precise_transcription(db, latest_audio.id)
             if precise:
-                transcript_text = precise.text
+                transcript_text = precise.accurate_transcript_text
             elif latest_audio.transcript_text:
                 transcript_text = latest_audio.transcript_text
-            speaker_segments = self._speaker_segments_for_audio(db, latest_audio.id)
+            speaker_segment_models = self._speaker_segment_models_for_audio(db, latest_audio.id)
 
         summary = self._meeting_summary(db, meeting_id)
         todos = self._meeting_todos(db, meeting_id)
@@ -779,7 +807,10 @@ class VolcMeetingMinuteService:
             stream_transcript_text=stream_text,
             transcript_text=transcript_text,
             audio_status=latest_audio.status if latest_audio else asr_session.status if asr_session else None,
-            speaker_segments=[schemas.VolcSpeakerSegmentInDB.model_validate(x) for x in speaker_segments],
+            speaker_segments=[
+                schemas.SpeakerSegment.model_validate(m.model_dump())
+                for m in speaker_segment_models
+            ],
             summary=schemas.VolcMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas.VolcMeetingTodoInDB.model_validate(x) for x in todos],
         )
@@ -794,11 +825,8 @@ class VolcMeetingMinuteService:
         db.query(database.VolcMeetingSummary).filter(
             database.VolcMeetingSummary.meeting_id == meeting_id
         ).delete(synchronize_session=False)
-        db.query(database.VolcSpeakerSegment).filter(
-            database.VolcSpeakerSegment.meeting_id == meeting_id
-        ).delete(synchronize_session=False)
-        db.query(database.VolcAudioTranscription).filter(
-            database.VolcAudioTranscription.meeting_id == meeting_id
+        db.query(database.VolcAccurateTranscription).filter(
+            database.VolcAccurateTranscription.meeting_id == meeting_id
         ).delete(synchronize_session=False)
         db.query(database.VolcMeetingMinutesSession).filter(
             database.VolcMeetingMinutesSession.meeting_id == meeting_id
@@ -919,7 +947,11 @@ class VolcMeetingMinuteService:
         summary = self._meeting_summary(db, audio.meeting_id)
         todos = self._meeting_todos(db, audio.meeting_id)
         precise = self._latest_precise_transcription(db, audio.id)
-        speaker_segments = self._speaker_segments_for_audio(db, audio.id)
+        speaker_segments_snapshot = (
+            precise.speaker_segments_json
+            if precise and precise.speaker_segments_json and str(precise.speaker_segments_json).strip()
+            else "[]"
+        )
         asr_session = (
             db.query(database.VolcAsrSession)
             .filter(database.VolcAsrSession.source_audio_id == audio.id)
@@ -943,19 +975,8 @@ class VolcMeetingMinuteService:
             status="completed",
             error_msg=audio.error_msg,
             stream_transcript_text=asr_session.transcript_text if asr_session else None,
-            transcript_text=precise.text if precise else audio.transcript_text,
-            speaker_segments_json=json.dumps(
-                [
-                    {
-                        "speaker": item.speaker,
-                        "text": item.text,
-                        "start_ms": item.start_ms,
-                        "end_ms": item.end_ms,
-                    }
-                    for item in speaker_segments
-                ],
-                ensure_ascii=False,
-            ),
+            transcript_text=precise.accurate_transcript_text if precise else audio.transcript_text,
+            speaker_segments_json=speaker_segments_snapshot,
             summary_title=summary.title if summary else None,
             summary_paragraph=summary.paragraph if summary else None,
             todos_json=json.dumps(todos_payload, ensure_ascii=False),
@@ -1055,35 +1076,58 @@ class VolcMeetingMinuteService:
                         audio.source_asr_session_id = asr_session.id
 
         if source_audio_id and "transcript_text" in fields_set:
-            db.query(database.VolcAudioTranscription).filter(
-                database.VolcAudioTranscription.source_audio_id == source_audio_id
-            ).delete(synchronize_session=False)
-            db.add(
-                database.VolcAudioTranscription(
-                    meeting_id=meeting_id,
-                    source_audio_id=source_audio_id,
-                    text=payload.transcript_text or "",
-                    is_final=True,
-                )
+            row = (
+                db.query(database.VolcAccurateTranscription)
+                .filter(database.VolcAccurateTranscription.source_audio_id == source_audio_id)
+                .first()
             )
+            if row:
+                row.accurate_transcript_text = payload.transcript_text or ""
+            else:
+                db.add(
+                    database.VolcAccurateTranscription(
+                        meeting_id=meeting_id,
+                        source_audio_id=source_audio_id,
+                        accurate_transcript_text=payload.transcript_text or "",
+                        speaker_segments_json=None,
+                    )
+                )
             audio = db.query(database.MeetingAudio).filter(database.MeetingAudio.id == source_audio_id).first()
             if audio:
                 audio.transcript_text = payload.transcript_text or ""
 
         if source_audio_id and "speaker_segments" in fields_set:
-            db.query(database.VolcSpeakerSegment).filter(
-                database.VolcSpeakerSegment.source_audio_id == source_audio_id
-            ).delete(synchronize_session=False)
-            for idx, item in enumerate(payload.speaker_segments or []):
+            row = (
+                db.query(database.VolcAccurateTranscription)
+                .filter(database.VolcAccurateTranscription.source_audio_id == source_audio_id)
+                .first()
+            )
+            segs = payload.speaker_segments or []
+            seg_json = (
+                json.dumps(
+                    [
+                        {
+                            "speaker": item.speaker,
+                            "text": item.text,
+                            "start_ms": item.start_ms,
+                            "end_ms": item.end_ms,
+                        }
+                        for item in segs
+                    ],
+                    ensure_ascii=False,
+                )
+                if segs
+                else None
+            )
+            if row:
+                row.speaker_segments_json = seg_json
+            else:
                 db.add(
-                    database.VolcSpeakerSegment(
+                    database.VolcAccurateTranscription(
                         meeting_id=meeting_id,
                         source_audio_id=source_audio_id,
-                        segment_index=idx,
-                        speaker=item.speaker,
-                        text=item.text,
-                        start_ms=item.start_ms,
-                        end_ms=item.end_ms,
+                        accurate_transcript_text="",
+                        speaker_segments_json=seg_json,
                     )
                 )
 
@@ -1125,11 +1169,19 @@ class LiveVolcAsrHandler:
     # 2) 录音结束后持久化 WAV 并上传对象存储；
     # 3) 输出完整状态事件，避免前端猜测流程状态。
 
-    def __init__(self, websocket, db: Session, meeting_id: int, service: VolcMeetingMinuteService):
+    def __init__(
+        self,
+        websocket,
+        db: Session,
+        meeting_id: int,
+        service: VolcMeetingMinuteService,
+        creator_id: Optional[str] = None,
+    ):
         self._ws = websocket
         self._db = db
         self._meeting_id = meeting_id
         self._service = service
+        self._creator_id = creator_id
         self._audio_chunks: List[bytes] = []
         self._transcript_parts: List[str] = []
         self._session_id: Optional[int] = None
@@ -1274,15 +1326,6 @@ class LiveVolcAsrHandler:
             if text:
                 if should_accumulate:
                     self._transcript_parts.append(text)
-                    self._db.add(
-                        database.VolcAudioTranscription(
-                            meeting_id=self._meeting_id,
-                            source_session_id=self._session_id,
-                            text=text,
-                            is_final=is_last,
-                        )
-                    )
-                    self._db.commit()
                 if self._ws_alive:
                     await self._ws.send_json(
                         {
@@ -1343,6 +1386,7 @@ class LiveVolcAsrHandler:
                 db=self._db,
                 meeting_id=self._meeting_id,
                 provider="volc",
+                creator_id=self._creator_id,
                 source_path=wav_path,
                 file_name=f"live_{self._session_id}.wav",
                 content_type="audio/wav",
