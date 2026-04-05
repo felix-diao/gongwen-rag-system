@@ -544,14 +544,14 @@ class VolcMeetingMinuteService:
                 elif status in MINUTES_SUCCESS_STATUS:
                     if not audio:
                         raise RuntimeError(f"妙记任务缺少关联音频 source_audio_id={job.source_audio_id}")
-                    self._consume_minutes_success_result(db, audio, data["Result"])
+                    snapshot_payload = self._consume_minutes_success_result(db, audio, data["Result"])
                     # SessionLocal 关闭了 autoflush；先把当前视图里的精确转写/摘要/待办 flush 到事务里，
                     # 再基于这些最新数据生成会话历史快照，避免快照读到旧值或空值。
                     db.flush()
                     job.status = "completed"
                     job.error_msg = None
                     job.updated_at = datetime.utcnow()
-                    self._create_minutes_session_snapshot(db, audio)
+                    self._create_minutes_session_snapshot(db, audio, snapshot=snapshot_payload)
                     db.commit()
                     meeting_ws_manager.notify_from_thread(
                         job.meeting_id,
@@ -605,7 +605,7 @@ class VolcMeetingMinuteService:
         db: Session,
         audio: database.MeetingAudio,
         result: Dict[str, Any],
-    ) -> None:
+    ) -> Dict[str, Any]:
         # 步骤说明（妙记结果落库）：
         # 1) 先落精确转写；
         # 2) 覆盖当前摘要；
@@ -727,6 +727,24 @@ class VolcMeetingMinuteService:
                     execution_time=item["execution_time"],
                 )
             )
+        return {
+            "transcript_text": transcript_text,
+            "speaker_segments_json": seg_json or "[]",
+            "summary_title": summary_title,
+            "summary_paragraph": summary_paragraph,
+            "todos_json": json.dumps(
+                [
+                    {
+                        "content": item["content"],
+                        "executor": item["executor"],
+                        "execution_time": item["execution_time"],
+                        "source_audio_id": audio.id,
+                    }
+                    for item in todos_items
+                ],
+                ensure_ascii=False,
+            ),
+        }
 
     @staticmethod
     def _pick_result_source(result: Dict[str, Any], candidates: tuple[str, ...], label: str) -> Any:
@@ -1147,40 +1165,54 @@ class VolcMeetingMinuteService:
         self,
         db: Session,
         audio: database.MeetingAudio,
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> database.VolcMeetingMinutesSession:
         # 火山纪要会话快照：记录“当次妙记结果”的稳定版本，便于历史回看与人工修订。
-        summary = self._meeting_summary(db, audio.meeting_id)
-        todos = self._meeting_todos(db, audio.meeting_id)
-        precise = self._latest_precise_transcription(db, audio.id)
-        speaker_segments_snapshot = (
-            precise.speaker_segments_json
-            if precise and precise.speaker_segments_json and str(precise.speaker_segments_json).strip()
-            else "[]"
-        )
         asr_session = (
             db.query(database.VolcAsrSession)
             .filter(database.VolcAsrSession.source_audio_id == audio.id)
             .first()
         )
-        todos_payload = [
-            {
-                "content": item.content,
-                "executor": item.executor,
-                "execution_time": item.execution_time,
-                "source_audio_id": item.source_audio_id,
-            }
-            for item in todos
-        ]
+        if snapshot is None:
+            summary = self._meeting_summary(db, audio.meeting_id)
+            todos = self._meeting_todos(db, audio.meeting_id)
+            precise = self._latest_precise_transcription(db, audio.id)
+            speaker_segments_snapshot = (
+                precise.speaker_segments_json
+                if precise and precise.speaker_segments_json and str(precise.speaker_segments_json).strip()
+                else "[]"
+            )
+            accurate_transcript_text = precise.accurate_transcript_text if precise else ""
+            summary_title = summary.title if summary else None
+            summary_paragraph = summary.paragraph if summary else None
+            todos_json = json.dumps(
+                [
+                    {
+                        "content": item.content,
+                        "executor": item.executor,
+                        "execution_time": item.execution_time,
+                        "source_audio_id": item.source_audio_id,
+                    }
+                    for item in todos
+                ],
+                ensure_ascii=False,
+            )
+        else:
+            speaker_segments_snapshot = str(snapshot.get("speaker_segments_json") or "[]")
+            accurate_transcript_text = str(snapshot.get("transcript_text") or "")
+            summary_title = snapshot.get("summary_title")
+            summary_paragraph = snapshot.get("summary_paragraph")
+            todos_json = str(snapshot.get("todos_json") or "[]")
         session = database.VolcMeetingMinutesSession(
             session_no=self._build_unique_session_no(db, audio.meeting_id),
             meeting_id=audio.meeting_id,
             source_audio_id=audio.id,
             stream_transcript_text=asr_session.stream_transcript_text if asr_session else None,
-            accurate_transcript_text=precise.accurate_transcript_text if precise else "",
+            accurate_transcript_text=accurate_transcript_text,
             speaker_segments_json=speaker_segments_snapshot,
-            summary_title=summary.title if summary else None,
-            summary_paragraph=summary.paragraph if summary else None,
-            todos_json=json.dumps(todos_payload, ensure_ascii=False),
+            summary_title=summary_title,
+            summary_paragraph=summary_paragraph,
+            todos_json=todos_json,
         )
         db.add(session)
         db.flush()
