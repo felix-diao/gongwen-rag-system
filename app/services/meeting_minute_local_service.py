@@ -491,6 +491,8 @@ class LocalMeetingMinuteService:
             transcript_text=transcript,
             stream_transcript_text=transcript,
             asr_session_id=latest_session.id if latest_session else None,
+            asr_status=latest_session.status if latest_session else None,
+            source_audio_id=latest_session.source_audio_id if latest_session else None,
             audio_status=(
                 latest_audio.status
                 if latest_audio

@@ -917,6 +917,8 @@ class LocalMeetingMinutesResponse(BaseModel):
     transcript_text: Optional[str] = None
     stream_transcript_text: Optional[str] = None
     asr_session_id: Optional[int] = None
+    asr_status: Optional[str] = None
+    source_audio_id: Optional[int] = None
     audio_status: Optional[str] = None
     summary: Optional[LocalMeetingSummaryInDB] = None
     todos: List[LocalMeetingTodoInDB] = Field(default_factory=list)
