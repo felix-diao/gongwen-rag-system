@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from difflib import SequenceMatcher
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from functools import partial
 
@@ -351,7 +351,10 @@ def _serve_chunks_dir(chunks_dir: Path, bind_port: int):
         stop_chunk_http_server(httpd, th)
 
 
-def transcribe_audio_file_incremental(source_audio: Path) -> Tuple[str, float]:
+def transcribe_audio_file_incremental(
+    source_audio: Path,
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
+) -> Tuple[str, float]:
     """对本地音频文件做分段 HTTP ASR 并拼接全文。返回 (全文, 规范化后时长秒)。"""
     source_audio = Path(source_audio)
     if not source_audio.is_file():
@@ -387,6 +390,7 @@ def transcribe_audio_file_incremental(source_audio: Path) -> Tuple[str, float]:
                 return "", duration_sec
 
             with _serve_chunks_dir(work_root / "chunks", bind_port):
+                total_chunks = len(chunks)
                 for seg in chunks:
                     chunk_url = f"{public_base}/{seg['file_name']}"
                     try:
@@ -401,7 +405,10 @@ def transcribe_audio_file_incremental(source_audio: Path) -> Tuple[str, float]:
                             exc,
                         )
                         curr = ""
+                    prev_text = merged_text
                     merged_text, _ = merge_pair(merged_text, curr)
+                    if on_progress and merged_text != prev_text:
+                        on_progress(merged_text, int(seg["idx"]), total_chunks)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
 

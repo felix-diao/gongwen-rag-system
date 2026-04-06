@@ -65,7 +65,33 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
         tmp_path, _, _ = meeting_audio_service.download_audio_to_temp(
             db, meeting_id, "local", audio_id
         )
-        merged, duration = transcribe_audio_file_incremental(tmp_path)
+        def _persist_progress(partial_text: str, chunk_idx: int, total_chunks: int) -> None:
+            row = (
+                db.query(database.LocalAsrSession)
+                .filter(database.LocalAsrSession.id == asr_id)
+                .first()
+            )
+            if not row:
+                return
+            row.stream_transcript_text = partial_text
+            row.source_audio_id = audio_id
+            row.status = "processing"
+            row.error_msg = None
+            db.commit()
+            logger.info(
+                "本地音频分段转写进度 meeting_id=%s audio_id=%s asr_session_id=%s chunk=%s/%s len=%s",
+                meeting_id,
+                audio_id,
+                asr_id,
+                chunk_idx,
+                total_chunks,
+                len(partial_text or ""),
+            )
+
+        merged, duration = transcribe_audio_file_incremental(
+            tmp_path,
+            on_progress=_persist_progress,
+        )
         row = (
             db.query(database.LocalAsrSession)
             .filter(database.LocalAsrSession.id == asr_id)
@@ -480,9 +506,12 @@ class LocalMeetingMinuteService:
         latest_audio = self._latest_local_audio(db, meeting_id)
         summary = self._meeting_summary(db, meeting_id)
         todos = self._meeting_todos(db, meeting_id)
-        # 最新 ASR 行可能尚在 processing 且无正文（如排队文件转写）；此时仍展示「最近一条有稿」避免 GET 空白
+        # 已绑定 source_audio_id 的会话就是“上传音频转写”当前稿，哪怕正文尚短也不能回退到上一稿。
         transcript: Optional[str] = None
-        if latest_session and (latest_session.stream_transcript_text or "").strip():
+        if latest_session and (
+            (latest_session.stream_transcript_text or "").strip()
+            or latest_session.source_audio_id is not None
+        ):
             transcript = latest_session.stream_transcript_text
         else:
             with_text = self._latest_asr_session_with_transcript(db, meeting_id)
