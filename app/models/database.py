@@ -174,6 +174,30 @@ class PromptTemplate(Base):
     # 关联关系
     user = relationship("User", foreign_keys=[user_id])
 
+# ========== 会议主表 ==========
+
+
+class Meeting(Base):
+    """会议主表（与 `MeetingService` / `meetings` DDL 一致）。"""
+
+    __tablename__ = "meetings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(256), nullable=False)
+    date = Column(DateTime, nullable=True)
+    location = Column(String(128), nullable=True)
+    host = Column(String(128), nullable=True)
+    participants = Column(Text, nullable=True)
+    content_text = Column(Text, nullable=True)
+    meeting_url = Column(String(512), nullable=True)
+    status = Column(String(64), nullable=True, default="created")
+    creator_id = Column(String(64), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+
 # ==========会议与会议音频表==========
 
 class MeetingAudio(Base):
@@ -419,6 +443,23 @@ class LocalMeetingMinutesSession(Base):
     todos_json = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# meeting 域表：创建顺序（外键未在库中强制时仍保持主表在前）。`recreate_meeting_domain_tables.py` 使用。
+MEETING_DOMAIN_TABLES = (
+    Meeting.__table__,
+    MeetingAudio.__table__,
+    VolcAsrSession.__table__,
+    VolcMinutesJob.__table__,
+    VolcAccurateTranscription.__table__,
+    VolcMeetingSummary.__table__,
+    VolcMeetingTodo.__table__,
+    VolcMeetingMinutesSession.__table__,
+    LocalAsrSession.__table__,
+    LocalMeetingSummary.__table__,
+    LocalMeetingTodo.__table__,
+    LocalMeetingMinutesSession.__table__,
+)
 
 
 def create_all_tables() -> None:

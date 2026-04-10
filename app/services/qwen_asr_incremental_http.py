@@ -8,6 +8,9 @@
 实时录音在 LIVE_FORCE_HTTP_CHUNK 模式下按 QWEN_ASR_CHUNK_SEC / QWEN_ASR_OVERLAP_SEC 从 PCM 滑窗切段，
 同样逐段请求 + merge_pair，不整文件末尾一次性识别。
 
+分段文件通过进程内共享的 ThreadingHTTPServer 暴露；每路会话使用 public_base 下唯一子路径（uuid4 hex）
++ chunk_xxxx.wav，同一端口可多路并发而不争用同一 URL。
+
 注意：HTTP 转写只认 QWEN_ASR_HTTP_CHAT_URL（及 QWEN_ASR_HTTP_CHAT_MODEL / *_API_KEY），
 绝不回退 LLM_API_URL / LLM_MODEL / LLM_API_KEY，避免与「文本生成纪要」的 LLM 混用。
 """
@@ -16,11 +19,12 @@ from __future__ import annotations
 
 import re
 import shutil
+import socketserver
 import subprocess
 import tempfile
 import threading
+import uuid
 import wave
-from contextlib import contextmanager
 from difflib import SequenceMatcher
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -35,8 +39,24 @@ from app.utils.logger import get_logger
 
 logger = get_logger("qwen_asr_incremental_http")
 
-# 全局互斥：本进程内仅一路 HTTP 分段服务占用 public_base 端口，避免并发冲突。
-_incremental_http_lock = threading.Lock()
+# 进程内共享：同一 bind_port 上长期监听，按 url_path_prefix（如 UUID）分子目录，避免多会话争用 /chunk_0000.wav。
+_http_serve_state_lock = threading.Lock()
+_http_serve_parent: Optional[Path] = None
+_http_serve_port: Optional[int] = None
+_httpd_shared: Optional[HTTPServer] = None
+_httpd_shared_thread: Optional[threading.Thread] = None
+
+
+class _ThreadingChunkHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class _QuietStaticHTTPRequestHandler(SimpleHTTPRequestHandler):
+    """关闭 BaseHTTPRequestHandler 默认写到 stderr 的访问日志，避免探活 HEAD 等刷屏。"""
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        pass
 
 
 def _run_cmd(cmd: str) -> str:
@@ -204,9 +224,13 @@ def _split_to_chunks(
     work_dir: Path,
     chunk_sec: float,
     overlap_sec: float,
+    *,
+    chunks_dir: Optional[Path] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, float]:
     work_dir.mkdir(parents=True, exist_ok=True)
-    chunks_dir = work_dir / "chunks"
+    if chunks_dir is None:
+        chunks_dir = work_dir / "chunks"
+    chunks_dir = Path(chunks_dir)
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     audio_wav = work_dir / "audio_normalized.wav"
@@ -278,9 +302,34 @@ def write_pcm_as_wav_file(
         wf.writeframes(pcm)
 
 
+def ensure_incremental_http_serve_root(bind_port: int) -> Path:
+    """在 bind_port 上启动或复用进程内共享静态根目录；会话 wav 放在 root/<url_path_prefix>/ 下。"""
+    global _http_serve_parent, _http_serve_port, _httpd_shared, _httpd_shared_thread
+    bind_port = int(bind_port)
+    with _http_serve_state_lock:
+        if _httpd_shared is not None:
+            if _http_serve_port != bind_port:
+                raise RuntimeError(
+                    f"分段音频 HTTP 已在端口 {_http_serve_port} 监听，与当前配置端口 {bind_port} 不一致"
+                )
+            assert _http_serve_parent is not None
+            return Path(_http_serve_parent)
+        parent = Path(tempfile.mkdtemp(prefix="qwen_asr_http_root_"))
+        handler = partial(_QuietStaticHTTPRequestHandler, directory=str(parent))
+        httpd = _ThreadingChunkHTTPServer(("0.0.0.0", bind_port), handler)
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        _httpd_shared = httpd
+        _httpd_shared_thread = th
+        _http_serve_parent = parent
+        _http_serve_port = bind_port
+        logger.info("分段音频 HTTP 共享服务已启动 root=%s port=%s", parent, bind_port)
+        return parent
+
+
 def start_chunk_http_server(chunks_dir: Path, bind_port: int) -> Tuple[HTTPServer, threading.Thread]:
-    """启动脚本中与 HTTPServer+SimpleHTTPRequestHandler 等价的静态目录服务。"""
-    handler = partial(SimpleHTTPRequestHandler, directory=str(chunks_dir))
+    """在指定目录独占启动单线程 HTTPServer（脚本/调试）；主业务请用 ensure_incremental_http_serve_root。"""
+    handler = partial(_QuietStaticHTTPRequestHandler, directory=str(chunks_dir))
     httpd = HTTPServer(("0.0.0.0", int(bind_port)), handler)
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
     th.start()
@@ -301,13 +350,17 @@ def post_served_wav_chunk(
     model: str,
     headers: Dict[str, str],
     public_base: str,
+    url_path_prefix: str,
     wav_filename: str,
     timeout: float,
     max_tokens: int,
 ) -> str:
-    """对已通过静态服务暴露的 wav 文件名发起一次 ASR（与脚本里 chunk_url 拼接方式一致）。"""
+    """对静态服务下 public_base/url_path_prefix/wav_filename 发起一次 ASR。"""
     base = public_base.rstrip("/")
-    chunk_url = f"{base}/{wav_filename}"
+    prefix = str(url_path_prefix).strip("/").replace("\\", "")
+    if not prefix:
+        raise ValueError("url_path_prefix 不能为空，请使用每会话唯一段（如 uuid4().hex）")
+    chunk_url = f"{base}/{prefix}/{wav_filename}"
     return _post_one_chunk(session, chat_url, model, headers, chunk_url, timeout, max_tokens)
 
 
@@ -336,19 +389,17 @@ def _post_one_chunk(
         "max_tokens": max_tokens,
     }
     r = session.post(chat_url, json=payload, timeout=timeout)
+    if not r.ok:
+        logger.warning(
+            "ASR HTTP 非成功 status=%s chunk_url=%s body_preview=%s",
+            r.status_code,
+            chunk_url,
+            (r.text or "")[:800],
+        )
     r.raise_for_status()
     data = r.json()
     raw = data["choices"][0]["message"]["content"]
     return _clean_text(raw) if isinstance(raw, str) else ""
-
-
-@contextmanager
-def _serve_chunks_dir(chunks_dir: Path, bind_port: int):
-    httpd, th = start_chunk_http_server(chunks_dir, bind_port)
-    try:
-        yield httpd
-    finally:
-        stop_chunk_http_server(httpd, th)
 
 
 def transcribe_audio_file_incremental(
@@ -371,6 +422,8 @@ def transcribe_audio_file_incremental(
     overlap_sec = float(settings.QWEN_ASR_OVERLAP_SEC or 1.0)
 
     work_root = Path(tempfile.mkdtemp(prefix="qwen_asr_inc_"))
+    url_path_prefix = uuid.uuid4().hex
+    session_http_dir: Optional[Path] = None
 
     headers: Dict[str, str] = {}
     if api_key:
@@ -382,35 +435,43 @@ def transcribe_audio_file_incremental(
     duration_sec = 0.0
 
     try:
-        with _incremental_http_lock:
-            chunks, _norm_wav, duration_sec = _split_to_chunks(
-                source_audio, work_root, chunk_sec, overlap_sec
-            )
-            if not chunks:
-                return "", duration_sec
+        serve_parent = ensure_incremental_http_serve_root(bind_port)
+        session_http_dir = serve_parent / url_path_prefix
+        session_http_dir.mkdir(parents=True, exist_ok=True)
+        chunks, _norm_wav, duration_sec = _split_to_chunks(
+            source_audio,
+            work_root,
+            chunk_sec,
+            overlap_sec,
+            chunks_dir=session_http_dir,
+        )
+        if not chunks:
+            return "", duration_sec
 
-            with _serve_chunks_dir(work_root / "chunks", bind_port):
-                total_chunks = len(chunks)
-                for seg in chunks:
-                    chunk_url = f"{public_base}/{seg['file_name']}"
-                    try:
-                        curr = _post_one_chunk(
-                            session, chat_url, model, headers, chunk_url, timeout, max_tokens
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "分段 ASR 失败 idx=%s url=%s error=%s",
-                            seg["idx"],
-                            chunk_url,
-                            exc,
-                        )
-                        curr = ""
-                    prev_text = merged_text
-                    merged_text, _ = merge_pair(merged_text, curr)
-                    if on_progress and merged_text != prev_text:
-                        on_progress(merged_text, int(seg["idx"]), total_chunks)
+        base = public_base.rstrip("/")
+        total_chunks = len(chunks)
+        for seg in chunks:
+            chunk_url = f"{base}/{url_path_prefix}/{seg['file_name']}"
+            try:
+                curr = _post_one_chunk(
+                    session, chat_url, model, headers, chunk_url, timeout, max_tokens
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "分段 ASR 失败 idx=%s url=%s error=%s",
+                    seg["idx"],
+                    chunk_url,
+                    exc,
+                )
+                curr = ""
+            prev_text = merged_text
+            merged_text, _ = merge_pair(merged_text, curr)
+            if on_progress and merged_text != prev_text:
+                on_progress(merged_text, int(seg["idx"]), total_chunks)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
+        if session_http_dir is not None:
+            shutil.rmtree(session_http_dir, ignore_errors=True)
 
     return merged_text, duration_sec
 

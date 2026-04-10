@@ -37,14 +37,12 @@ from app.models import database, schemas
 from app.models.database import SessionLocal
 from app.services.meeting_audio_service import meeting_audio_service
 from app.services.qwen_asr_incremental_http import (
-    _incremental_http_lock,
     asr_http_runtime_params,
     build_asr_requests_session,
+    ensure_incremental_http_serve_root,
     get_incremental_http_public_base_and_port,
     merge_pair,
     post_served_wav_chunk,
-    start_chunk_http_server,
-    stop_chunk_http_server,
     transcribe_audio_file_incremental,
     validate_incremental_http_config,
     write_pcm_as_wav_file,
@@ -1164,15 +1162,13 @@ class LiveLocalAsrHandler:
         step_bytes = max(1, int(step_sec * bytes_per_sec))
         min_tail_bytes = max(frame, int(0.5 * bytes_per_sec))
 
-        work_root = Path(tempfile.mkdtemp(prefix="live_asr_inc_"))
-        chunks_dir = work_root / "chunks"
-        chunks_dir.mkdir(parents=True, exist_ok=True)
-
-        await asyncio.to_thread(lambda: _incremental_http_lock.acquire())
-        httpd: Optional[Any] = None
-        th: Optional[threading.Thread] = None
+        url_path_prefix = uuid.uuid4().hex
+        chunks_dir: Optional[Path] = None
         try:
-            httpd, th = start_chunk_http_server(chunks_dir, bind_port)
+            serve_parent = await asyncio.to_thread(ensure_incremental_http_serve_root, bind_port)
+            chunks_dir = serve_parent / url_path_prefix
+            chunks_dir.mkdir(parents=True, exist_ok=True)
+
             req_session = build_asr_requests_session()
             pcm_total = bytearray()
             cursor = 0
@@ -1202,6 +1198,7 @@ class LiveLocalAsrHandler:
                                 model,
                                 headers,
                                 public_base,
+                                url_path_prefix,
                                 fname,
                                 timeout,
                                 max_tokens,
@@ -1282,6 +1279,7 @@ class LiveLocalAsrHandler:
                             model,
                             headers,
                             public_base,
+                            url_path_prefix,
                             fname,
                             timeout,
                             max_tokens,
@@ -1307,10 +1305,8 @@ class LiveLocalAsrHandler:
             wav_path, pcm_duration = self._materialize_wav_path()
             await self._finalize_common(merged_text, pcm_duration, wav_path)
         finally:
-            if httpd is not None and th is not None:
-                stop_chunk_http_server(httpd, th)
-            shutil.rmtree(work_root, ignore_errors=True)
-            _incremental_http_lock.release()
+            if chunks_dir is not None:
+                shutil.rmtree(chunks_dir, ignore_errors=True)
 
 
 local_meeting_minute_service = LocalMeetingMinuteService()
