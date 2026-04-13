@@ -329,7 +329,7 @@ def ensure_incremental_http_serve_root(bind_port: int) -> Path:
 
 def start_chunk_http_server(chunks_dir: Path, bind_port: int) -> Tuple[HTTPServer, threading.Thread]:
     """在指定目录独占启动单线程 HTTPServer（脚本/调试）；主业务请用 ensure_incremental_http_serve_root。"""
-    handler = partial(_QuietStaticHTTPRequestHandler, directory=str(chunks_dir))
+    handler = partial[_QuietStaticHTTPRequestHandler](_QuietStaticHTTPRequestHandler, directory=str(chunks_dir))
     httpd = HTTPServer(("0.0.0.0", int(bind_port)), handler)
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
     th.start()

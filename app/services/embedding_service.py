@@ -3,7 +3,7 @@ import asyncio
 import os
 from typing import List
 from app.config import settings
-from FlagEmbedding import FlagAutoModel
+from FlagEmbedding import FlagModel
 from transformers import AutoTokenizer
 from app.utils.logger import get_logger
 
@@ -86,7 +86,7 @@ class EmbeddingService:
     
     def _load_model(self):
         """在线程池中执行的模型加载"""
-        return FlagAutoModel.from_finetuned(
+        return FlagModel.from_finetuned(
             self.model_name,
             query_instruction_for_retrieval=self.query_instruction,
             use_fp16=True  # 使用半精度加速
