@@ -47,6 +47,7 @@ from app.services.qwen_asr_incremental_http import (
     validate_incremental_http_config,
     write_pcm_as_wav_file,
 )
+from app.services.websocket_manager import meeting_ws_manager
 from app.utils.logger import get_logger
 
 logger = get_logger("meeting_local_minutes_service")
@@ -85,6 +86,19 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
                 total_chunks,
                 len(partial_text or ""),
             )
+            meeting_ws_manager.notify_from_thread(
+                meeting_id,
+                {
+                    "type": "local_audio_transcribe_progress",
+                    "meeting_id": meeting_id,
+                    "audio_id": audio_id,
+                    "asr_session_id": asr_id,
+                    "status": "processing",
+                    "chunk_idx": chunk_idx,
+                    "total_chunks": total_chunks,
+                    "accumulated": partial_text,
+                },
+            )
 
         merged, duration = transcribe_audio_file_incremental(
             tmp_path,
@@ -103,12 +117,40 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
         row.status = "completed"
         row.error_msg = None
         db.commit()
+        minutes_generated = False
+        minutes_error: Optional[str] = None
+        try:
+            local_meeting_minute_service.generate_minutes(db, meeting_id)
+            minutes_generated = True
+        except Exception as minutes_exc:  # noqa: BLE001
+            minutes_error = str(minutes_exc)
+            logger.warning(
+                "本地音频转写完成后自动生成纪要失败 meeting_id=%s audio_id=%s asr_session_id=%s error=%s",
+                meeting_id,
+                audio_id,
+                asr_id,
+                minutes_error,
+            )
         logger.info(
             "本地音频分段转写完成 meeting_id=%s audio_id=%s asr_session_id=%s len=%s",
             meeting_id,
             audio_id,
             asr_id,
             len(merged or ""),
+        )
+        meeting_ws_manager.notify_from_thread(
+            meeting_id,
+            {
+                "type": "local_audio_transcribe_completed",
+                "meeting_id": meeting_id,
+                "audio_id": audio_id,
+                "asr_session_id": asr_id,
+                "status": "completed",
+                "duration_seconds": duration,
+                "transcript": merged,
+                "minutes_generated": minutes_generated,
+                "minutes_error": minutes_error,
+            },
         )
     except HTTPException as exc:
         logger.warning(
@@ -128,6 +170,18 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             detail = exc.detail
             row.error_msg = detail if isinstance(detail, str) else repr(detail)
             db.commit()
+            meeting_ws_manager.notify_from_thread(
+                meeting_id,
+                {
+                    "type": "local_audio_transcribe_failed",
+                    "meeting_id": meeting_id,
+                    "audio_id": audio_id,
+                    "asr_session_id": asr_id,
+                    "status": "failed",
+                    "error": row.error_msg,
+                    "transcript": row.stream_transcript_text,
+                },
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
             "本地音频分段转写失败 meeting_id=%s audio_id=%s asr_session_id=%s",
@@ -144,6 +198,18 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             row.status = "failed"
             row.error_msg = str(exc)
             db.commit()
+            meeting_ws_manager.notify_from_thread(
+                meeting_id,
+                {
+                    "type": "local_audio_transcribe_failed",
+                    "meeting_id": meeting_id,
+                    "audio_id": audio_id,
+                    "asr_session_id": asr_id,
+                    "status": "failed",
+                    "error": row.error_msg,
+                    "transcript": row.stream_transcript_text,
+                },
+            )
     finally:
         if tmp_path is not None:
             try:
@@ -398,6 +464,16 @@ class LocalMeetingMinuteService:
             daemon=True,
             name=f"local-asr-file-{asr_id}",
         ).start()
+        meeting_ws_manager.notify_from_thread(
+            meeting_id,
+            {
+                "type": "local_audio_transcribe_started",
+                "meeting_id": meeting_id,
+                "audio_id": audio_id,
+                "asr_session_id": asr_id,
+                "status": "processing",
+            },
+        )
         logger.info(
             "已排队本地音频分段转写 meeting_id=%s audio_id=%s asr_session_id=%s",
             meeting_id,
