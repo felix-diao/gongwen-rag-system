@@ -52,6 +52,8 @@ from app.utils.logger import get_logger
 
 logger = get_logger("meeting_local_minutes_service")
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
+_LOCAL_AUDIO_TRANSCRIBE_SUBMIT_LOCK = threading.Lock()
+_LOCAL_ASR_ACTIVE_STATUS = {"pending", "processing", "running", "submitted"}
 
 
 def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
@@ -116,11 +118,26 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
         row.source_audio_id = audio_id
         row.status = "completed"
         row.error_msg = None
+        audio = (
+            db.query(database.MeetingAudio)
+            .filter(
+                database.MeetingAudio.id == audio_id,
+                database.MeetingAudio.meeting_id == meeting_id,
+                database.MeetingAudio.provider == "local",
+            )
+            .first()
+        )
+        if audio:
+            audio.status = "completed"
         db.commit()
         minutes_generated = False
         minutes_error: Optional[str] = None
         try:
-            local_meeting_minute_service.generate_minutes(db, meeting_id)
+            local_meeting_minute_service.generate_minutes(
+                db,
+                meeting_id,
+                asr_session_id=asr_id,
+            )
             minutes_generated = True
         except Exception as minutes_exc:  # noqa: BLE001
             minutes_error = str(minutes_exc)
@@ -169,6 +186,17 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             row.status = "failed"
             detail = exc.detail
             row.error_msg = detail if isinstance(detail, str) else repr(detail)
+            audio = (
+                db.query(database.MeetingAudio)
+                .filter(
+                    database.MeetingAudio.id == audio_id,
+                    database.MeetingAudio.meeting_id == meeting_id,
+                    database.MeetingAudio.provider == "local",
+                )
+                .first()
+            )
+            if audio:
+                audio.status = "uploaded"
             db.commit()
             meeting_ws_manager.notify_from_thread(
                 meeting_id,
@@ -197,6 +225,17 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
         if row:
             row.status = "failed"
             row.error_msg = str(exc)
+            audio = (
+                db.query(database.MeetingAudio)
+                .filter(
+                    database.MeetingAudio.id == audio_id,
+                    database.MeetingAudio.meeting_id == meeting_id,
+                    database.MeetingAudio.provider == "local",
+                )
+                .first()
+            )
+            if audio:
+                audio.status = "uploaded"
             db.commit()
             meeting_ws_manager.notify_from_thread(
                 meeting_id,
@@ -396,6 +435,23 @@ class LocalMeetingMinuteService:
         return None
 
     @staticmethod
+    def _active_asr_session_for_audio(
+        db: Session,
+        meeting_id: int,
+        audio_id: int,
+    ) -> Optional[database.LocalAsrSession]:
+        return (
+            db.query(database.LocalAsrSession)
+            .filter(
+                database.LocalAsrSession.meeting_id == meeting_id,
+                database.LocalAsrSession.source_audio_id == audio_id,
+                database.LocalAsrSession.status.in_(_LOCAL_ASR_ACTIVE_STATUS),
+            )
+            .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
+            .first()
+        )
+
+    @staticmethod
     def _asr_session_for_minutes_snapshot(
         db: Session,
         meeting_id: int,
@@ -404,9 +460,31 @@ class LocalMeetingMinuteService:
         """按快照 source_audio_id 定位对应 ASR 行；未绑音频时取该会议下最近一条 ASR。"""
         q = db.query(database.LocalAsrSession).filter(database.LocalAsrSession.meeting_id == meeting_id)
         if source_audio_id is not None:
-            return q.filter(database.LocalAsrSession.source_audio_id == source_audio_id).first()
+            return (
+                q.filter(database.LocalAsrSession.source_audio_id == source_audio_id)
+                .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
+                .first()
+            )
         return (
             q.order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc()).first()
+        )
+
+    @staticmethod
+    def _local_audio_by_id(
+        db: Session,
+        meeting_id: int,
+        audio_id: Optional[int],
+    ) -> Optional[database.MeetingAudio]:
+        if audio_id is None:
+            return None
+        return (
+            db.query(database.MeetingAudio)
+            .filter(
+                database.MeetingAudio.id == audio_id,
+                database.MeetingAudio.meeting_id == meeting_id,
+                database.MeetingAudio.provider == "local",
+            )
+            .first()
         )
 
     @staticmethod
@@ -444,7 +522,28 @@ class LocalMeetingMinuteService:
     ) -> schemas.LocalAsrTranscribeFromAudioResponse:
         """对已上传的本地会议音频排队分段 HTTP 转写（异步写入 local_asr_sessions）。"""
         self._assert_meeting_exists(db, meeting_id)
-        self._assert_local_audio(db, meeting_id, audio_id)
+        with _LOCAL_AUDIO_TRANSCRIBE_SUBMIT_LOCK:
+            audio = self._assert_local_audio(db, meeting_id, audio_id)
+            existing = self._active_asr_session_for_audio(db, meeting_id, audio_id)
+            if existing:
+                if audio.status != "processing":
+                    audio.status = "processing"
+                    db.commit()
+                logger.info(
+                    "复用进行中的本地音频转写任务 meeting_id=%s audio_id=%s asr_session_id=%s",
+                    meeting_id,
+                    audio_id,
+                    existing.id,
+                )
+                return schemas.LocalAsrTranscribeFromAudioResponse(
+                    asr_session_id=existing.id,
+                    meeting_id=meeting_id,
+                    source_audio_id=audio_id,
+                    status="processing",
+                )
+
+            audio.status = "processing"
+            db.flush()
         validate_incremental_http_config()
 
         asr = database.LocalAsrSession(
@@ -519,10 +618,34 @@ class LocalMeetingMinuteService:
             .first()
         )
 
-    def generate_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
-        logger.info("开始生成本地会议纪要 meeting_id=%s", meeting_id)
+    def generate_minutes(
+        self,
+        db: Session,
+        meeting_id: int,
+        asr_session_id: Optional[int] = None,
+    ) -> schemas.LocalMeetingMinutesResponse:
+        logger.info(
+            "开始生成本地会议纪要 meeting_id=%s asr_session_id=%s",
+            meeting_id,
+            asr_session_id,
+        )
         self._assert_meeting_exists(db, meeting_id)
-        asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
+        asr_session: Optional[database.LocalAsrSession] = None
+        if asr_session_id is not None:
+            asr_session = (
+                db.query(database.LocalAsrSession)
+                .filter(
+                    database.LocalAsrSession.id == asr_session_id,
+                    database.LocalAsrSession.meeting_id == meeting_id,
+                )
+                .first()
+            )
+            if not asr_session:
+                raise ValueError("指定的转写会话不存在")
+            if not (asr_session.stream_transcript_text or "").strip():
+                raise ValueError("当前转写会话尚未生成有效文本")
+        if asr_session is None:
+            asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
         if not asr_session:
             raise ValueError("当前会议尚无可用转写文本（请完成实时录音、HTTP 分段录音或已上传音频转写）")
 
@@ -571,35 +694,62 @@ class LocalMeetingMinuteService:
             stream_transcript_text=asr_session.stream_transcript_text,
         )
         db.commit()
-        logger.info("本地会议纪要生成完成 meeting_id=%s source_audio_id=%s", meeting_id, source_audio_id)
+        logger.info(
+            "本地会议纪要生成完成 meeting_id=%s asr_session_id=%s source_audio_id=%s",
+            meeting_id,
+            asr_session.id,
+            source_audio_id,
+        )
         return self.get_minutes(db, meeting_id)
 
     def get_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
         self._assert_meeting_exists(db, meeting_id)
         latest_session = self._latest_asr_session(db, meeting_id)
+        latest_minutes_session = self._latest_minutes_session(db, meeting_id)
         latest_audio = self._latest_local_audio(db, meeting_id)
         summary = self._meeting_summary(db, meeting_id)
         todos = self._meeting_todos(db, meeting_id)
-        # 已绑定 source_audio_id 的会话就是“上传音频转写”当前稿，哪怕正文尚短也不能回退到上一稿。
+        display_session: Optional[database.LocalAsrSession] = None
         transcript: Optional[str] = None
-        if latest_session and (
-            (latest_session.stream_transcript_text or "").strip()
-            or latest_session.source_audio_id is not None
-        ):
-            transcript = latest_session.stream_transcript_text
-        else:
-            with_text = self._latest_asr_session_with_transcript(db, meeting_id)
-            transcript = with_text.stream_transcript_text if with_text else None
+        pinned_audio_id: Optional[int] = None
+
+        # 当前主视图一旦已有纪要结果，就优先回显与该结果同源的转写内容，避免被会议里其他更新的 ASR 稿串掉。
+        if latest_minutes_session and (summary is not None or bool(todos)):
+            pinned_audio_id = latest_minutes_session.source_audio_id
+            transcript = latest_minutes_session.stream_transcript_text
+            display_session = self._asr_session_for_minutes_snapshot(db, meeting_id, pinned_audio_id)
+        elif summary and summary.source_audio_id is not None:
+            pinned_audio_id = summary.source_audio_id
+            display_session = self._asr_session_for_minutes_snapshot(db, meeting_id, pinned_audio_id)
+
+        if display_session is None:
+            display_session = latest_session
+
+        if transcript is None:
+            if display_session and (
+                (display_session.stream_transcript_text or "").strip()
+                or display_session.source_audio_id is not None
+            ):
+                transcript = display_session.stream_transcript_text
+            else:
+                with_text = self._latest_asr_session_with_transcript(db, meeting_id)
+                transcript = with_text.stream_transcript_text if with_text else None
+
+        source_audio_id = pinned_audio_id
+        if source_audio_id is None and display_session:
+            source_audio_id = display_session.source_audio_id
+
+        source_audio = self._local_audio_by_id(db, meeting_id, source_audio_id)
         return schemas.LocalMeetingMinutesResponse(
             transcript_text=transcript,
             stream_transcript_text=transcript,
-            asr_session_id=latest_session.id if latest_session else None,
-            asr_status=latest_session.status if latest_session else None,
-            source_audio_id=latest_session.source_audio_id if latest_session else None,
+            asr_session_id=display_session.id if display_session else None,
+            asr_status=display_session.status if display_session else None,
+            source_audio_id=source_audio_id,
             audio_status=(
-                latest_audio.status
-                if latest_audio
-                else (latest_session.status if latest_session else None)
+                source_audio.status
+                if source_audio
+                else (latest_audio.status if latest_audio else (display_session.status if display_session else None))
             ),
             summary=schemas.LocalMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas.LocalMeetingTodoInDB.model_validate(x) for x in todos],

@@ -84,19 +84,35 @@ async def live_recording(websocket: WebSocket, meeting_id: int, token: str = Que
 )
 def generate_minutes(
     meeting_id: int,
+    asr_session_id: int | None = Query(None, description="可选：指定用于生成纪要的 local_asr_sessions 主键"),
     db: Session = Depends(database.get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    logger.info("生成本地纪要请求 meeting_id=%s", meeting_id)
+    logger.info("生成本地纪要请求 meeting_id=%s asr_session_id=%s", meeting_id, asr_session_id)
     try:
-        data = local_meeting_minute_service.generate_minutes(db, meeting_id)
+        data = local_meeting_minute_service.generate_minutes(db, meeting_id, asr_session_id=asr_session_id)
     except ValueError as exc:
-        logger.warning("生成本地纪要失败 meeting_id=%s error=%s", meeting_id, exc)
+        logger.warning(
+            "生成本地纪要失败 meeting_id=%s asr_session_id=%s error=%s",
+            meeting_id,
+            asr_session_id,
+            exc,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
-        logger.warning("生成本地纪要失败：下游依赖异常 meeting_id=%s error=%s", meeting_id, exc)
+        logger.warning(
+            "生成本地纪要失败：下游依赖异常 meeting_id=%s asr_session_id=%s error=%s",
+            meeting_id,
+            asr_session_id,
+            exc,
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    logger.info("生成本地纪要成功 meeting_id=%s todo_count=%s", meeting_id, len(data.todos))
+    logger.info(
+        "生成本地纪要成功 meeting_id=%s asr_session_id=%s todo_count=%s",
+        meeting_id,
+        asr_session_id,
+        len(data.todos),
+    )
     return StandardResponse(success=True, data=data, message="会议纪要生成成功")
 
 
