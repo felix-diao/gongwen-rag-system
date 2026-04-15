@@ -1335,6 +1335,7 @@ class LiveLocalAsrHandler:
                     "type": "completed",
                     "session_id": self._session_id,
                     "audio_id": audio_record.id,
+                    "transcript": transcript,
                     "stream_transcript_text": transcript,
                     "audio_uploaded": True,
                     "duration_seconds": duration,
