@@ -450,7 +450,7 @@ def transcribe_audio_file_incremental(
     max_tokens = int(settings.QWEN_ASR_HTTP_CHAT_MAX_TOKENS or 512)
     chunk_sec = float(settings.QWEN_ASR_CHUNK_SEC or 6.0)
     overlap_sec = float(settings.QWEN_ASR_OVERLAP_SEC or 1.0)
-    prepare_batch_size = max(1, int(settings.QWEN_ASR_FILE_PREPARE_BATCH_SIZE or 5))
+    prepare_batch_size = max(1, int(settings.QWEN_ASR_FILE_PREPARE_BATCH_SIZE or 12))
 
     work_root = Path(tempfile.mkdtemp(prefix="qwen_asr_inc_"))
     url_path_prefix = uuid.uuid4().hex

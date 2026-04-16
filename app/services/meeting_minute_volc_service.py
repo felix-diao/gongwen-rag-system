@@ -45,6 +45,8 @@ ASR_WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 MINUTES_RUNNING_STATUS = {"queued", "running", "processing"}
 MINUTES_SUCCESS_STATUS = {"success", "succeeded", "successed", "finished", "completed", "done"}
 MINUTES_FAILED_STATUS = {"failed", "error"}
+MINUTES_CANCELLED_STATUS = {"cancelled", "canceled"}
+MINUTES_CANCELABLE_STATUS = {"submitted", *MINUTES_RUNNING_STATUS}
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
 EMPTY_SUMMARY_HINT = "摘要为空，可能因录音内容较短或有效信息不足，暂未生成摘要。"
 
@@ -432,6 +434,23 @@ class VolcMeetingMinuteService:
             .first()
         )
 
+    @staticmethod
+    def _latest_cancelable_minutes_job(
+        db: Session,
+        meeting_id: int,
+    ) -> Optional[database.VolcMinutesJob]:
+        rows = (
+            db.query(database.VolcMinutesJob)
+            .filter(database.VolcMinutesJob.meeting_id == meeting_id)
+            .order_by(database.VolcMinutesJob.updated_at.desc(), database.VolcMinutesJob.id.desc())
+            .all()
+        )
+        for row in rows:
+            status = str(row.status or "").strip().lower()
+            if status in MINUTES_CANCELABLE_STATUS:
+                return row
+        return None
+
     def submit_minutes(
         self,
         db: Session,
@@ -470,6 +489,64 @@ class VolcMeetingMinuteService:
         self._start_poller(job.id)
         return job
 
+    def cancel_minutes_job(
+        self,
+        db: Session,
+        meeting_id: int,
+        job_id: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> schemas.VolcMinutesCancelResponse:
+        self._assert_meeting_exists(db, meeting_id)
+        if job_id is None:
+            job = self._latest_cancelable_minutes_job(db, meeting_id)
+        else:
+            job = (
+                db.query(database.VolcMinutesJob)
+                .filter(
+                    database.VolcMinutesJob.id == job_id,
+                    database.VolcMinutesJob.meeting_id == meeting_id,
+                )
+                .first()
+            )
+        if not job:
+            raise ValueError("妙记任务不存在")
+
+        status = str(job.status or "").strip().lower()
+        if status in MINUTES_SUCCESS_STATUS or status in MINUTES_FAILED_STATUS:
+            raise ValueError("当前妙记任务已结束，无法取消")
+
+        with self._poll_lock:
+            stop_flag = self._poll_stop.get(job.id)
+            if stop_flag:
+                stop_flag.set()
+
+        if status not in MINUTES_CANCELLED_STATUS:
+            job.status = "cancelled"
+            job.error_msg = str(reason or "").strip() or "用户已取消当前妙记任务"
+            job.updated_at = datetime.utcnow()
+            db.commit()
+            meeting_ws_manager.notify_from_thread(
+                meeting_id,
+                {
+                    "type": "volc_minutes_cancelled",
+                    "meeting_id": meeting_id,
+                    "job_id": job.id,
+                    "audio_id": job.source_audio_id,
+                    "task_id": job.volc_task_id,
+                    "status": "cancelled",
+                    "error": job.error_msg,
+                },
+            )
+
+        logger.info("已取消火山妙记任务 meeting_id=%s job_id=%s", meeting_id, job.id)
+        return schemas.VolcMinutesCancelResponse(
+            meeting_id=meeting_id,
+            job_id=job.id,
+            source_audio_id=job.source_audio_id,
+            task_id=job.volc_task_id,
+            status="cancelled",
+        )
+
     def _start_poller(self, job_id: int) -> None:
         # 同一任务只保留一个活跃轮询器；新轮询启动前会停掉旧轮询。
         with self._poll_lock:
@@ -500,6 +577,9 @@ class VolcMeetingMinuteService:
                 )
                 if not job or not job.volc_task_id:
                     break
+                if str(job.status or "").strip().lower() in MINUTES_CANCELLED_STATUS:
+                    logger.info("火山妙记轮询已取消 job_id=%s", job_id)
+                    break
                 audio = None
                 if job.source_audio_id is not None:
                     audio = (
@@ -509,6 +589,16 @@ class VolcMeetingMinuteService:
                     )
 
                 result = self._minutes_api.query(job.volc_task_id)
+                if stop_flag.is_set():
+                    db.expire_all()
+                    latest_job = (
+                        db.query(database.VolcMinutesJob)
+                        .filter(database.VolcMinutesJob.id == job_id)
+                        .first()
+                    )
+                    if not latest_job or str(latest_job.status or "").strip().lower() in MINUTES_CANCELLED_STATUS:
+                        logger.info("火山妙记轮询收到取消信号后退出 job_id=%s", job_id)
+                        break
                 data = result["Data"]
                 status_raw = str(data["Status"]).strip()
                 status = status_raw.lower()
@@ -575,6 +665,9 @@ class VolcMeetingMinuteService:
                     .first()
                 )
                 if job:
+                    if str(job.status or "").strip().lower() in MINUTES_CANCELLED_STATUS:
+                        logger.info("火山妙记轮询异常但任务已取消，忽略失败回写 job_id=%s error=%s", job_id, exc)
+                        return
                     job.status = "failed"
                     job.error_msg = str(exc)
                     job.updated_at = datetime.utcnow()
@@ -1026,6 +1119,7 @@ class VolcMeetingMinuteService:
         return schemas.VolcMeetingMinutesResponse(
             stream_transcript_text=stream_text,
             transcript_text=transcript_text,
+            minutes_job_id=latest_job.id if latest_job else None,
             minutes_job_status=latest_job.status if latest_job else None,
             audio_status=(
                 latest_audio.status

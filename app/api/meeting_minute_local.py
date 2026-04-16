@@ -16,6 +16,7 @@ from app.models.database import SessionLocal
 from app.models.schemas import StandardResponse
 from app.services.meeting_minute_local_service import (
     LiveLocalAsrHandler,
+    ProcessingCancelledError,
     local_meeting_minute_service,
 )
 from app.utils.auth import decode_access_token, get_current_user
@@ -99,6 +100,14 @@ def generate_minutes(
             exc,
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProcessingCancelledError as exc:
+        logger.info(
+            "本地纪要生成已取消 meeting_id=%s asr_session_id=%s error=%s",
+            meeting_id,
+            asr_session_id,
+            exc,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         logger.warning(
             "生成本地纪要失败：下游依赖异常 meeting_id=%s asr_session_id=%s error=%s",
@@ -178,6 +187,46 @@ def transcribe_uploaded_local_audio(
         data=data,
         message="已提交异步分段转写，请轮询 GET 当前纪要查看转写结果",
     )
+
+
+@router.post(
+    "/{meeting_id}/cancel",
+    response_model=StandardResponse[schemas.LocalProcessingCancelResponse],
+)
+def cancel_local_processing(
+    meeting_id: int,
+    payload: schemas.LocalProcessingCancelRequest | None = Body(None),
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    payload = payload or schemas.LocalProcessingCancelRequest()
+    logger.info(
+        "取消本地处理请求 meeting_id=%s asr_session_id=%s",
+        meeting_id,
+        payload.asr_session_id,
+    )
+    try:
+        data = local_meeting_minute_service.cancel_processing(
+            db,
+            meeting_id,
+            asr_session_id=payload.asr_session_id,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "取消本地处理失败 meeting_id=%s asr_session_id=%s error=%s",
+            meeting_id,
+            payload.asr_session_id,
+            exc,
+        )
+        raise _http_from_local_minutes_value_error(exc) from exc
+    logger.info(
+        "取消本地处理请求已接受 meeting_id=%s asr_session_id=%s stage=%s",
+        meeting_id,
+        data.asr_session_id,
+        data.stage,
+    )
+    return StandardResponse(success=True, data=data, message="已提交取消请求")
 
 
 # 列出本会下全部本地纪要历史快照（某次生成后的整包版本，非实时 WS）。

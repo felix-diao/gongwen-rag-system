@@ -764,6 +764,21 @@ class VolcMinutesJobInDB(BaseModel):
     updated_at: datetime
 
 
+class VolcMinutesCancelRequest(BaseModel):
+    """取消火山妙记任务请求。"""
+    job_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class VolcMinutesCancelResponse(BaseModel):
+    """取消火山妙记任务响应。"""
+    meeting_id: int
+    job_id: int
+    source_audio_id: Optional[int] = None
+    task_id: Optional[str] = None
+    status: Literal["cancelled"] = "cancelled"
+
+
 class VolcSpeakerSegmentInDB(BaseModel):
     """火山说话人分段响应模型（由 volc_accurate_transcriptions.speaker_segments_json 解析展开）。"""
     model_config = ConfigDict(from_attributes=True)
@@ -801,6 +816,7 @@ class VolcMeetingMinutesResponse(BaseModel):
     """火山会议纪要聚合响应。"""
     stream_transcript_text: Optional[str] = None
     transcript_text: Optional[str] = None
+    minutes_job_id: Optional[int] = None
     minutes_job_status: Optional[str] = None
     audio_status: Optional[str] = None
     speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
@@ -918,6 +934,9 @@ class LocalMeetingMinutesResponse(BaseModel):
     stream_transcript_text: Optional[str] = None
     asr_session_id: Optional[int] = None
     asr_status: Optional[str] = None
+    processing_asr_session_id: Optional[int] = None
+    processing_stage: Optional[Literal["transcribe", "minutes"]] = None
+    processing_status: Optional[str] = None
     source_audio_id: Optional[int] = None
     audio_status: Optional[str] = None
     summary: Optional[LocalMeetingSummaryInDB] = None
@@ -931,6 +950,21 @@ class LocalAsrTranscribeFromAudioResponse(BaseModel):
     meeting_id: int
     source_audio_id: int
     status: Literal["processing"] = "processing"
+
+
+class LocalProcessingCancelRequest(BaseModel):
+    """取消本地转写/纪要处理请求。"""
+    asr_session_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class LocalProcessingCancelResponse(BaseModel):
+    """取消本地转写/纪要处理响应。"""
+    meeting_id: int
+    asr_session_id: int
+    source_audio_id: Optional[int] = None
+    stage: Literal["transcribe", "minutes"]
+    status: Literal["cancel_requested"] = "cancel_requested"
 
 
 class LocalSessionTodoItem(BaseModel):

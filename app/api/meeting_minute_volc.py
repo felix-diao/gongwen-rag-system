@@ -33,6 +33,8 @@ def _http_from_volc_minutes_value_error(exc: ValueError) -> HTTPException:
         return HTTPException(status_code=404, detail=detail)
     if detail == "会话历史不存在":
         return HTTPException(status_code=404, detail=detail)
+    if detail == "妙记任务不存在":
+        return HTTPException(status_code=404, detail=detail)
     return HTTPException(status_code=400, detail=detail)
 
 
@@ -111,6 +113,59 @@ def submit_minutes(
         data=schemas.VolcMinutesJobInDB.model_validate(record),
         message="已提交语音妙记，后台处理中",
     )
+
+
+@router.post(
+    "/{meeting_id}/jobs/{job_id}/cancel",
+    response_model=StandardResponse[schemas.VolcMinutesCancelResponse],
+)
+def cancel_minutes_job(
+    meeting_id: int,
+    job_id: int,
+    payload: schemas.VolcMinutesCancelRequest | None = Body(None),
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    payload = payload or schemas.VolcMinutesCancelRequest()
+    logger.info("取消火山妙记任务请求 meeting_id=%s job_id=%s", meeting_id, job_id)
+    try:
+        data = volc_meeting_minute_service.cancel_minutes_job(
+            db=db,
+            meeting_id=meeting_id,
+            job_id=job_id,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        logger.warning("取消火山妙记任务失败 meeting_id=%s job_id=%s error=%s", meeting_id, job_id, exc)
+        raise _http_from_volc_minutes_value_error(exc) from exc
+    logger.info("取消火山妙记任务成功 meeting_id=%s job_id=%s", meeting_id, job_id)
+    return StandardResponse(success=True, data=data, message="已取消妙记任务")
+
+
+@router.post(
+    "/{meeting_id}/cancel",
+    response_model=StandardResponse[schemas.VolcMinutesCancelResponse],
+)
+def cancel_current_minutes_job(
+    meeting_id: int,
+    payload: schemas.VolcMinutesCancelRequest | None = Body(None),
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    payload = payload or schemas.VolcMinutesCancelRequest()
+    logger.info("取消当前火山妙记任务请求 meeting_id=%s job_id=%s", meeting_id, payload.job_id)
+    try:
+        data = volc_meeting_minute_service.cancel_minutes_job(
+            db=db,
+            meeting_id=meeting_id,
+            job_id=payload.job_id,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        logger.warning("取消当前火山妙记任务失败 meeting_id=%s job_id=%s error=%s", meeting_id, payload.job_id, exc)
+        raise _http_from_volc_minutes_value_error(exc) from exc
+    logger.info("取消当前火山妙记任务成功 meeting_id=%s job_id=%s", meeting_id, data.job_id)
+    return StandardResponse(success=True, data=data, message="已取消妙记任务")
 
 
 # 聚合读取火山链路下当前会议的转写、分段、摘要、待办与妙记任务态。

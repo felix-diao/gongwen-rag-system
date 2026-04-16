@@ -54,6 +54,60 @@ logger = get_logger("meeting_local_minutes_service")
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
 _LOCAL_AUDIO_TRANSCRIBE_SUBMIT_LOCK = threading.Lock()
 _LOCAL_ASR_ACTIVE_STATUS = {"pending", "processing", "running", "submitted"}
+_LOCAL_CANCELLED_STATUS = {"cancelled", "canceled"}
+_LOCAL_CANCEL_LOCK = threading.Lock()
+_LOCAL_CANCEL_REQUESTED_ASR_IDS: set[int] = set()
+_LOCAL_ACTIVE_GENERATE_ASR_IDS: set[int] = set()
+
+
+class ProcessingCancelledError(RuntimeError):
+    """当前处理任务已被用户取消。"""
+
+
+def _request_local_cancel(asr_session_id: int) -> None:
+    with _LOCAL_CANCEL_LOCK:
+        _LOCAL_CANCEL_REQUESTED_ASR_IDS.add(int(asr_session_id))
+
+
+def _clear_local_cancel(asr_session_id: int) -> None:
+    with _LOCAL_CANCEL_LOCK:
+        _LOCAL_CANCEL_REQUESTED_ASR_IDS.discard(int(asr_session_id))
+
+
+def _is_local_cancel_requested(asr_session_id: int) -> bool:
+    with _LOCAL_CANCEL_LOCK:
+        return int(asr_session_id) in _LOCAL_CANCEL_REQUESTED_ASR_IDS
+
+
+def _mark_local_generate_active(asr_session_id: int) -> None:
+    with _LOCAL_CANCEL_LOCK:
+        _LOCAL_ACTIVE_GENERATE_ASR_IDS.add(int(asr_session_id))
+
+
+def _mark_local_generate_finished(asr_session_id: int) -> None:
+    with _LOCAL_CANCEL_LOCK:
+        _LOCAL_ACTIVE_GENERATE_ASR_IDS.discard(int(asr_session_id))
+
+
+def _is_local_generate_active(asr_session_id: int) -> bool:
+    with _LOCAL_CANCEL_LOCK:
+        return int(asr_session_id) in _LOCAL_ACTIVE_GENERATE_ASR_IDS
+
+
+def _raise_if_local_cancel_requested(
+    db: Session,
+    asr_session_id: int,
+    message: str,
+) -> None:
+    if _is_local_cancel_requested(asr_session_id):
+        raise ProcessingCancelledError(message)
+    row = (
+        db.query(database.LocalAsrSession)
+        .filter(database.LocalAsrSession.id == asr_session_id)
+        .first()
+    )
+    if row and str(row.status or "").strip().lower() in _LOCAL_CANCELLED_STATUS:
+        raise ProcessingCancelledError(message)
 
 
 def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
@@ -78,6 +132,7 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
         tmp_path, _, _ = meeting_audio_service.download_audio_to_temp(
             db, meeting_id, "local", audio_id
         )
+        _raise_if_local_cancel_requested(db, asr_id, "已取消当前本地音频转写任务")
         def _persist_progress(partial_text: str, chunk_idx: int, total_chunks: int) -> None:
             row = (
                 db.query(database.LocalAsrSession)
@@ -86,12 +141,14 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             )
             if not row:
                 return
+            if _is_local_cancel_requested(asr_id) or str(row.status or "").strip().lower() in _LOCAL_CANCELLED_STATUS:
+                raise ProcessingCancelledError("已取消当前本地音频转写任务")
             row.stream_transcript_text = partial_text
             row.source_audio_id = audio_id
             row.status = "processing"
             row.error_msg = None
             db.commit()
-            logger.info(
+            logger.debug(
                 "本地音频分段转写进度 meeting_id=%s audio_id=%s asr_session_id=%s chunk=%s/%s len=%s",
                 meeting_id,
                 audio_id,
@@ -115,8 +172,9 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             )
 
         def _notify_stage(stage: Dict[str, Any]) -> None:
+            _raise_if_local_cancel_requested(db, asr_id, "已取消当前本地音频转写任务")
             message = str(stage.get("message") or "").strip()
-            logger.info(
+            logger.debug(
                 "本地音频分段转写阶段 meeting_id=%s audio_id=%s asr_session_id=%s phase=%s message=%s",
                 meeting_id,
                 audio_id,
@@ -141,6 +199,7 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             on_progress=_persist_progress,
             on_stage=_notify_stage,
         )
+        _raise_if_local_cancel_requested(db, asr_id, "已取消当前本地音频转写任务")
         row = (
             db.query(database.LocalAsrSession)
             .filter(database.LocalAsrSession.id == asr_id)
@@ -174,6 +233,8 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
                 asr_session_id=asr_id,
             )
             minutes_generated = True
+        except ProcessingCancelledError:
+            raise
         except Exception as minutes_exc:  # noqa: BLE001
             minutes_error = str(minutes_exc)
             logger.warning(
@@ -204,6 +265,50 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
                 "minutes_error": minutes_error,
             },
         )
+    except ProcessingCancelledError as exc:
+        logger.info(
+            "本地音频分段转写已取消 meeting_id=%s audio_id=%s asr_session_id=%s reason=%s",
+            meeting_id,
+            audio_id,
+            asr_id,
+            exc,
+        )
+        db.rollback()
+        row = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.id == asr_id)
+            .first()
+        )
+        if row:
+            previous_status = str(row.status or "").strip().lower()
+            if previous_status in _LOCAL_ASR_ACTIVE_STATUS:
+                row.status = "cancelled"
+            row.error_msg = str(exc)
+            audio = (
+                db.query(database.MeetingAudio)
+                .filter(
+                    database.MeetingAudio.id == audio_id,
+                    database.MeetingAudio.meeting_id == meeting_id,
+                    database.MeetingAudio.provider == "local",
+                )
+                .first()
+            )
+            if audio and audio.status == "processing":
+                audio.status = "uploaded"
+            db.commit()
+            if previous_status != "completed":
+                meeting_ws_manager.notify_from_thread(
+                    meeting_id,
+                    {
+                        "type": "local_audio_transcribe_cancelled",
+                        "meeting_id": meeting_id,
+                        "audio_id": audio_id,
+                        "asr_session_id": asr_id,
+                        "status": "cancelled",
+                        "error": row.error_msg,
+                        "transcript": row.stream_transcript_text,
+                    },
+                )
     except HTTPException as exc:
         logger.warning(
             "本地音频分段转写失败(HTTP) meeting_id=%s audio_id=%s asr_session_id=%s detail=%s",
@@ -285,6 +390,7 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
                 },
             )
     finally:
+        _clear_local_cancel(asr_id)
         if tmp_path is not None:
             try:
                 tmp_path.unlink(missing_ok=True)
@@ -487,6 +593,44 @@ class LocalMeetingMinuteService:
         )
 
     @staticmethod
+    def _cancel_target_asr_session(
+        db: Session,
+        meeting_id: int,
+        asr_session_id: Optional[int],
+    ) -> Optional[database.LocalAsrSession]:
+        q = db.query(database.LocalAsrSession).filter(database.LocalAsrSession.meeting_id == meeting_id)
+        if asr_session_id is not None:
+            return q.filter(database.LocalAsrSession.id == asr_session_id).first()
+        rows = (
+            q.order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
+            .all()
+        )
+        for row in rows:
+            status = str(row.status or "").strip().lower()
+            if status in _LOCAL_ASR_ACTIVE_STATUS or _is_local_generate_active(row.id):
+                return row
+        return None
+
+    @staticmethod
+    def _latest_processing_task(
+        db: Session,
+        meeting_id: int,
+    ) -> tuple[Optional[database.LocalAsrSession], Optional[str]]:
+        rows = (
+            db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.meeting_id == meeting_id)
+            .order_by(database.LocalAsrSession.updated_at.desc(), database.LocalAsrSession.id.desc())
+            .all()
+        )
+        for row in rows:
+            status = str(row.status or "").strip().lower()
+            if status in _LOCAL_ASR_ACTIVE_STATUS:
+                return row, "transcribe"
+            if _is_local_generate_active(row.id):
+                return row, "minutes"
+        return None, None
+
+    @staticmethod
     def _asr_session_for_minutes_snapshot(
         db: Session,
         meeting_id: int,
@@ -683,63 +827,128 @@ class LocalMeetingMinuteService:
             asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
         if not asr_session:
             raise ValueError("当前会议尚无可用转写文本（请完成实时录音、HTTP 分段录音或已上传音频转写）")
+        _mark_local_generate_active(asr_session.id)
+        try:
+            _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
+            meeting_title = self._get_meeting_title(db, meeting_id)
+            payload = self._call_llm(meeting_title, asr_session.stream_transcript_text or "")
+            _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
 
-        meeting_title = self._get_meeting_title(db, meeting_id)
-        payload = self._call_llm(meeting_title, asr_session.stream_transcript_text or "")
+            source_audio_id = asr_session.source_audio_id
+            if source_audio_id is None:
+                latest_local_audio = self._latest_local_audio(db, meeting_id)
+                source_audio_id = latest_local_audio.id if latest_local_audio else None
 
-        source_audio_id = asr_session.source_audio_id
-        if source_audio_id is None:
-            latest_local_audio = self._latest_local_audio(db, meeting_id)
-            source_audio_id = latest_local_audio.id if latest_local_audio else None
+            db.query(database.LocalMeetingSummary).filter(
+                database.LocalMeetingSummary.meeting_id == meeting_id
+            ).delete(synchronize_session=False)
+            db.query(database.LocalMeetingTodo).filter(
+                database.LocalMeetingTodo.meeting_id == meeting_id
+            ).delete(synchronize_session=False)
+            db.flush()
+            _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
 
-        db.query(database.LocalMeetingSummary).filter(
-            database.LocalMeetingSummary.meeting_id == meeting_id
-        ).delete(synchronize_session=False)
-        db.query(database.LocalMeetingTodo).filter(
-            database.LocalMeetingTodo.meeting_id == meeting_id
-        ).delete(synchronize_session=False)
-        db.flush()
-
-        summary = payload["summary"]
-        db.add(
-            database.LocalMeetingSummary(
-                meeting_id=meeting_id,
-                source_audio_id=source_audio_id,
-                title=summary["title"],
-                paragraph=summary["paragraph"],
-            )
-        )
-
-        for item in payload["todos"]:
+            summary = payload["summary"]
             db.add(
-                database.LocalMeetingTodo(
+                database.LocalMeetingSummary(
                     meeting_id=meeting_id,
                     source_audio_id=source_audio_id,
-                    content=item["content"],
-                    executor=item.get("executor"),
-                    execution_time=item.get("execution_time"),
+                    title=summary["title"],
+                    paragraph=summary["paragraph"],
                 )
             )
 
-        db.flush()
-        self._create_minutes_session_snapshot(
-            db=db,
-            meeting_id=meeting_id,
-            source_audio_id=source_audio_id,
-            stream_transcript_text=asr_session.stream_transcript_text,
-        )
-        db.commit()
+            for item in payload["todos"]:
+                db.add(
+                    database.LocalMeetingTodo(
+                        meeting_id=meeting_id,
+                        source_audio_id=source_audio_id,
+                        content=item["content"],
+                        executor=item.get("executor"),
+                        execution_time=item.get("execution_time"),
+                    )
+                )
+
+            db.flush()
+            _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
+            self._create_minutes_session_snapshot(
+                db=db,
+                meeting_id=meeting_id,
+                source_audio_id=source_audio_id,
+                stream_transcript_text=asr_session.stream_transcript_text,
+            )
+            db.commit()
+            logger.info(
+                "本地会议纪要生成完成 meeting_id=%s asr_session_id=%s source_audio_id=%s",
+                meeting_id,
+                asr_session.id,
+                source_audio_id,
+            )
+            return self.get_minutes(db, meeting_id)
+        except ProcessingCancelledError:
+            db.rollback()
+            meeting_ws_manager.notify_from_thread(
+                meeting_id,
+                {
+                    "type": "local_minutes_cancelled",
+                    "meeting_id": meeting_id,
+                    "asr_session_id": asr_session.id,
+                    "status": "cancelled",
+                    "source_audio_id": asr_session.source_audio_id,
+                },
+            )
+            raise
+        finally:
+            _mark_local_generate_finished(asr_session.id)
+            _clear_local_cancel(asr_session.id)
+
+    def cancel_processing(
+        self,
+        db: Session,
+        meeting_id: int,
+        asr_session_id: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> schemas.LocalProcessingCancelResponse:
+        self._assert_meeting_exists(db, meeting_id)
+        asr = self._cancel_target_asr_session(db, meeting_id, asr_session_id)
+        if not asr:
+            raise ValueError("当前没有可取消的本地处理任务")
+
+        status = str(asr.status or "").strip().lower()
+        transcribe_active = status in _LOCAL_ASR_ACTIVE_STATUS or status in _LOCAL_CANCELLED_STATUS
+        minutes_active = _is_local_generate_active(asr.id)
+        if not transcribe_active and not minutes_active:
+            raise ValueError("当前没有可取消的本地处理任务")
+
+        _request_local_cancel(asr.id)
+        message = str(reason or "").strip() or "用户已取消当前处理"
+        stage = "transcribe" if transcribe_active else "minutes"
+        if status in _LOCAL_ASR_ACTIVE_STATUS:
+            asr.status = "cancelled"
+            asr.error_msg = message
+            audio = self._local_audio_by_id(db, meeting_id, asr.source_audio_id)
+            if audio and audio.status == "processing":
+                audio.status = "uploaded"
+            db.commit()
+
         logger.info(
-            "本地会议纪要生成完成 meeting_id=%s asr_session_id=%s source_audio_id=%s",
+            "已请求取消本地处理 meeting_id=%s asr_session_id=%s stage=%s",
             meeting_id,
-            asr_session.id,
-            source_audio_id,
+            asr.id,
+            stage,
         )
-        return self.get_minutes(db, meeting_id)
+        return schemas.LocalProcessingCancelResponse(
+            meeting_id=meeting_id,
+            asr_session_id=asr.id,
+            source_audio_id=asr.source_audio_id,
+            stage=stage,
+            status="cancel_requested",
+        )
 
     def get_minutes(self, db: Session, meeting_id: int) -> schemas.LocalMeetingMinutesResponse:
         self._assert_meeting_exists(db, meeting_id)
         latest_session = self._latest_asr_session(db, meeting_id)
+        processing_session, processing_stage = self._latest_processing_task(db, meeting_id)
         latest_minutes_session = self._latest_minutes_session(db, meeting_id)
         latest_audio = self._latest_local_audio(db, meeting_id)
         summary = self._meeting_summary(db, meeting_id)
@@ -780,6 +989,9 @@ class LocalMeetingMinuteService:
             stream_transcript_text=transcript,
             asr_session_id=display_session.id if display_session else None,
             asr_status=display_session.status if display_session else None,
+            processing_asr_session_id=processing_session.id if processing_session else None,
+            processing_stage=processing_stage,
+            processing_status="processing" if processing_session and processing_stage else None,
             source_audio_id=source_audio_id,
             audio_status=(
                 source_audio.status
