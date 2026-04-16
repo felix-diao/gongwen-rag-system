@@ -491,6 +491,22 @@ class MeetingAudioService:
 
         return tmp_file_path, record.file_name, record.file_type
 
+    def get_audio_download_source(
+        self,
+        db: Session,
+        meeting_id: int,
+        provider: Provider,
+        audio_id: int,
+    ) -> Tuple[Optional[str], str, str]:
+        """返回音频下载源地址与元数据；缺失 file_url 时由调用方回退旧链路。"""
+        self._assert_meeting_exists(db, meeting_id)
+        record = self._get_audio_record(db, meeting_id, provider, audio_id)
+        if not record.file_name:
+            raise HTTPException(status_code=404, detail="音频文件名缺失")
+        if not record.file_type:
+            raise HTTPException(status_code=404, detail="音频文件类型缺失")
+        return record.file_url, record.file_name, record.file_type
+
     def delete_audio(
         self, db: Session, meeting_id: int, provider: Provider, audio_id: int
     ) -> schemas.MeetingAudioInDB:

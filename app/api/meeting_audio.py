@@ -6,10 +6,14 @@ WebSocket `/audio/ws/{meeting_id}` 用于同会议多端推送，由 meeting_ws_
 排障：上传看 upload-task 与后台线程；下载/删除看 object_key 与 TOS 日志；WS 看连接与断开日志。
 """
 
-from typing import List
+from pathlib import Path
+from typing import Iterator, List, Optional
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+import httpx
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
@@ -17,12 +21,42 @@ from app.models import database, schemas
 from app.models.schemas import StandardResponse
 from app.services.meeting_audio_service import meeting_audio_service
 from app.services.websocket_manager import meeting_ws_manager
-from app.utils.auth import get_current_user
+from app.utils.auth import decode_access_token, get_current_user
 from app.utils.logger import get_logger
 
 logger = get_logger("meeting_audio_api")
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+
+def _resolve_download_user(request: Request, token: Optional[str]) -> dict:
+    bearer = (token or "").strip()
+    if not bearer:
+        auth_header = (request.headers.get("Authorization") or "").strip()
+        if auth_header.lower().startswith("bearer "):
+            bearer = auth_header[7:].strip()
+    if not bearer:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="缺少访问令牌",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    payload = decode_access_token(bearer)
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的令牌",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"user_id": user_id, "username": payload.get("username"), "role": payload.get("role")}
+
+
+def _attachment_disposition(file_name: str) -> str:
+    safe_name = Path(file_name).name or "download"
+    ascii_name = safe_name.encode("ascii", "ignore").decode("ascii") or "download"
+    ascii_name = ascii_name.replace("\\", "_").replace('"', "_")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
 
 
 # 创建异步上传任务，立即返回 task_id 供轮询。
@@ -162,6 +196,113 @@ def download_meeting_audio(
         filename=file_name,
         media_type=file_type,
         background=BackgroundTask(cleanup),
+    )
+
+
+@router.get("/audio/direct-download/{meeting_id}/{audio_id}")
+def direct_download_meeting_audio(
+    request: Request,
+    meeting_id: int,
+    audio_id: int,
+    provider: str = Query(..., description="当前仅支持 local"),
+    token: Optional[str] = Query(None, description="浏览器直链下载时使用的访问令牌"),
+    db: Session = Depends(database.get_db),
+):
+    current_user = _resolve_download_user(request, token)
+    normalized_provider = meeting_audio_service.normalize_provider(provider)
+    if normalized_provider != "local":
+        raise HTTPException(status_code=400, detail="该直链下载接口当前仅支持机密会议音频")
+    logger.info(
+        "直链下载音频请求 meeting_id=%s provider=%s audio_id=%s user_id=%s",
+        meeting_id,
+        normalized_provider,
+        audio_id,
+        current_user.get("user_id"),
+    )
+    file_url, file_name, file_type = meeting_audio_service.get_audio_download_source(
+        db, meeting_id, normalized_provider, audio_id
+    )
+    if not file_url:
+        logger.info(
+            "直链下载缺少 file_url，回退旧链路 meeting_id=%s provider=%s audio_id=%s",
+            meeting_id,
+            normalized_provider,
+            audio_id,
+        )
+        tmp_file_path, file_name, file_type = meeting_audio_service.download_audio_to_temp(
+            db, meeting_id, normalized_provider, audio_id
+        )
+
+        def cleanup() -> None:
+            if tmp_file_path.exists():
+                tmp_file_path.unlink(missing_ok=True)
+                logger.info("直链下载回退临时音频清理 path=%s", tmp_file_path)
+
+        return FileResponse(
+            path=str(tmp_file_path),
+            filename=file_name,
+            media_type=file_type,
+            background=BackgroundTask(cleanup),
+        )
+
+    client = httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None))
+    try:
+        upstream = client.send(client.build_request("GET", file_url), stream=True)
+        upstream.raise_for_status()
+    except Exception as exc:
+        client.close()
+        logger.warning(
+            "直链下载快路径失败，回退旧链路，模式=%s，会议ID=%s，音频ID=%s，file_url=%s，错误=%s",
+            normalized_provider,
+            meeting_id,
+            audio_id,
+            file_url,
+            exc,
+        )
+        tmp_file_path, file_name, file_type = meeting_audio_service.download_audio_to_temp(
+            db, meeting_id, normalized_provider, audio_id
+        )
+
+        def cleanup() -> None:
+            if tmp_file_path.exists():
+                tmp_file_path.unlink(missing_ok=True)
+                logger.info("直链下载回退临时音频清理 path=%s", tmp_file_path)
+
+        return FileResponse(
+            path=str(tmp_file_path),
+            filename=file_name,
+            media_type=file_type,
+            background=BackgroundTask(cleanup),
+        )
+
+    def iter_remote() -> Iterator[bytes]:
+        try:
+            for chunk in upstream.iter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+            client.close()
+
+    headers = {
+        "Content-Disposition": _attachment_disposition(file_name),
+        "Cache-Control": "no-store",
+    }
+    content_length = upstream.headers.get("content-length")
+    if content_length:
+        headers["Content-Length"] = content_length
+
+    logger.info(
+        "直链下载音频准备完成 meeting_id=%s provider=%s audio_id=%s file_url=%s",
+        meeting_id,
+        normalized_provider,
+        audio_id,
+        file_url,
+    )
+    return StreamingResponse(
+        iter_remote(),
+        media_type=file_type,
+        headers=headers,
     )
 
 
