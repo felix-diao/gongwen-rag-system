@@ -137,6 +137,8 @@ class Settings(BaseSettings):
     QWEN_ASR_HTTP_CHAT_API_KEY: str = ""
     QWEN_ASR_HTTP_CHAT_TIMEOUT_SEC: float = 120.0
     QWEN_ASR_HTTP_CHAT_MAX_TOKENS: int = 512
+    # 已有音频转写：每批先切多少段再开始识别，避免长音频首段长时间无输出
+    QWEN_ASR_FILE_PREPARE_BATCH_SIZE: int = 5
     # ASR 服务可访问的分段 wav URL 前缀（无尾斜杠），端口=本进程静态服务 bind
     QWEN_ASR_FILE_HTTP_PUBLIC_BASE: str = ""
 

@@ -63,6 +63,18 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
     db = SessionLocal()
     tmp_path: Optional[Path] = None
     try:
+        meeting_ws_manager.notify_from_thread(
+            meeting_id,
+            {
+                "type": "local_audio_transcribe_stage",
+                "meeting_id": meeting_id,
+                "audio_id": audio_id,
+                "asr_session_id": asr_id,
+                "status": "processing",
+                "phase": "downloading_audio",
+                "message": "正在准备音频文件…",
+            },
+        )
         tmp_path, _, _ = meeting_audio_service.download_audio_to_temp(
             db, meeting_id, "local", audio_id
         )
@@ -102,9 +114,32 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
                 },
             )
 
+        def _notify_stage(stage: Dict[str, Any]) -> None:
+            message = str(stage.get("message") or "").strip()
+            logger.info(
+                "本地音频分段转写阶段 meeting_id=%s audio_id=%s asr_session_id=%s phase=%s message=%s",
+                meeting_id,
+                audio_id,
+                asr_id,
+                stage.get("phase"),
+                message,
+            )
+            meeting_ws_manager.notify_from_thread(
+                meeting_id,
+                {
+                    "type": "local_audio_transcribe_stage",
+                    "meeting_id": meeting_id,
+                    "audio_id": audio_id,
+                    "asr_session_id": asr_id,
+                    "status": "processing",
+                    **stage,
+                },
+            )
+
         merged, duration = transcribe_audio_file_incremental(
             tmp_path,
             on_progress=_persist_progress,
+            on_stage=_notify_stage,
         )
         row = (
             db.query(database.LocalAsrSession)

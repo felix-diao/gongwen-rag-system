@@ -219,31 +219,24 @@ def _parse_public_base() -> Tuple[str, int]:
     return raw, port
 
 
-def _split_to_chunks(
-    audio_source: Path,
-    work_dir: Path,
-    chunk_sec: float,
-    overlap_sec: float,
-    *,
-    chunks_dir: Optional[Path] = None,
-) -> Tuple[List[Dict[str, Any]], Path, float]:
+def _normalize_audio_to_wav(audio_source: Path, work_dir: Path) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
-    if chunks_dir is None:
-        chunks_dir = work_dir / "chunks"
-    chunks_dir = Path(chunks_dir)
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-
     audio_wav = work_dir / "audio_normalized.wav"
     _run_cmd(
         f'ffmpeg -y -i "{audio_source}" -ar 16000 -ac 1 "{audio_wav}" -loglevel quiet'
     )
+    return audio_wav
 
-    duration = float(
+
+def _probe_audio_duration(audio_wav: Path) -> float:
+    return float(
         _run_cmd(
             f'ffprobe -i "{audio_wav}" -show_entries format=duration -v quiet -of csv="p=0"'
         )
     )
 
+
+def _build_chunk_specs(duration: float, chunk_sec: float, overlap_sec: float) -> List[Dict[str, Any]]:
     step = chunk_sec - overlap_sec
     if step <= 0:
         raise ValueError("QWEN_ASR_CHUNK_SEC 必须大于 QWEN_ASR_OVERLAP_SEC")
@@ -253,23 +246,59 @@ def _split_to_chunks(
     idx = 0
     while start < duration:
         end = min(start + chunk_sec, duration)
-        filename = f"chunk_{idx:04d}.wav"
-        file_path = chunks_dir / filename
-        _run_cmd(
-            f'ffmpeg -y -i "{audio_wav}" -ss {start:.3f} -to {end:.3f} "{file_path}" -loglevel quiet'
-        )
         chunks.append(
             {
                 "idx": idx,
                 "start": round(start, 3),
                 "end": round(end, 3),
-                "file_name": filename,
-                "file_path": str(file_path),
+                "file_name": f"chunk_{idx:04d}.wav",
             }
         )
         start += step
         idx += 1
+    return chunks
 
+
+def _materialize_chunk_files(
+    audio_wav: Path,
+    chunk_specs: List[Dict[str, Any]],
+    chunks_dir: Path,
+) -> List[Dict[str, Any]]:
+    chunks_dir = Path(chunks_dir)
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    materialized: List[Dict[str, Any]] = []
+    for seg in chunk_specs:
+        file_path = chunks_dir / str(seg["file_name"])
+        _run_cmd(
+            f'ffmpeg -y -i "{audio_wav}" -ss {seg["start"]:.3f} -to {seg["end"]:.3f} "{file_path}" -loglevel quiet'
+        )
+        materialized.append(
+            {
+                **seg,
+                "file_path": str(file_path),
+            }
+        )
+    return materialized
+
+
+def _split_to_chunks(
+    audio_source: Path,
+    work_dir: Path,
+    chunk_sec: float,
+    overlap_sec: float,
+    *,
+    chunks_dir: Optional[Path] = None,
+) -> Tuple[List[Dict[str, Any]], Path, float]:
+    if chunks_dir is None:
+        chunks_dir = work_dir / "chunks"
+    chunks_dir = Path(chunks_dir)
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    audio_wav = _normalize_audio_to_wav(audio_source, work_dir)
+    duration = _probe_audio_duration(audio_wav)
+    chunk_specs = _build_chunk_specs(duration, chunk_sec, overlap_sec)
+    chunks = _materialize_chunk_files(audio_wav, chunk_specs, chunks_dir)
     return chunks, audio_wav, duration
 
 
@@ -405,6 +434,7 @@ def _post_one_chunk(
 def transcribe_audio_file_incremental(
     source_audio: Path,
     on_progress: Optional[Callable[[str, int, int], None]] = None,
+    on_stage: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[str, float]:
     """对本地音频文件做分段 HTTP ASR 并拼接全文。返回 (全文, 规范化后时长秒)。"""
     source_audio = Path(source_audio)
@@ -420,6 +450,7 @@ def transcribe_audio_file_incremental(
     max_tokens = int(settings.QWEN_ASR_HTTP_CHAT_MAX_TOKENS or 512)
     chunk_sec = float(settings.QWEN_ASR_CHUNK_SEC or 6.0)
     overlap_sec = float(settings.QWEN_ASR_OVERLAP_SEC or 1.0)
+    prepare_batch_size = max(1, int(settings.QWEN_ASR_FILE_PREPARE_BATCH_SIZE or 5))
 
     work_root = Path(tempfile.mkdtemp(prefix="qwen_asr_inc_"))
     url_path_prefix = uuid.uuid4().hex
@@ -438,36 +469,68 @@ def transcribe_audio_file_incremental(
         serve_parent = ensure_incremental_http_serve_root(bind_port)
         session_http_dir = serve_parent / url_path_prefix
         session_http_dir.mkdir(parents=True, exist_ok=True)
-        chunks, _norm_wav, duration_sec = _split_to_chunks(
-            source_audio,
-            work_root,
-            chunk_sec,
-            overlap_sec,
-            chunks_dir=session_http_dir,
-        )
-        if not chunks:
+        if on_stage:
+            on_stage({"phase": "normalizing", "message": "正在预处理音频格式…"})
+        normalized_wav = _normalize_audio_to_wav(source_audio, work_root)
+        if on_stage:
+            on_stage({"phase": "probing", "message": "正在分析音频时长…"})
+        duration_sec = _probe_audio_duration(normalized_wav)
+        chunk_specs = _build_chunk_specs(duration_sec, chunk_sec, overlap_sec)
+        if not chunk_specs:
             return "", duration_sec
 
         base = public_base.rstrip("/")
-        total_chunks = len(chunks)
-        for seg in chunks:
-            chunk_url = f"{base}/{url_path_prefix}/{seg['file_name']}"
-            try:
-                curr = _post_one_chunk(
-                    session, chat_url, model, headers, chunk_url, timeout, max_tokens
+        total_chunks = len(chunk_specs)
+        for batch_start in range(0, total_chunks, prepare_batch_size):
+            batch = chunk_specs[batch_start : batch_start + prepare_batch_size]
+            batch_no = batch_start // prepare_batch_size + 1
+            batch_from = int(batch[0]["idx"]) + 1
+            batch_to = int(batch[-1]["idx"]) + 1
+            if on_stage:
+                on_stage(
+                    {
+                        "phase": "preparing_batch",
+                        "message": f"正在切分第 {batch_no} 批音频片段（第 {batch_from}-{batch_to}/{total_chunks} 段）…",
+                        "batch_no": batch_no,
+                        "batch_from": batch_from,
+                        "batch_to": batch_to,
+                        "total_chunks": total_chunks,
+                    }
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "分段 ASR 失败 idx=%s url=%s error=%s",
-                    seg["idx"],
-                    chunk_url,
-                    exc,
+            materialized_batch = _materialize_chunk_files(normalized_wav, batch, session_http_dir)
+            if on_stage:
+                on_stage(
+                    {
+                        "phase": "recognizing_batch",
+                        "message": f"正在转写第 {batch_no} 批音频片段（第 {batch_from}-{batch_to}/{total_chunks} 段）…",
+                        "batch_no": batch_no,
+                        "batch_from": batch_from,
+                        "batch_to": batch_to,
+                        "total_chunks": total_chunks,
+                    }
                 )
-                curr = ""
-            prev_text = merged_text
-            merged_text, _ = merge_pair(merged_text, curr)
-            if on_progress and merged_text != prev_text:
-                on_progress(merged_text, int(seg["idx"]), total_chunks)
+            for seg in materialized_batch:
+                chunk_url = f"{base}/{url_path_prefix}/{seg['file_name']}"
+                try:
+                    curr = _post_one_chunk(
+                        session, chat_url, model, headers, chunk_url, timeout, max_tokens
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "分段 ASR 失败 idx=%s url=%s error=%s",
+                        seg["idx"],
+                        chunk_url,
+                        exc,
+                    )
+                    curr = ""
+                prev_text = merged_text
+                merged_text, _ = merge_pair(merged_text, curr)
+                if on_progress and merged_text != prev_text:
+                    on_progress(merged_text, int(seg["idx"]), total_chunks)
+                try:
+                    Path(str(seg["file_path"])).unlink(missing_ok=True)
+                except OSError:
+                    pass
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
         if session_http_dir is not None:
