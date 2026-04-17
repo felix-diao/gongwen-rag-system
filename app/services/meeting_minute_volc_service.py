@@ -80,6 +80,7 @@ class CompressionType:
 
 class _AsrResponse:
     def __init__(self) -> None:
+        self.message_type = 0
         self.code = 0
         self.event = 0
         self.is_last_package = False
@@ -94,6 +95,7 @@ class ResponseParser:
         response = _AsrResponse()
         header_size = msg[0] & 0x0F
         message_type = msg[1] >> 4
+        response.message_type = message_type
         flags = msg[1] & 0x0F
         serialization_method = msg[2] >> 4
         compression_type = msg[2] & 0x0F
@@ -1602,7 +1604,14 @@ class LiveVolcAsrHandler:
 
                     send_task = asyncio.create_task(self._forward_audio(volc_ws, stop_event, seq))
                     recv_task = asyncio.create_task(self._recv_asr_result(volc_ws, stop_event))
-                    await asyncio.wait([send_task, recv_task], return_when=asyncio.ALL_COMPLETED)
+                    try:
+                        await asyncio.gather(send_task, recv_task)
+                    except BaseException:
+                        for t in (send_task, recv_task):
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(send_task, recv_task, return_exceptions=True)
+                        raise
 
             await self._finalize()
         except Exception as exc:  # noqa: BLE001
@@ -1648,10 +1657,38 @@ class LiveVolcAsrHandler:
         async for msg in volc_ws:
             if msg.type != aiohttp.WSMsgType.BINARY:
                 continue
-            resp = ResponseParser.parse_response(msg.data)
+            raw = msg.data
+            resp = ResponseParser.parse_response(raw)
             if resp.code != 0:
                 stop_event.set()
-                raise RuntimeError(f"火山实时 ASR 返回错误 code={resp.code}")
+                preview = raw[:64].hex() if raw else ""
+                extra: Dict[str, Any] = {}
+                if isinstance(resp.payload_msg, dict):
+                    extra = resp.payload_msg
+                logger.error(
+                    "火山实时 ASR 错误帧 meeting_id=%s session_id=%s code=%s message_type=%s "
+                    "payload_keys=%s raw_prefix_hex=%s",
+                    self._meeting_id,
+                    self._session_id,
+                    resp.code,
+                    resp.message_type,
+                    sorted(extra.keys()) if extra else [],
+                    preview,
+                )
+                detail = None
+                if extra:
+                    detail = (
+                        extra.get("message")
+                        or extra.get("error")
+                        or extra.get("err_msg")
+                        or extra.get("detail")
+                    )
+                    if isinstance(detail, dict):
+                        detail = json.dumps(detail, ensure_ascii=False)
+                err_text = f"火山实时 ASR 返回错误 code={resp.code}"
+                if detail:
+                    err_text = f"{err_text} ({detail})"
+                raise RuntimeError(err_text)
             payload = resp.payload_msg
             text = _extract_text(payload) if payload else None
             is_last = bool(resp.is_last_package)
