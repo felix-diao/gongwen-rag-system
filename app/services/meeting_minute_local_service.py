@@ -36,6 +36,7 @@ from app.config import settings
 from app.models import database, schemas
 from app.models.database import SessionLocal
 from app.services.meeting_audio_service import meeting_audio_service
+from app.services.meeting_minute_local_prompt import build_local_minutes_llm_instruction
 from app.services.qwen_asr_incremental_http import (
     asr_http_runtime_params,
     build_asr_requests_session,
@@ -1118,21 +1119,7 @@ class LocalMeetingMinuteService:
     def _call_llm(self, meeting_title: str, transcript: str) -> dict:
         from app.llm_client.generators import get_client
 
-        instruction = (
-            "你是企业会议纪要助手。请严格基于会议转写文本生成会议纪要，并输出严格 JSON。"
-            "不要输出任何解释、前后缀、额外说明或 Markdown 代码块。"
-            '输出格式必须为：{"summary":{"title":"string","paragraph":"string"},"todos":[{"content":"string","executor":"string|null","execution_time":"string|null"}]}'
-            "要求如下："
-            "1. summary.title 必须是简洁明确的会议摘要标题，长度控制在 8-20 个汉字。"
-            "2. summary.paragraph 必须是详细摘要，不能只写一句话。"
-            "3. summary.paragraph 应使用自然中文分段或分点，长度不少于 220 字，通常控制在 220-500 字。"
-            "4. 摘要必须尽量覆盖会议背景或主题、关键讨论点、达成的结论或共识、后续安排或风险提醒。"
-            "5. 如果转写中的信息不足或不明确，不要编造；只总结能够明确判断的内容，并明确说明“转写信息有限”。"
-            "6. todos 只提取转写中明确提到的待办事项；如果没有明确待办，返回空数组 []。"
-            "7. executor 和 execution_time 只有在转写中明确出现时才填写，否则必须为 null。"
-            "8. 不要照抄整段转写，要进行归纳、压缩和重组，但必须保留关键信息。"
-            "9. 只允许输出 JSON 对象。"
-        )
+        instruction = build_local_minutes_llm_instruction()
         user_msg = f"会议标题：{meeting_title}\n\n会议转写文本：\n{transcript}"
         try:
             cli = get_client()
