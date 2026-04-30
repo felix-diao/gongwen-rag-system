@@ -84,13 +84,26 @@ class Conversation(Base):
 class User(Base):
     """用户表"""
     __tablename__ = "users"
-    
+
     user_id = Column(String(64), primary_key=True)
     username = Column(String(256), unique=True, nullable=False)
     hashed_password = Column(String(256), nullable=False)
     department = Column(String(128))
     role = Column(String(64), default="user")
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    needs_password_setup = Column(Boolean, default=False, index=True)  # 新用户需要设置密码
+
+
+class LoginTicket(Base):
+    """一次性登录票据表"""
+    __tablename__ = "login_tickets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticket = Column(String(64), unique=True, nullable=False, index=True)
+    username = Column(String(256), nullable=False, index=True)
+    is_used = Column(Boolean, default=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 # ========== 新增：知识库表 ==========
 class KnowledgeBase(Base):

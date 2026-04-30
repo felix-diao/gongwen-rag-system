@@ -5,6 +5,8 @@ import bcrypt  # 直接使用 bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config import settings
+import secrets
+import string
 
 security = HTTPBearer()
 
@@ -125,7 +127,7 @@ def require_admin_or_owner(
 ) -> dict:
     """
     要求管理员或资源所有者权限（依赖函数版本）
-    
+
     使用方式:
         @router.delete("/knowledge/{item_id}")
         def delete_item(
@@ -135,11 +137,11 @@ def require_admin_or_owner(
         ):
             # 先获取资源
             item = db.query(KnowledgeItem).filter_by(id=item_id).first()
-            
+
             # 检查权限
             if not check_admin_or_owner(current_user, item.user_id):
                 raise HTTPException(status_code=403, detail="无权操作")
-            
+
             # 执行删除
             ...
     """
@@ -149,3 +151,42 @@ def require_admin_or_owner(
             detail="无权访问此资源"
         )
     return current_user
+
+
+def generate_random_password(length: int = 16) -> str:
+    """
+    生成符合密码规则的随机密码
+
+    规则：
+    - 长度：8-72位（默认16位）
+    - 必须包含至少一个大写字母
+    - 必须包含至少一个小写字母
+    - 必须包含至少一个数字
+    - 必须包含至少一个特殊符号 !@#$%^&*
+
+    Args:
+        length: 密码长度，默认16位
+
+    Returns:
+        str: 随机生成的密码
+    """
+    if length < 8:
+        length = 8
+    if length > 72:
+        length = 72
+
+    # 确保包含各类必要字符
+    upper = secrets.choice(string.ascii_uppercase)
+    lower = secrets.choice(string.ascii_lowercase)
+    digit = secrets.choice(string.digits)
+    special = secrets.choice('!@#$%^&*')
+
+    # 剩余字符从所有字符中随机选择
+    all_chars = string.ascii_letters + string.digits + '!@#$%^&*'
+    remaining = length - 4
+    rest = ''.join(secrets.choice(all_chars) for _ in range(remaining))
+
+    # 组合并打乱顺序
+    password = list(upper + lower + digit + special + rest)
+    secrets.SystemRandom().shuffle(password)
+    return ''.join(password)

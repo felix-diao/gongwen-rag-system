@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
-from app.models.database import get_db, User
+from app.models.database import get_db, User, LoginTicket
 from app.models.schemas import (
     UserLogin,
     UserRegister,
@@ -11,15 +11,25 @@ from app.models.schemas import (
     StandardResponse,
     LogoutResponse,
     RegisterResponse,
+    CreateTicketRequest,
+    CreateTicketResponse,
+    RedeemTicketRequest,
+    RedeemTicketResponse,
+    ResetPasswordByUsernameRequest,
+    ResetPasswordByUsernameResponse,
+    SetPasswordRequest,
+    SetPasswordResponse,
 )
 from app.utils.auth import (
-    verify_password, 
-    get_password_hash, 
+    verify_password,
+    get_password_hash,
     create_access_token,
-    get_current_user
+    get_current_user,
+    generate_random_password,
 )
 from app.config import settings
 import uuid
+import secrets
 from app.utils.logger import get_logger
 
 logger = get_logger("admin_api")
@@ -145,7 +155,8 @@ def get_current_user_info(
         "role": user.role,
         "department": user.department,
         "created_at": user.created_at,
-        "is_admin": user.role == "admin"  # 便于前端判断
+        "is_admin": user.role == "admin",  # 便于前端判断
+        "needs_password_setup": getattr(user, 'needs_password_setup', False)  # 新用户需要设置密码
     }
 
 @router.post("/logout", response_model=StandardResponse[LogoutResponse])
@@ -251,6 +262,316 @@ def change_password(
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"服务器错误: {str(e)}"
+        )
+
+
+# ========== 一次性 Ticket 相关接口 ==========
+
+TICKET_EXPIRE_MINUTES = 5  # ticket 有效期 5 分钟
+
+
+@router.post("/create-ticket", response_model=StandardResponse[CreateTicketResponse])
+def create_ticket(
+    ticket_data: CreateTicketRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    创建一次性登录 ticket
+
+    用于对接平台无感知登录：
+    - 如果用户存在，直接创建 ticket
+    - 如果用户不存在，自动注册用户（生成随机密码）并创建 ticket
+
+    ticket 有效期 5 分钟，只能使用一次
+    """
+    try:
+        username = ticket_data.username.strip()
+
+        # 检查用户是否存在
+        user = db.query(User).filter(User.username == username).first()
+
+        if not user:
+            # 用户不存在，自动注册
+            user_id = f"user_{uuid.uuid4().hex[:16]}"
+            random_password = generate_random_password()
+            hashed_password = get_password_hash(random_password)
+
+            user = User(
+                user_id=user_id,
+                username=username,
+                hashed_password=hashed_password,
+                department=None,
+                role="user",
+                needs_password_setup=True  # 新用户需要设置密码
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            logger.info(f"自动注册新用户: {username}, user_id: {user_id}")
+
+        # 生成一次性 ticket
+        ticket_str = f"ticket_{secrets.token_hex(24)}"
+        expires_at = datetime.utcnow() + timedelta(minutes=TICKET_EXPIRE_MINUTES)
+
+        login_ticket = LoginTicket(
+            ticket=ticket_str,
+            username=username,
+            is_used=False,
+            expires_at=expires_at
+        )
+        db.add(login_ticket)
+        db.commit()
+
+        logger.info(f"创建 ticket: {ticket_str}, 用户: {username}, 过期时间: {expires_at}")
+
+        return StandardResponse(
+            success=True,
+            data=CreateTicketResponse(
+                ticket=ticket_str,
+                expires_in=TICKET_EXPIRE_MINUTES * 60
+            ),
+            message="ticket 创建成功"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"创建 ticket 失败: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建 ticket 失败: {str(e)}"
+        )
+
+
+@router.post("/redeem-ticket", response_model=StandardResponse[RedeemTicketResponse])
+def redeem_ticket(
+    ticket_data: RedeemTicketRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    兑换一次性登录 ticket
+
+    用于前端自动登录：
+    - 验证 ticket 是否有效（存在、未使用、未过期）
+    - 标记 ticket 为已使用
+    - 返回 JWT token
+    """
+    try:
+        ticket_str = ticket_data.ticket.strip()
+
+        # 查询 ticket
+        login_ticket = db.query(LoginTicket).filter(LoginTicket.ticket == ticket_str).first()
+
+        if not login_ticket:
+            return StandardResponse(
+                success=False,
+                data=None,
+                message="ticket 不存在"
+            )
+
+        # 检查是否已使用
+        if login_ticket.is_used:
+            return StandardResponse(
+                success=False,
+                data={"username": login_ticket.username},
+                message="ticket 已被使用"
+            )
+
+        # 检查是否过期
+        if datetime.utcnow() > login_ticket.expires_at:
+            return StandardResponse(
+                success=False,
+                data={"username": login_ticket.username},
+                message="ticket 已过期"
+            )
+
+        # 查询用户
+        user = db.query(User).filter(User.username == login_ticket.username).first()
+        if not user:
+            return StandardResponse(
+                success=False,
+                data=None,
+                message="关联用户不存在"
+            )
+
+        # 标记 ticket 为已使用
+        login_ticket.is_used = True
+        db.commit()
+
+        # 生成 JWT token
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={
+                "sub": user.user_id,
+                "username": user.username,
+                "role": user.role
+            },
+            expires_delta=access_token_expires
+        )
+
+        logger.info(f"兑换 ticket 成功: {ticket_str}, 用户: {user.username}")
+
+        return StandardResponse(
+            success=True,
+            data=RedeemTicketResponse(
+                access_token=access_token,
+                token_type="bearer",
+                user_id=user.user_id,
+                username=user.username
+            ),
+            message="登录成功"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"兑换 ticket 失败: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"兑换 ticket 失败: {str(e)}"
+        )
+
+
+@router.post("/reset-password-by-username", response_model=StandardResponse[ResetPasswordByUsernameResponse])
+def reset_password_by_username(
+    password_data: ResetPasswordByUsernameRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    根据用户名重置密码
+
+    用于对接平台为用户设置密码（用户首次登录后可使用此接口设置自己的密码）
+    """
+    try:
+        username = password_data.username.strip()
+
+        # 查询用户
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            return StandardResponse(
+                success=False,
+                data=None,
+                message="用户不存在"
+            )
+
+        # 更新密码
+        try:
+            new_hashed_password = get_password_hash(password_data.new_password)
+            user.hashed_password = new_hashed_password
+            db.commit()
+            db.refresh(user)
+        except ValueError as e:
+            db.rollback()
+            return StandardResponse(
+                success=False,
+                data=None,
+                message=str(e)
+            )
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"密码更新失败: {str(e)}"
+            )
+
+        logger.info(f"重置密码成功: {username}")
+
+        return StandardResponse(
+            success=True,
+            data=ResetPasswordByUsernameResponse(
+                message="密码重置成功",
+                user_id=user.user_id,
+                username=user.username,
+                changed_at=datetime.utcnow()
+            ),
+            message="密码重置成功"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"重置密码失败: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"服务器错误: {str(e)}"
+        )
+
+
+@router.post("/set-password", response_model=StandardResponse[SetPasswordResponse])
+def set_password(
+    password_data: SetPasswordRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    新用户设置密码（不需要旧密码）
+
+    用于通过 ticket 登录的新用户首次设置密码：
+    - 只有 needs_password_setup=True 的用户才能调用
+    - 设置密码后，needs_password_setup 自动设为 False
+    """
+    try:
+        # 获取用户
+        user = db.query(User).filter(User.user_id == current_user["user_id"]).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="用户不存在"
+            )
+
+        # 检查是否需要设置密码
+        if not getattr(user, 'needs_password_setup', False):
+            return StandardResponse(
+                success=False,
+                data=None,
+                message="您已设置过密码，请使用修改密码功能"
+            )
+
+        # 更新密码
+        try:
+            new_hashed_password = get_password_hash(password_data.new_password)
+            user.hashed_password = new_hashed_password
+            user.needs_password_setup = False  # 标记已设置密码
+            db.commit()
+            db.refresh(user)
+        except ValueError as e:
+            db.rollback()
+            return StandardResponse(
+                success=False,
+                data=None,
+                message=str(e)
+            )
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"密码设置失败: {str(e)}"
+            )
+
+        logger.info(f"新用户设置密码成功: {user.username}")
+
+        return StandardResponse(
+            success=True,
+            data=SetPasswordResponse(
+                message="密码设置成功",
+                user_id=user.user_id,
+                username=user.username,
+                changed_at=datetime.utcnow()
+            ),
+            message="密码设置成功"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"设置密码失败: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"服务器错误: {str(e)}"

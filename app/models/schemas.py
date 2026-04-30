@@ -1001,6 +1001,111 @@ class LocalMeetingMinutesSessionUpdate(BaseModel):
     todos: Optional[List[LocalSessionTodoItem]] = None
 
 
+# ========== 一次性 Ticket 相关 Schema ==========
+
+class CreateTicketRequest(BaseModel):
+    """创建 ticket 请求"""
+    username: str = Field(..., min_length=3, max_length=50, description="用户名")
+
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        """验证用户名"""
+        v = v.strip()
+        if not v:
+            raise ValueError('用户名不能为空或只包含空格')
+        if v.isdigit():
+            raise ValueError('用户名不能为纯数字')
+        return v
+
+
+class CreateTicketResponse(BaseData):
+    """创建 ticket 响应"""
+    ticket: str = Field(..., description="一次性票据")
+    expires_in: int = Field(..., description="有效期（秒）")
+
+
+class RedeemTicketRequest(BaseModel):
+    """兑换 ticket 请求"""
+    ticket: str = Field(..., min_length=1, description="一次性票据")
+
+
+class RedeemTicketResponse(BaseData):
+    """兑换 ticket 响应"""
+    access_token: Optional[str] = None
+    token_type: str = "bearer"
+    user_id: Optional[str] = None
+    username: Optional[str] = None
+
+
+class ResetPasswordByUsernameRequest(BaseModel):
+    """根据用户名重置密码请求"""
+    username: str = Field(..., min_length=3, max_length=50, description="用户名")
+    new_password: str = Field(..., min_length=8, max_length=72, description="新密码")
+
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        """验证用户名"""
+        v = v.strip()
+        if not v:
+            raise ValueError('用户名不能为空或只包含空格')
+        if v.isdigit():
+            raise ValueError('用户名不能为纯数字')
+        return v
+
+    @field_validator('new_password')
+    @classmethod
+    def validate_password_strength(cls, v):
+        """验证密码强度"""
+        if len(v) < 8:
+            raise ValueError('密码长度至少8位')
+        if not any(char.isdigit() for char in v):
+            raise ValueError('密码必须包含至少一个数字')
+        if not any(char.isupper() for char in v):
+            raise ValueError('密码必须包含至少一个大写字母')
+        if not any(char.islower() for char in v):
+            raise ValueError('密码必须包含至少一个小写字母')
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
+            raise ValueError('密码必须包含至少一个特殊符号(!@#$%^&*等)')
+        return v
+
+
+class ResetPasswordByUsernameResponse(BaseData):
+    """根据用户名重置密码响应"""
+    message: str
+    user_id: str
+    username: str
+    changed_at: datetime
+
+
+class SetPasswordRequest(BaseModel):
+    """新用户设置密码请求（不需要旧密码）"""
+    new_password: str = Field(..., min_length=8, max_length=72, description="新密码")
+
+    @field_validator('new_password')
+    @classmethod
+    def validate_password_strength(cls, v):
+        """验证密码强度"""
+        if len(v) < 8:
+            raise ValueError('密码长度至少8位')
+        if not any(char.isdigit() for char in v):
+            raise ValueError('密码必须包含至少一个数字')
+        if not any(char.isupper() for char in v):
+            raise ValueError('密码必须包含至少一个大写字母')
+        if not any(char.islower() for char in v):
+            raise ValueError('密码必须包含至少一个小写字母')
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/~`]', v):
+            raise ValueError('密码必须包含至少一个特殊符号(!@#$%^&*等)')
+        return v
+
+
+class SetPasswordResponse(BaseData):
+    """新用户设置密码响应"""
+    message: str
+    user_id: str
+    username: str
+    changed_at: datetime
 
 
 # 统一保留 schemas.py 作为唯一 schema 入口
