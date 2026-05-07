@@ -2,13 +2,13 @@
 
 import pytz
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 from dateutil import parser
-from sqlalchemy import text
+from sqlalchemy import case
 from sqlalchemy.orm import Session
 
-from app.models import schemas
+from app.models import database, schemas
 
 SH = pytz.timezone("Asia/Shanghai")
 
@@ -32,27 +32,9 @@ def to_beijing_naive(dt_val: str | datetime | None) -> Optional[datetime]:
 class MeetingService:
     """会议主表服务。"""
 
-    _SELECT_COLUMNS = """
-        id,
-        title,
-        date,
-        location,
-        host,
-        participants,
-        content_text,
-        meeting_url,
-        status,
-        creator_id,
-        created_at,
-        updated_at
-    """
-
-    @classmethod
-    def _to_schema(cls, row: Any) -> schemas.MeetingInDB:
-        if row is None:
-            raise ValueError("会议记录不存在")
-        mapping = row._mapping if hasattr(row, "_mapping") else row
-        return schemas.MeetingInDB.model_validate(dict(mapping))
+    @staticmethod
+    def _to_schema(row: database.Meeting) -> schemas.MeetingInDB:
+        return schemas.MeetingInDB.model_validate(row)
 
     def create_meeting(
         self,
@@ -61,55 +43,19 @@ class MeetingService:
         creator_id: Optional[str] = None,
     ) -> schemas.MeetingInDB:
         data = meeting.model_dump()
-        if "date" in data:
-            data["date"] = to_beijing_naive(data["date"])
-        data["creator_id"] = creator_id
-
-        row = db.execute(
-            text(
-                f"""
-                INSERT INTO meetings (
-                    title,
-                    date,
-                    location,
-                    host,
-                    participants,
-                    content_text,
-                    meeting_url,
-                    status,
-                    creator_id
-                )
-                VALUES (
-                    :title,
-                    :date,
-                    :location,
-                    :host,
-                    :participants,
-                    :content_text,
-                    :meeting_url,
-                    :status,
-                    :creator_id
-                )
-                RETURNING {self._SELECT_COLUMNS}
-                """
-            ),
-            data,
-        ).first()
+        data["date"] = to_beijing_naive(data["date"])
+        row = database.Meeting(creator_id=creator_id, **data)
+        db.add(row)
         db.commit()
+        db.refresh(row)
         return self._to_schema(row)
 
     def get_meeting(self, db: Session, meeting_id: int) -> Optional[schemas.MeetingInDB]:
-        row = db.execute(
-            text(
-                f"""
-                SELECT {self._SELECT_COLUMNS}
-                FROM meetings
-                WHERE id = :meeting_id
-                LIMIT 1
-                """
-            ),
-            {"meeting_id": meeting_id},
-        ).first()
+        row = (
+            db.query(database.Meeting)
+            .filter(database.Meeting.id == meeting_id)
+            .first()
+        )
         return self._to_schema(row) if row else None
 
     def update_meeting(
@@ -122,46 +68,47 @@ class MeetingService:
         if not data:
             return self.get_meeting(db, meeting_id)
 
+        row = (
+            db.query(database.Meeting)
+            .filter(database.Meeting.id == meeting_id)
+            .first()
+        )
+        if not row:
+            return None
+
         if "date" in data:
             data["date"] = to_beijing_naive(data["date"])
+        for key, value in data.items():
+            setattr(row, key, value)
 
-        assignments = ", ".join(f"{key} = :{key}" for key in data)
-        params = {"meeting_id": meeting_id, **data}
-        row = db.execute(
-            text(
-                f"""
-                UPDATE meetings
-                SET {assignments}, updated_at = NOW()
-                WHERE id = :meeting_id
-                RETURNING {self._SELECT_COLUMNS}
-                """
-            ),
-            params,
-        ).first()
         db.commit()
-        return self._to_schema(row) if row else None
+        db.refresh(row)
+        return self._to_schema(row)
 
     def delete_meeting(self, db: Session, meeting_id: int) -> bool:
-        result = db.execute(
-            text("DELETE FROM meetings WHERE id = :meeting_id"),
-            {"meeting_id": meeting_id},
+        row = (
+            db.query(database.Meeting)
+            .filter(database.Meeting.id == meeting_id)
+            .first()
         )
+        if not row:
+            return False
+        db.delete(row)
         db.commit()
-        return result.rowcount > 0
+        return True
 
     def get_meetings_by_creator(self, db: Session, creator_id: str) -> list[schemas.MeetingInDB]:
-        rows = db.execute(
-            text(
-                f"""
-                SELECT {self._SELECT_COLUMNS}
-                FROM meetings
-                WHERE creator_id = :creator_id
-                ORDER BY CASE WHEN date IS NULL THEN 1 ELSE 0 END, date DESC, id DESC
-                """
-            ),
-            {"creator_id": creator_id},
-        ).all()
-        return [self._to_schema(row) for row in rows]
+        rows = (
+            db.query(database.Meeting)
+            .filter(database.Meeting.creator_id == creator_id)
+            .order_by(
+                case((database.Meeting.date.is_(None), 1), else_=0),
+                database.Meeting.date.desc(),
+                database.Meeting.id.desc(),
+            )
+            .all()
+        )
+        return [self._to_schema(r) for r in rows]
 
 
 meeting_service = MeetingService()
