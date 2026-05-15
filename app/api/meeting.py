@@ -15,7 +15,7 @@ from app.models.schemas import StandardResponse
 from app.services.meeting_audio_service import meeting_audio_service
 from app.services.meeting_minute_local_service import local_meeting_minute_service
 from app.services.meeting_minute_volc_service import volc_meeting_minute_service
-from app.services.meeting_service import meeting_service
+from app.services.meeting_service import DuplicateMeetingError, meeting_service
 from app.utils.auth import get_current_user
 from app.utils.logger import get_logger
 
@@ -36,7 +36,11 @@ def create_meeting(
 ):
     user_id = current_user.get("user_id")
     logger.info("创建会议请求 title=%s creator_id=%s", meeting.title, user_id)
-    result = meeting_service.create_meeting(db, meeting, creator_id=user_id)
+    try:
+        result = meeting_service.create_meeting(db, meeting, creator_id=user_id)
+    except DuplicateMeetingError as e:
+        logger.warning("创建会议失败：重复 title=%s creator_id=%s", meeting.title, user_id)
+        raise HTTPException(status_code=409, detail=e.message) from e
     logger.info("创建会议成功 meeting_id=%s creator_id=%s", result.id, user_id)
     return StandardResponse(success=True, data=result, message="会议创建成功")
 
@@ -91,7 +95,11 @@ def update_meeting(
     current_user: dict = Depends(get_current_user),
 ):
     logger.info("更新会议请求 meeting_id=%s fields=%s", meeting_id, sorted(meeting.model_fields_set))
-    db_meeting = meeting_service.update_meeting(db, meeting_id, meeting)
+    try:
+        db_meeting = meeting_service.update_meeting(db, meeting_id, meeting)
+    except DuplicateMeetingError as e:
+        logger.warning("更新会议失败：重复 meeting_id=%s", meeting_id)
+        raise HTTPException(status_code=409, detail=e.message) from e
     if not db_meeting:
         logger.warning("更新会议失败：会议不存在 meeting_id=%s", meeting_id)
         raise HTTPException(status_code=404, detail="会议未找到")
