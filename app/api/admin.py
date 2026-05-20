@@ -305,7 +305,7 @@ def create_ticket(
                 hashed_password=hashed_password,
                 department=None,
                 role="user",
-                needs_password_setup=True  # 新用户需要设置密码
+                needs_password_setup=False
             )
             db.add(user)
             db.commit()
