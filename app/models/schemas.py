@@ -156,6 +156,8 @@ class ConversationCreate(BaseModel):
     answer: str
     weight: float = 0.8
     liked: bool = False
+    pdf_url: Optional[str] = None
+    word_url: Optional[str] = None
 
 
 class ConversationResponse(BaseModel):
@@ -167,6 +169,8 @@ class ConversationResponse(BaseModel):
     answer: str
     weight: float
     liked: bool
+    pdf_url: Optional[str] = None
+    word_url: Optional[str] = None
     created_at: datetime
 
 

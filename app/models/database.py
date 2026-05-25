@@ -78,6 +78,8 @@ class Conversation(Base):
     answer = Column(Text, nullable=False)
     weight = Column(Float, default=0.8)
     liked = Column(Boolean, default=False)
+    pdf_url = Column(String(512), nullable=True)
+    word_url = Column(String(512), nullable=True)
     valid = Column(Boolean, default=True)
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
 

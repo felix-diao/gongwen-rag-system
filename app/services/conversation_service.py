@@ -63,7 +63,9 @@ class ConversationService:
             query=conv_data.query,
             answer=conv_data.answer,
             weight=conv_data.weight,
-            liked=conv_data.liked
+            liked=conv_data.liked,
+            pdf_url=getattr(conv_data, 'pdf_url', None),
+            word_url=getattr(conv_data, 'word_url', None)
         )
         db.add(db_conv)
         db.commit()

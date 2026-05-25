@@ -97,6 +97,8 @@ async def create_conversation(
                 answer=new_conv.answer,
                 weight=new_conv.weight,
                 liked=new_conv.liked,
+                pdf_url=new_conv.pdf_url,
+                word_url=new_conv.word_url,
                 created_at=new_conv.created_at
             ),
             message="会话创建成功"
@@ -134,6 +136,8 @@ def list_conversations(
                     answer=conv.answer,
                     weight=conv.weight,
                     liked=conv.liked,
+                    pdf_url=conv.pdf_url,
+                    word_url=conv.word_url,
                     created_at=conv.created_at
                 )
                 for conv in conversations
@@ -171,6 +175,8 @@ def get_conversation(
             answer=conversation.answer,
             weight=conversation.weight,
             liked=conversation.liked,
+            pdf_url=conversation.pdf_url,
+            word_url=conversation.word_url,
             created_at=conversation.created_at
         ),
         message="获取成功"

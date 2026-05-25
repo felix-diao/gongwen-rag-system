@@ -52,7 +52,9 @@ async def log_conversation_background(
     user_id: str,
     query: str,
     answer: str,
-    weight: float = 0.8
+    weight: float = 0.8,
+    pdf_url: Optional[str] = None,
+    word_url: Optional[str] = None
 ):
     """后台记录会话，不阻塞主流程"""
     try:
@@ -61,7 +63,9 @@ async def log_conversation_background(
             query=query,
             answer=answer,
             weight=weight,
-            liked=False
+            liked=False,
+            pdf_url=pdf_url,
+            word_url=word_url
         )
         await conversation_service.create_conversation(db, conv_data)
         logger.info(f"✓ 会话已记录: user={user_id}")
@@ -638,7 +642,9 @@ async def document_write(
             user_id=current_user_id,
             query=query_record,
             answer=document_string,
-            weight=0.8
+            weight=0.8,
+            pdf_url=pdf_preview_path,
+            word_url=docx_preview_path
         )
 
         # ✅ 立即返回响应（不等待会话记录完成）
@@ -820,7 +826,9 @@ async def document_optimize(
             user_id=current_user["user_id"],
             query=query_record,
             answer=str_result,
-            weight=0.8
+            weight=0.8,
+            pdf_url=pdf_preview_path,
+            word_url=docx_preview_path
         )
 
         # ✅ 立即返回响应（不等待会话记录完成）
