@@ -293,7 +293,7 @@ def optimize_document(content: str, optimization_type: str = "all", custom_instr
     user_prompt = (
         f"{optimization_requirement}\n\n"
         f"原文：\n{content}\n\n"
-        f"要求：直接输出优化后的文本，不要添加'以下是优化后的版本'、'优化结果如下'等说明文字。"
+        f"要求：严格按照系统提示的JSON格式输出优化后的公文内容，只输出JSON，不要添加任何说明文字或markdown代码块标记。"
     )
 
     messages = [

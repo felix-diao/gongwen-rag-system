@@ -16,6 +16,7 @@ from app.services.rag_service import rag_service
 from app.services.embedding_service import embedding_service
 from app.models.schemas import RAGRequest
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from app.models.database import get_db
 from app.utils.auth import get_current_user
@@ -764,10 +765,12 @@ async def document_optimize(
             custom_instruction=req.customInstruction
         )
         # print(f"optimized_text: {optimized_text}")
-        lines = optimized_text.splitlines()
-        new_s = "\n".join(lines[1:-1])
+        # 从 LLM 输出中提取 JSON 对象
+        json_match = re.search(r'\{[\s\S]*\}', optimized_text)
+        if not json_match:
+            raise ValueError(f"未能从优化结果中提取JSON对象")
         try:
-            document_payload = json.loads(new_s)
+            document_payload = json.loads(json_match.group())
             lines = []
             for v in document_payload.values():
                 if isinstance(v, list):
