@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 from app.models.database import get_db, User, LoginTicket
@@ -24,6 +24,7 @@ from app.utils.auth import (
     verify_password,
     get_password_hash,
     create_access_token,
+    decode_access_token,
     get_current_user,
     generate_random_password,
 )
@@ -349,6 +350,7 @@ def create_ticket(
 
 @router.post("/redeem-ticket", response_model=StandardResponse[RedeemTicketResponse])
 def redeem_ticket(
+    request: Request,
     ticket_data: RedeemTicketRequest,
     db: Session = Depends(get_db)
 ):
@@ -397,6 +399,21 @@ def redeem_ticket(
                 data=None,
                 message="关联用户不存在"
             )
+
+        # 从 Authorization header 提取当前 token，校验 username 是否与 ticket 一致
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            try:
+                token_str = auth_header[len("Bearer "):]
+                token_payload = decode_access_token(token_str)
+                token_username = token_payload.get("username")
+                if token_username and token_username != login_ticket.username:
+                    logger.info(
+                        f"Token 用户 ({token_username}) 与 Ticket 用户 ({login_ticket.username}) 不一致，"
+                        f"以 Ticket 为准更新 Access Token"
+                    )
+            except Exception:
+                pass
 
         # 标记 ticket 为已使用
         login_ticket.is_used = True

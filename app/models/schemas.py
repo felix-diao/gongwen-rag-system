@@ -1030,9 +1030,7 @@ class CreateTicketResponse(BaseData):
 
 
 class RedeemTicketRequest(BaseModel):
-    """兑换 ticket 请求"""
     ticket: str = Field(..., min_length=1, description="一次性票据")
-
 
 class RedeemTicketResponse(BaseData):
     """兑换 ticket 响应"""
