@@ -21,26 +21,33 @@ class LLMService:
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 2000,
-        stream: bool = False
+        stream: bool = False,
+        user_id: Optional[str] = None,
     ) -> str:
         """
         通用聊天接口
-        
+
         Args:
             messages: 对话消息列表 [{"role": "user", "content": "..."}]
             model: 模型名称（默认使用配置的模型）
             temperature: 温度参数
             max_tokens: 最大 token 数
             stream: 是否流式输出
-        
+            user_id: 可选用户 ID，用于 token 追踪
+
         Returns:
             生成的回复文本
         """
+        model_name = model or self.default_model
+        request_chars = sum(len(m.get("content", "")) for m in messages)
+        t_start = None
         try:
+            import time
+            t_start = time.time()
             response = await self.client.post(
                 self.api_url,
                 json={
-                    "model": model or self.default_model,
+                    "model": model_name,
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
@@ -48,15 +55,52 @@ class LLMService:
                 },
                 headers={"Authorization": f"Bearer {self.api_key}"}
             )
-            
+            duration_ms = int((time.time() - t_start) * 1000) if t_start else None
+
             response.raise_for_status()
             result = response.json()
             answer = result["choices"][0]["message"]["content"]
-            
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+
+            # 记录 token 消耗
+            try:
+                from app.services.token_tracker import token_tracker
+                token_tracker.record(
+                    user_id=user_id,
+                    api_category="llm",
+                    api_endpoint=self.api_url,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    request_chars=request_chars,
+                    duration_ms=duration_ms,
+                )
+            except Exception:
+                pass
+
             logger.info(f"LLM 调用成功，生成 {len(answer)} 字符")
             return answer
-            
+
         except Exception as e:
+            duration_ms = int((time.time() - t_start) * 1000) if t_start else None
+            try:
+                from app.services.token_tracker import token_tracker
+                token_tracker.record(
+                    user_id=user_id,
+                    api_category="llm",
+                    api_endpoint=self.api_url,
+                    model=model_name,
+                    request_chars=request_chars,
+                    duration_ms=duration_ms,
+                    status="error",
+                    error_msg=str(e)[:500],
+                )
+            except Exception:
+                pass
             logger.error(f"LLM 调用失败: {e}")
             raise RuntimeError(f"LLM 服务错误: {str(e)}")
     
@@ -65,26 +109,37 @@ class LLMService:
         messages: List[Dict[str, str]],
         model: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 2000
+        max_tokens: int = 2000,
+        user_id: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """
         流式聊天接口
-        
+
         Args:
             messages: 对话消息
             model: 模型名称
             temperature: 温度参数
             max_tokens: 最大 token 数
-        
+            user_id: 可选用户 ID，用于 token 追踪
+
         Yields:
             逐个返回生成的文本片段
         """
+        model_name = model or self.default_model
+        request_chars = sum(len(m.get("content", "")) for m in messages)
+        t_start = None
+        full_text = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
         try:
+            import time
+            t_start = time.time()
             async with self.client.stream(
                 "POST",
                 self.api_url,
                 json={
-                    "model": model or self.default_model,
+                    "model": model_name,
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
@@ -93,14 +148,14 @@ class LLMService:
                 headers={"Authorization": f"Bearer {self.api_key}"}
             ) as response:
                 response.raise_for_status()
-                
+
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         data = line[6:]  # 去掉 "data: " 前缀
-                        
+
                         if data == "[DONE]":
                             break
-                        
+
                         try:
                             import json
                             chunk = json.loads(data)
@@ -108,13 +163,59 @@ class LLMService:
                                 delta = chunk["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
                                 if content:
+                                    full_text += content
                                     yield content
+                            # 部分流式端点会在最后一个 chunk 带 usage
+                            usage = chunk.get("usage")
+                            if usage and isinstance(usage, dict):
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                completion_tokens = usage.get("completion_tokens", 0)
+                                total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
                         except json.JSONDecodeError:
                             continue
-            
+
+            duration_ms = int((time.time() - t_start) * 1000) if t_start else None
+
+            # 流式通常不返回 usage，用字符数估算
+            if not total_tokens:
+                prompt_tokens = max(1, int(request_chars / 1.5))
+                completion_tokens = max(1, int(len(full_text) / 1.5))
+                total_tokens = prompt_tokens + completion_tokens
+
+            try:
+                from app.services.token_tracker import token_tracker
+                token_tracker.record(
+                    user_id=user_id,
+                    api_category="llm",
+                    api_endpoint=self.api_url,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    request_chars=request_chars,
+                    duration_ms=duration_ms,
+                )
+            except Exception:
+                pass
+
             logger.info("流式输出完成")
-            
+
         except Exception as e:
+            duration_ms = int((time.time() - t_start) * 1000) if t_start else None
+            try:
+                from app.services.token_tracker import token_tracker
+                token_tracker.record(
+                    user_id=user_id,
+                    api_category="llm",
+                    api_endpoint=self.api_url,
+                    model=model_name,
+                    request_chars=request_chars,
+                    duration_ms=duration_ms,
+                    status="error",
+                    error_msg=str(e)[:500],
+                )
+            except Exception:
+                pass
             logger.error(f"流式调用失败: {e}")
             raise RuntimeError(f"LLM 流式服务错误: {str(e)}")
     

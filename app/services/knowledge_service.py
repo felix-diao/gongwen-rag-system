@@ -403,7 +403,7 @@ class KnowledgeService:
         
         # 检查文件格式
         file_ext_lower = file_ext.lower()
-        supported_types = ['.txt', '.md', '.docx', '.pdf']
+        supported_types = ['.txt', '.md', '.doc', '.docx', '.pdf']
         
         if file_ext_lower not in supported_types:
             item.status = "completed"

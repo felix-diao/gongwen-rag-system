@@ -1,6 +1,6 @@
 # app/routers/document.py
 # app/routers/document.py
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from app.services.document_service import DocumentService
 from app.models.schemas import (
     DocumentWriteRequest,
@@ -34,12 +34,16 @@ import platform
 import os
 import re
 import random
+import tempfile
 from typing import Optional, Dict, Any
+
+from pydantic import BaseModel
 from app.models.schemas import AIRateRequest, AIRateResponse
 from app.services.ai_rate_service1 import compute_ai_rate
 from app.models.schemas import ConversationCreate  # 新增导入
 from app.services.conversation_service import conversation_service  # 新增导入
 from app.utils.logger import get_logger
+from app.utils.text_processor import TextProcessor
 from fastapi import BackgroundTasks
 
 logger = get_logger("document_api")
@@ -861,6 +865,57 @@ async def document_ai_rate(req: AIRateRequest):
     """
     ai_rate = compute_ai_rate(req.content)
     return AIRateResponse(ai_rate=ai_rate)
+
+
+class MaterialExtractResponse(BaseModel):
+    """素材提取响应。"""
+    filename: str
+    text: str
+    char_count: int
+
+
+@router.post("/extract-materials", response_model=StandardResponse[list[MaterialExtractResponse]])
+async def extract_materials(
+    files: list[UploadFile] = File(..., description="素材文件（txt/pdf/docx）"),
+    current_user: dict = Depends(get_current_user),
+):
+    """上传写作素材文件，提取文本内容用于公文生成的参考资料。
+
+    支持格式：.txt / .pdf / .docx
+    每个文件返回文件名和提取的文本内容。
+    """
+    processor = TextProcessor()
+    results: list[MaterialExtractResponse] = []
+    tmp_path: Optional[Path] = None
+    try:
+        for f in files:
+            suffix = Path(f.filename or "_.txt").suffix.lower()
+            if suffix not in (".txt", ".md", ".doc", ".docx", ".pdf"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"不支持的文件格式: {suffix}，仅支持 .txt / .md / .doc / .docx / .pdf",
+                )
+            raw = await f.read()
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(raw)
+                tmp_path = Path(tmp.name)
+            text = processor.extract_text(str(tmp_path))
+            results.append(MaterialExtractResponse(
+                filename=f.filename or "unknown",
+                text=text,
+                char_count=len(text),
+            ))
+            tmp_path.unlink(missing_ok=True)
+            tmp_path = None
+        return StandardResponse(success=True, data=results, message="素材提取成功")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"素材提取失败: {e}")
+        raise HTTPException(status_code=500, detail=f"素材提取失败: {str(e)}")
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 # # 使用示例

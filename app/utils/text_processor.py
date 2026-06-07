@@ -1,3 +1,8 @@
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import List, Dict
 import re
 from app.config import settings
@@ -15,10 +20,10 @@ class TextProcessor:
     def extract_text(self, file_path: str) -> str:
         """从文件提取文本"""
         logger.info(f"开始解析文件: {file_path}")
-        if file_path.endswith('.txt'):
+        if file_path.endswith('.txt') or file_path.endswith('.md'):
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read()
-        
+
         elif file_path.endswith('.docx'):
             try:
                 from docx import Document
@@ -29,6 +34,10 @@ class TextProcessor:
             except ImportError:
                 raise ValueError("需要安装 python-docx: pip install python-docx")
         
+        elif file_path.endswith('.doc'):
+            # 旧版 .doc 通过 LibreOffice 转 .docx 再解析
+            return self._extract_doc_via_libreoffice(file_path)
+
         elif file_path.endswith('.pdf'):
             try:
                 import PyPDF2
@@ -44,6 +53,37 @@ class TextProcessor:
             logger.warning(f"不支持的文件格式: {file_path}")
             raise ValueError(f"不支持的文件格式: {file_path}")
     
+    def _extract_doc_via_libreoffice(self, file_path: str) -> str:
+        """通过 LibreOffice headless 将 .doc 转为 .docx 再提取文本。"""
+        logger.info(f"尝试 LibreOffice 转换 .doc: {file_path}")
+        tmp_dir = None
+        try:
+            soffice = shutil.which("soffice") or shutil.which("libreoffice")
+            if not soffice:
+                raise RuntimeError("未找到 LibreOffice，无法解析 .doc 文件，请安装 LibreOffice")
+            tmp_dir = tempfile.mkdtemp()
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "docx", "--outdir", tmp_dir, file_path],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            src_name = Path(file_path).stem
+            converted = Path(tmp_dir) / f"{src_name}.docx"
+            if not converted.exists():
+                raise RuntimeError(f"LibreOffice 转换后未找到输出文件: {converted}")
+            from docx import Document
+            doc = Document(str(converted))
+            text = '\n'.join([para.text for para in doc.paragraphs])
+            logger.info(f"LibreOffice 转换 .doc 成功: {file_path}，提取 {len(text)} 字符")
+            return text
+        except ImportError:
+            raise RuntimeError("需要安装 python-docx: pip install python-docx")
+        finally:
+            if tmp_dir and os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def split_text(self, text: str) -> List[Dict]:
         """智能分块"""
         paragraphs = re.split(r'\n\s*\n', text)

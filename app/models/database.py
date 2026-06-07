@@ -206,6 +206,7 @@ class Meeting(Base):
     content_text = Column(Text, nullable=True)
     meeting_url = Column(String(512), nullable=True)
     status = Column(String(64), nullable=True, default="created")
+    provider = Column(String(16), nullable=False, default="volc", index=True)
     creator_id = Column(String(64), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
@@ -458,6 +459,26 @@ class LocalMeetingMinutesSession(Base):
     todos_json = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TokenUsageRecord(Base):
+    """Token 消耗记录表 —— 统一追踪所有 LLM API 调用的 token 用量。"""
+    __tablename__ = "token_usage_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), index=True, nullable=True)
+    api_category = Column(String(32), nullable=False, index=True, comment="llm / volc_miaoji / volc_asr / qwen_asr")
+    api_endpoint = Column(String(256), nullable=False)
+    model = Column(String(128), nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    request_chars = Column(Integer, default=0, comment="请求字符数，API 不返回 usage 时的回退估算")
+    duration_ms = Column(Integer, nullable=True)
+    status = Column(String(16), default="success")
+    error_msg = Column(Text, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # meeting 域表：创建顺序（外键未在库中强制时仍保持主表在前）。`recreate_meeting_domain_tables.py` 使用。

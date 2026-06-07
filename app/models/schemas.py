@@ -636,6 +636,7 @@ class MeetingBase(BaseModel):
     content_text: Optional[str] = None
     meeting_url: Optional[str] = None
     status: Optional[str] = "created"
+    provider: Optional[str] = "volc"
 
 
 class MeetingCreate(MeetingBase):
@@ -1108,6 +1109,67 @@ class SetPasswordResponse(BaseData):
     user_id: str
     username: str
     changed_at: datetime
+
+
+# ========== Token 消耗追踪相关 Schema ==========
+
+
+class TokenUsageRecordInDB(BaseModel):
+    """Token 消耗记录响应。"""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: Optional[str] = None
+    api_category: str
+    api_endpoint: str
+    model: Optional[str] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    request_chars: int = 0
+    duration_ms: Optional[int] = None
+    status: str = "success"
+    error_msg: Optional[str] = None
+    metadata_json: Optional[str] = None
+    created_at: datetime
+
+
+class TokenUsageQuery(BaseModel):
+    """Token 消耗查询参数。"""
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    user_id: Optional[str] = None
+    api_category: Optional[str] = None
+    model: Optional[str] = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=500)
+
+
+class TokenUsageSummary(BaseModel):
+    """Token 消耗聚合统计。"""
+    total_tokens: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_calls: int = 0
+    total_errors: int = 0
+    by_category: List[dict] = Field(default_factory=list)
+    by_model: List[dict] = Field(default_factory=list)
+    by_user: List[dict] = Field(default_factory=list)
+
+
+class TokenDailyStat(BaseModel):
+    """按天统计。"""
+    date: str
+    total_tokens: int
+    total_calls: int
+
+
+class TokenUsageListResponse(BaseModel):
+    """分页列表响应。"""
+    items: List[TokenUsageRecordInDB]
+    total: int
+    page: int
+    page_size: int
 
 
 # 统一保留 schemas.py 作为唯一 schema 入口

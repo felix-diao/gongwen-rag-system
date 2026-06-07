@@ -8,6 +8,7 @@ import os
 from app.config import settings
 from app.api import documents, rag, conversations, admin, embed, knowledge, document, translate, llm, prompt
 from app.api import meeting, meeting_audio, meeting_minute_local, meeting_minute_volc
+from app.api import tokens
 from app.services.websocket_manager import meeting_ws_manager
 from app.utils.logger import get_logger
 
@@ -112,6 +113,7 @@ app.include_router(knowledge.router)
 app.include_router(translate.router)
 app.include_router(llm.router)
 app.include_router(prompt.router)
+app.include_router(tokens.router)
 
 @app.get("/health")
 def health_check():

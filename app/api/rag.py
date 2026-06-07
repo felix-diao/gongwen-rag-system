@@ -147,7 +147,25 @@ async def rag_query_stream(
                                         yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
                             except json.JSONDecodeError:
                                 continue
-            
+
+            # 流式 RAG 无 usage 字段，按字符数估算 token
+            try:
+                from app.services.token_tracker import token_tracker
+                import time as _time
+                prompt_chars = len(system_prompt) + len(user_prompt)
+                token_tracker.record(
+                    user_id=request.user_id,
+                    api_category="llm",
+                    api_endpoint=settings.LLM_API_URL,
+                    model=request.generator or settings.LLM_MODEL,
+                    prompt_tokens=max(1, int(prompt_chars / 1.5)),
+                    completion_tokens=max(1, int(len(full_answer) / 1.5)),
+                    total_tokens=max(1, int(prompt_chars / 1.5)) + max(1, int(len(full_answer) / 1.5)),
+                    request_chars=prompt_chars,
+                )
+            except Exception:
+                pass
+
             sources = rag_service._format_sources(candidates)
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
