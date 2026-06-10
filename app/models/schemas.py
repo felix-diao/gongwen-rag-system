@@ -1172,4 +1172,25 @@ class TokenUsageListResponse(BaseModel):
     page_size: int
 
 
+# ========== 企业微信免登 ==========
+
+class WechatLoginRequest(BaseModel):
+    """企业微信免登请求。"""
+    code: str
+
+
+class WechatLoginResponse(BaseData):
+    """企业微信免登响应：返回 ticket，前端再 redeem。"""
+    ticket: str
+    expires_in: int
+
+
+class WechatJsConfigResponse(BaseData):
+    """企业微信 JS-SDK config 参数。"""
+    corpId: str
+    agentId: str
+    timestamp: int
+    nonceStr: str
+    signature: str
+
 # 统一保留 schemas.py 作为唯一 schema 入口

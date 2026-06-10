@@ -93,7 +93,9 @@ class User(Base):
     department = Column(String(128))
     role = Column(String(64), default="user")
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    needs_password_setup = Column(Boolean, default=False, index=True)  # 新用户需要设置密码
+    needs_password_setup = Column(Boolean, default=False, index=True)
+    wechat_user_id = Column(String(64), nullable=True, index=True)
+    wechat_name = Column(String(64), nullable=True)
 
 
 class LoginTicket(Base):

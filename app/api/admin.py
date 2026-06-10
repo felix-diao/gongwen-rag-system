@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 from app.models.database import get_db, User, LoginTicket
@@ -32,6 +32,8 @@ from app.config import settings
 import uuid
 import secrets
 from app.utils.logger import get_logger
+from app.services.wechat_service import wechat_service
+from app.models.schemas import WechatLoginRequest, WechatLoginResponse, WechatJsConfigResponse
 
 logger = get_logger("admin_api")
 
@@ -593,3 +595,99 @@ def set_password(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"服务器错误: {str(e)}"
         )
+
+
+# ========== 企业微信免登 ==========
+
+@router.get("/wechat-js-config", response_model=StandardResponse[WechatJsConfigResponse])
+def wechat_js_config(url: str = Query(..., description="当前页面完整 URL")):
+    """获取企业微信 JS-SDK 的 wx.config 参数。
+
+    前端在加载页面时调用，拿到参数后调用 wx.config() 初始化。
+    """
+    try:
+        config = wechat_service.get_js_config(url)
+        return StandardResponse(
+            success=True,
+            data=WechatJsConfigResponse(**config),
+            message="获取成功",
+        )
+    except Exception as e:
+        logger.warning("获取企业微信 JS 配置失败: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/wechat-login", response_model=StandardResponse[WechatLoginResponse])
+def wechat_login(
+    payload: WechatLoginRequest,
+    db: Session = Depends(get_db),
+):
+    """企业微信免登：用 code 换取 ticket，前端再 redeem 获取 JWT。
+
+    1. code → 企业微信 API → userId
+    2. userId → 查/创系统用户（username = {userId}_{姓名}_wx）
+    3. 生成一次性 ticket 返回
+    """
+    try:
+        # 1. code → userId
+        wx_user_id = wechat_service.get_user_id(payload.code)
+        # 2. userId → 姓名
+        wx_name = wechat_service.get_user_name(wx_user_id)
+        # 3. 生成系统 username
+        safe_name = wx_name.replace(" ", "").replace("@", "")
+        username = f"{wx_user_id}_{safe_name}_wx"
+
+        # 4. 查用户（用 wechat_user_id 匹配最稳）
+        user = db.query(User).filter(User.wechat_user_id == wx_user_id).first()
+        if not user:
+            # 自动注册
+            user_id = f"user_{uuid.uuid4().hex[:16]}"
+            random_password = generate_random_password()
+            hashed_password = get_password_hash(random_password)
+            user = User(
+                user_id=user_id,
+                username=username,
+                hashed_password=hashed_password,
+                department=None,
+                role="user",
+                wechat_user_id=wx_user_id,
+                wechat_name=wx_name,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            logger.info("企业微信自动注册: username=%s wx_user_id=%s", username, wx_user_id)
+        else:
+            # 更新姓名（可能企业微信里改名了）
+            if user.wechat_name != wx_name:
+                user.wechat_name = wx_name
+                db.commit()
+
+        # 5. 生成 ticket（复用现有逻辑）
+        ticket_str = f"ticket_{secrets.token_hex(24)}"
+        expires_at = datetime.utcnow() + timedelta(minutes=TICKET_EXPIRE_MINUTES)
+        login_ticket = LoginTicket(
+            ticket=ticket_str,
+            username=user.username,
+            is_used=False,
+            expires_at=expires_at,
+        )
+        db.add(login_ticket)
+        db.commit()
+
+        logger.info("企业微信免登 ticket 已创建: user=%s", user.username)
+        return StandardResponse(
+            success=True,
+            data=WechatLoginResponse(
+                ticket=ticket_str,
+                expires_in=TICKET_EXPIRE_MINUTES * 60,
+            ),
+            message="登录成功，请兑换 ticket",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("企业微信免登失败: %s", e)
+        raise HTTPException(status_code=500, detail=f"免登失败: {str(e)}")

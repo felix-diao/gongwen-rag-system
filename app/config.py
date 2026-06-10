@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     TENCENT_MEETING_SECRET_ID: str = ""
     TENCENT_MEETING_SECRET_KEY: str = ""
     TENCENT_MEETING_API_URL: str = "https://api.meeting.qq.com/v1"
+    # 企业微信配置
+    WECHAT_CORP_ID: str = ""
+    WECHAT_AGENT_ID: str = ""
+    WECHAT_SECRET: str = ""
 
     # AI率配置
     AI_RATE_MODEL_DIR: str
