@@ -102,36 +102,41 @@ class WechatService:
     # JS-SDK config 签名
     # ------------------------------------------------------------------
     def get_js_config(self, url: str) -> Dict[str, Any]:
-        """生成 wx.config 所需的参数。
-
-        :param url: 当前页面 URL（不含 # 后面部分）
-        """
+        # 生成 wx.config + wx.agentConfig 所需的参数（url 为当前页面 URL，不含 # 后部分）
         token = self._get_access_token()
-
-        # 1. 获取 jsapi_ticket
-        ticket_url = (
-            "https://qyapi.weixin.qq.com/cgi-bin/get_jsapi_ticket"
-            f"?access_token={token}"
-        )
-        ticket_resp = requests.get(ticket_url, timeout=10)
-        ticket_resp.raise_for_status()
-        ticket_data = ticket_resp.json()
-        if ticket_data.get("errcode") != 0:
-            raise RuntimeError(f"获取 jsapi_ticket 失败: {ticket_data}")
-        jsapi_ticket = ticket_data["ticket"]
-
-        # 2. 生成签名
         timestamp = int(time.time())
         nonce_str = "".join(random.choices(string.ascii_letters + string.digits, k=16))
-        raw = f"jsapi_ticket={jsapi_ticket}&noncestr={nonce_str}&timestamp={timestamp}&url={url}"
-        signature = hashlib.sha1(raw.encode()).hexdigest()
+
+        def _ticket(ticket_url: str, what: str) -> str:
+            resp = requests.get(ticket_url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errcode") != 0:
+                raise RuntimeError(f"获取 {what} 失败: {data}")
+            return data["ticket"]
+
+        def _sign(ticket: str) -> str:
+            raw = f"jsapi_ticket={ticket}&noncestr={nonce_str}&timestamp={timestamp}&url={url}"
+            return hashlib.sha1(raw.encode()).hexdigest()
+
+        # 企业级 ticket -> wx.config 签名
+        corp_ticket = _ticket(
+            f"https://qyapi.weixin.qq.com/cgi-bin/get_jsapi_ticket?access_token={token}",
+            "jsapi_ticket",
+        )
+        # 应用级 ticket -> wx.agentConfig 签名
+        agent_ticket = _ticket(
+            f"https://qyapi.weixin.qq.com/cgi-bin/ticket/get?access_token={token}&type=agent_config",
+            "agent_config ticket",
+        )
 
         return {
             "corpId": settings.WECHAT_CORP_ID,
             "agentId": settings.WECHAT_AGENT_ID,
             "timestamp": timestamp,
             "nonceStr": nonce_str,
-            "signature": signature,
+            "signature": _sign(corp_ticket),
+            "agentSignature": _sign(agent_ticket),
         }
 
 

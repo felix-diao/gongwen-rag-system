@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """企业微信配置检查脚本。
 
-甲方填完 .env 后运行此脚本，验证配置是否正确。
+填完 /mnt/data/tmp/.env 后运行此脚本，验证企业微信配置是否正确。
 """
 
 import sys
 import os
 
 # 确保能导入项目代码
-sys.path.insert(0, '/root/workspace/rag/gongwen-rag-system')
+sys.path.insert(0, '/mnt/data/gongwen/gongwen20251127/gongwen-rag-system')
 
 from app.config import settings
 
@@ -38,7 +38,7 @@ def check():
 
     if missing:
         print(f"\n  ❌ 以下配置项未填写: {', '.join(missing)}")
-        print("  请编辑 .env 文件，填入上述参数后再运行此脚本。")
+        print("  请编辑 /mnt/data/tmp/.env 或当前项目 .env，填入上述参数后再运行此脚本。")
         return False
 
     # 2. 尝试获取 access_token（验证 CorpID + Secret）
@@ -67,7 +67,7 @@ def check():
         elif data.get("errcode") == 60020:
             print(f"  ❌ 失败: {data.get('errmsg')}")
             print("  原因: 服务器IP不在企业微信'企业可信IP'白名单里")
-            print(f"  当前服务器出口IP: 请把这个IP发给甲方添加到白名单")
+            print(f"  当前服务器公网/出口 IP 应为: 14.103.102.92，请确认已添加到企业微信企业可信 IP 白名单")
             return False
         else:
             print(f"  ❌ 失败: {data}")
@@ -79,7 +79,7 @@ def check():
     # 4. 生成一个测试用的 JS-SDK config
     print("\n【4/4】生成 JS-SDK config 参数（供前端测试）...")
     try:
-        test_url = "https://example.com"
+        test_url = "https://wx.hiruiai.com/agent_officea/mobile/meetings"
         cfg = wechat_service.get_js_config(test_url)
         print(f"  corpId: {cfg['corpId']}")
         print(f"  agentId: {cfg['agentId']}")
@@ -94,9 +94,9 @@ def check():
     print("✅ 所有检查通过！配置正确。")
     print("=" * 50)
     print("\n下一步:")
-    print("  1. 确认企业微信后台已配置：可信域名、应用主页")
-    print("  2. 重启后端服务: pkill -f uvicorn && 重新启动")
-    print("  3. 在企业微信内打开应用测试免登录")
+    print("  1. 确认企业微信后台已配置：可信域名 wx.hiruiai.com、企业可信 IP 14.103.102.92、应用主页 https://wx.hiruiai.com/agent_officea/mobile/meetings")
+    print("  2. 重启后端容器: cd /mnt/data/tmp && docker compose restart gongwen-rag-system")
+    print("  3. 在企业微信内打开应用主页测试免登录")
     return True
 
 

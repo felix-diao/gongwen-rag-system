@@ -1192,5 +1192,6 @@ class WechatJsConfigResponse(BaseData):
     timestamp: int
     nonceStr: str
     signature: str
+    agentSignature: str
 
 # 统一保留 schemas.py 作为唯一 schema 入口
