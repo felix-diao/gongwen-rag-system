@@ -112,7 +112,8 @@ class Settings(BaseSettings):
     VOLC_MINUTES_ACCESS_KEY: str = "AH0yQdtRt-FFj7Iq_hQT--GewVFLVYYj"
     VOLC_MINUTES_RESOURCE_ID: str = "volc.lark.minutes"
     VOLC_MINUTES_SOURCE_LANG: str = "zh_cn"
-    VOLC_MINUTES_SPEAKER_IDENTIFICATION: bool = False
+    # 火山妙记说话人识别：开启后 volc 会议纪要会返回 speaker_segments
+    VOLC_MINUTES_SPEAKER_IDENTIFICATION: bool = True
     VOLC_MINUTES_NUMBER_OF_SPEAKERS: int = 0
     VOLC_MINUTES_NEED_WORD_TS: bool = False
     VOLC_MINUTES_TIMEOUT: int = 10
