@@ -36,7 +36,10 @@ from app.config import settings
 from app.models import database, schemas
 from app.models.database import SessionLocal
 from app.services.meeting_audio_service import meeting_audio_service
-from app.services.meeting_minute_local_prompt import build_local_minutes_llm_instruction
+from app.services.meeting_minute_local_prompt import (
+    build_local_minutes_llm_instruction,
+    resolve_max_tokens,
+)
 from app.services.qwen_asr_incremental_http import (
     asr_http_runtime_params,
     build_asr_requests_session,
@@ -832,7 +835,11 @@ class LocalMeetingMinuteService:
         try:
             _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
             meeting_title = self._get_meeting_title(db, meeting_id)
-            payload = self._call_llm(meeting_title, asr_session.stream_transcript_text or "")
+            payload = self._call_llm(
+                meeting_title,
+                asr_session.stream_transcript_text or "",
+                duration_seconds=asr_session.duration_seconds or 0,
+            )
             _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
 
             source_audio_id = asr_session.source_audio_id
@@ -1116,20 +1123,27 @@ class LocalMeetingMinuteService:
         ).delete(synchronize_session=False)
         db.commit()
 
-    def _call_llm(self, meeting_title: str, transcript: str) -> dict:
+    def _call_llm(
+        self,
+        meeting_title: str,
+        transcript: str,
+        duration_seconds: float = 0,
+    ) -> dict:
         from app.llm_client.generators import get_client
 
-        instruction = build_local_minutes_llm_instruction()
+        char_count = len((transcript or "").strip().replace(" ", "").replace("\n", ""))
+        instruction = build_local_minutes_llm_instruction(char_count, duration_seconds)
         user_msg = f"会议标题：{meeting_title}\n\n会议转写文本：\n{transcript}"
         try:
             cli = get_client()
+            max_tokens = resolve_max_tokens(char_count, duration_seconds)
             raw = cli.chat(
                 [
                     {"role": "system", "content": instruction},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.2,
-                max_tokens=1800,
+                max_tokens=max_tokens,
             )
             payload = self._parse_json(raw)
             return self._normalize_payload(payload, meeting_title)
