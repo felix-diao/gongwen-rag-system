@@ -8,8 +8,8 @@
 实时录音在 LIVE_FORCE_HTTP_CHUNK 模式下按 QWEN_ASR_CHUNK_SEC / QWEN_ASR_OVERLAP_SEC 从 PCM 滑窗切段，
 同样逐段请求 + merge_pair，不整文件末尾一次性识别。
 
-分段文件通过进程内共享的 ThreadingHTTPServer 暴露；每路会话使用 public_base 下唯一子路径（uuid4 hex）
-+ chunk_xxxx.wav，同一端口可多路并发而不争用同一 URL。
+分段文件写入 QWEN_ASR_HTTP_ROOT_DIR 下的唯一子目录（uuid4 hex），nginx 通过
+QWEN_ASR_FILE_HTTP_PUBLIC_BASE 对外暴露这些 chunk_xxxx.wav 给 ASR 服务拉取。
 
 注意：HTTP 转写只认 QWEN_ASR_HTTP_CHAT_URL（及 QWEN_ASR_HTTP_CHAT_MODEL / *_API_KEY），
 绝不回退 LLM_API_URL / LLM_MODEL / LLM_API_KEY，避免与「文本生成纪要」的 LLM 混用。
@@ -19,18 +19,14 @@ from __future__ import annotations
 
 import re
 import shutil
-import socketserver
 import subprocess
 import tempfile
-import threading
 import uuid
 import wave
 from difflib import SequenceMatcher
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-from functools import partial
 
 import requests
 
@@ -38,26 +34,6 @@ from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger("qwen_asr_incremental_http")
-
-# 进程内共享：同一 bind_port 上长期监听，按 url_path_prefix（如 UUID）分子目录，避免多会话争用 /chunk_0000.wav。
-_http_serve_state_lock = threading.Lock()
-_http_serve_parent: Optional[Path] = None
-_http_serve_port: Optional[int] = None
-_httpd_shared: Optional[HTTPServer] = None
-_httpd_shared_thread: Optional[threading.Thread] = None
-
-
-class _ThreadingChunkHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class _QuietStaticHTTPRequestHandler(SimpleHTTPRequestHandler):
-    """关闭 BaseHTTPRequestHandler 默认写到 stderr 的访问日志，避免探活 HEAD 等刷屏。"""
-
-    def log_message(self, _format: str, *args: Any) -> None:
-        pass
-
 
 def _run_cmd(cmd: str) -> str:
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -205,18 +181,17 @@ def _resolve_chat_api_key() -> str:
     return ""
 
 
-def _parse_public_base() -> Tuple[str, int]:
+def _parse_public_base() -> str:
     raw = (settings.QWEN_ASR_FILE_HTTP_PUBLIC_BASE or "").strip().rstrip("/")
     if not raw:
         raise RuntimeError(
-            "请配置 QWEN_ASR_FILE_HTTP_PUBLIC_BASE（如 http://公网IP:8010），"
-            "使 ASR 服务能访问分段音频 URL"
+            "请配置 QWEN_ASR_FILE_HTTP_PUBLIC_BASE（如 https://wx.hiruiai.com/asr_chunks），"
+            "使 ASR 服务能通过 nginx 访问分段音频 URL"
         )
     u = urlparse(raw)
     if not u.scheme or not u.hostname:
         raise RuntimeError(f"QWEN_ASR_FILE_HTTP_PUBLIC_BASE 无效: {raw!r}")
-    port = u.port or (443 if u.scheme == "https" else 80)
-    return raw, port
+    return raw
 
 
 def _normalize_audio_to_wav(audio_source: Path, work_dir: Path) -> Path:
@@ -331,46 +306,15 @@ def write_pcm_as_wav_file(
         wf.writeframes(pcm)
 
 
-def ensure_incremental_http_serve_root(bind_port: int) -> Path:
-    """在 bind_port 上启动或复用进程内共享静态根目录；会话 wav 放在 root/<url_path_prefix>/ 下。"""
-    global _http_serve_parent, _http_serve_port, _httpd_shared, _httpd_shared_thread
-    bind_port = int(bind_port)
-    with _http_serve_state_lock:
-        if _httpd_shared is not None:
-            if _http_serve_port != bind_port:
-                raise RuntimeError(
-                    f"分段音频 HTTP 已在端口 {_http_serve_port} 监听，与当前配置端口 {bind_port} 不一致"
-                )
-            assert _http_serve_parent is not None
-            return Path(_http_serve_parent)
-        parent = Path(tempfile.mkdtemp(prefix="qwen_asr_http_root_"))
-        handler = partial(_QuietStaticHTTPRequestHandler, directory=str(parent))
-        httpd = _ThreadingChunkHTTPServer(("0.0.0.0", bind_port), handler)
-        th = threading.Thread(target=httpd.serve_forever, daemon=True)
-        th.start()
-        _httpd_shared = httpd
-        _httpd_shared_thread = th
-        _http_serve_parent = parent
-        _http_serve_port = bind_port
-        logger.info("分段音频 HTTP 共享服务已启动 root=%s port=%s", parent, bind_port)
-        return parent
-
-
-def start_chunk_http_server(chunks_dir: Path, bind_port: int) -> Tuple[HTTPServer, threading.Thread]:
-    """在指定目录独占启动单线程 HTTPServer（脚本/调试）；主业务请用 ensure_incremental_http_serve_root。"""
-    handler = partial[_QuietStaticHTTPRequestHandler](_QuietStaticHTTPRequestHandler, directory=str(chunks_dir))
-    httpd = HTTPServer(("0.0.0.0", int(bind_port)), handler)
-    th = threading.Thread(target=httpd.serve_forever, daemon=True)
-    th.start()
-    return httpd, th
-
-
-def stop_chunk_http_server(httpd: HTTPServer, th: threading.Thread) -> None:
-    try:
-        httpd.shutdown()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("HTTP 分段服务 shutdown 异常: %s", exc)
-    th.join(timeout=5.0)
+def ensure_incremental_http_serve_root() -> Path:
+    """返回 nginx 暴露的固定分片根目录；会话 wav 放在 root/<url_path_prefix>/ 下。"""
+    configured_root = (settings.QWEN_ASR_HTTP_ROOT_DIR or "").strip()
+    if not configured_root:
+        raise RuntimeError("QWEN_ASR_HTTP_ROOT_DIR 未配置，无法暴露分段音频文件")
+    parent = Path(configured_root).expanduser().resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    logger.info("分段音频使用 nginx 静态目录 root=%s public_base=%s", parent, settings.QWEN_ASR_FILE_HTTP_PUBLIC_BASE)
+    return parent
 
 
 def post_served_wav_chunk(
@@ -441,7 +385,7 @@ def transcribe_audio_file_incremental(
     if not source_audio.is_file():
         raise FileNotFoundError(str(source_audio))
 
-    public_base, bind_port = _parse_public_base()
+    public_base = _parse_public_base()
     chat_url = _resolve_chat_url()
 
     model = _resolve_chat_model()
@@ -466,7 +410,7 @@ def transcribe_audio_file_incremental(
     duration_sec = 0.0
 
     try:
-        serve_parent = ensure_incremental_http_serve_root(bind_port)
+        serve_parent = ensure_incremental_http_serve_root()
         session_http_dir = serve_parent / url_path_prefix
         session_http_dir.mkdir(parents=True, exist_ok=True)
         if on_stage:
@@ -546,8 +490,8 @@ def validate_incremental_http_config() -> None:
     _resolve_chat_model()
 
 
-def get_incremental_http_public_base_and_port() -> Tuple[str, int]:
-    """返回 (对外 URL 前缀, 本机 bind 端口)。须在 validate_incremental_http_config 之后调用。"""
+def get_incremental_http_public_base() -> str:
+    """返回 nginx 暴露的 audio_url 前缀。须在 validate_incremental_http_config 之后调用。"""
     return _parse_public_base()
 
 

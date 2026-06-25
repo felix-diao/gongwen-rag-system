@@ -41,7 +41,7 @@ from app.services.qwen_asr_incremental_http import (
     asr_http_runtime_params,
     build_asr_requests_session,
     ensure_incremental_http_serve_root,
-    get_incremental_http_public_base_and_port,
+    get_incremental_http_public_base,
     merge_pair,
     post_served_wav_chunk,
     transcribe_audio_file_incremental,
@@ -1608,7 +1608,7 @@ class LiveLocalAsrHandler:
     async def _run_live_incremental_http(self) -> None:
         """实时 HTTP 滑窗：与 qwen_asr_smoketest_incremental_merge 同源的分段请求 + merge_pair。"""
         validate_incremental_http_config()
-        public_base, bind_port = get_incremental_http_public_base_and_port()
+        public_base = get_incremental_http_public_base()
         chat_url, model, headers, timeout, max_tokens = asr_http_runtime_params()
 
         chunk_sec = float(settings.QWEN_ASR_CHUNK_SEC)
@@ -1626,7 +1626,7 @@ class LiveLocalAsrHandler:
         url_path_prefix = uuid.uuid4().hex
         chunks_dir: Optional[Path] = None
         try:
-            serve_parent = await asyncio.to_thread(ensure_incremental_http_serve_root, bind_port)
+            serve_parent = await asyncio.to_thread(ensure_incremental_http_serve_root)
             chunks_dir = serve_parent / url_path_prefix
             chunks_dir.mkdir(parents=True, exist_ok=True)
 
