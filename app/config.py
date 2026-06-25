@@ -90,10 +90,10 @@ class Settings(BaseSettings):
 
     # 火山引擎大模型流式语音识别 (Functionality 1)
     # 资源ID：
-    #   ASR 1.0 小时版 volc.bigasr.sauc.duration；并发版 volc.bigasr.sauc.concurrent
     #   ASR 2.0 小时版 volc.seedasr.sauc.duration；并发版 volc.seedasr.sauc.concurrent
-    # 开启说话人分离时务必使用 ASR 2.0 资源
-    VOLC_ASR_RESOURCE_ID: str = "volc.bigasr.sauc.duration"
+    #   ASR 1.0 小时版 volc.bigasr.sauc.duration；并发版 volc.bigasr.sauc.concurrent
+    # 默认使用 ASR 2.0，支持说话人分离和二遍识别
+    VOLC_ASR_RESOURCE_ID: str = "volc.seedasr.sauc.duration"
     VOLC_ASR_APP_KEY: str = ""
     VOLC_ASR_ACCESS_KEY: str = ""
     # 实时录音保存目录（留空则使用 UPLOAD_DIR/asr_recordings）
