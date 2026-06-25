@@ -89,12 +89,25 @@ class Settings(BaseSettings):
     LOG_KEEP_DAYS: int = 30   # ← 加这一行
 
     # 火山引擎大模型流式语音识别 (Functionality 1)
-    # 资源ID：小时版 volc.bigasr.sauc.duration；并发版 volc.bigasr.sauc.concurrent
+    # 资源ID：
+    #   ASR 1.0 小时版 volc.bigasr.sauc.duration；并发版 volc.bigasr.sauc.concurrent
+    #   ASR 2.0 小时版 volc.seedasr.sauc.duration；并发版 volc.seedasr.sauc.concurrent
+    # 开启说话人分离时务必使用 ASR 2.0 资源
     VOLC_ASR_RESOURCE_ID: str = "volc.bigasr.sauc.duration"
     VOLC_ASR_APP_KEY: str = ""
     VOLC_ASR_ACCESS_KEY: str = ""
     # 实时录音保存目录（留空则使用 UPLOAD_DIR/asr_recordings）
     VOLC_ASR_AUDIO_SAVE_DIR: str = ""
+    # 实时 ASR WebSocket 路径：
+    #   /api/v3/sauc/bigmodel          标准双向流式（ASR 1.0，不支持说话人分离）
+    #   /api/v3/sauc/bigmodel_async    双向流式优化版（ASR 2.0，支持说话人分离）
+    VOLC_ASR_WS_PATH: str = "/api/v3/sauc/bigmodel_async"
+    # 是否开启实时 ASR 说话人分离（需要 ASR 2.0 资源 + bigmodel_async）
+    VOLC_ASR_SPEAKER_INFO: bool = True
+    # 大模型 SSD 版本：开启说话人分离时必须为 "200"
+    VOLC_ASR_SSD_VERSION: str = "200"
+    # 是否开启二遍识别（流式+非流式），说话人分离依赖该能力
+    VOLC_ASR_ENABLE_NONSTREAM: bool = True
 
     # 火山引擎对象存储配置
     VOLC_TOS_ENDPOINT: str = "https://tos-cn-beijing.volces.com"

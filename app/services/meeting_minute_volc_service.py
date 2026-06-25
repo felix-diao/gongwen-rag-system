@@ -41,7 +41,7 @@ from app.utils.logger import get_logger
 logger = get_logger("meeting_volc_minutes_service")
 
 
-ASR_WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+ASR_WS_URL = f"wss://openspeech.bytedance.com{settings.VOLC_ASR_WS_PATH}"
 MINUTES_RUNNING_STATUS = {"queued", "running", "processing"}
 MINUTES_SUCCESS_STATUS = {"success", "succeeded", "successed", "finished", "completed", "done"}
 MINUTES_FAILED_STATUS = {"failed", "error"}
@@ -165,6 +165,35 @@ def _extract_text(payload: Optional[dict]) -> Optional[str]:
             return alternatives[0].get("transcript") or alternatives[0].get("text")
     if isinstance(payload.get("text"), str):
         return payload["text"] or None
+    return None
+
+
+def _format_speaker(speaker: Any) -> Optional[str]:
+    """把火山返回的 speaker 对象/字符串格式化成展示名。"""
+    if isinstance(speaker, dict):
+        return speaker.get("name") or speaker.get("id") or None
+    if isinstance(speaker, str) and speaker:
+        return speaker
+    return None
+
+
+def _extract_speaker(payload: Optional[dict]) -> Optional[str]:
+    """从火山实时 ASR 回包中提取说话人标识。
+
+    说话人信息通常在 result.speaker 或 result.utterances[].speaker 中。
+    """
+    if not payload:
+        return None
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return None
+    if "speaker" in result:
+        return _format_speaker(result["speaker"])
+    utterances = result.get("utterances")
+    if isinstance(utterances, list):
+        for u in utterances:
+            if isinstance(u, dict) and "speaker" in u:
+                return _format_speaker(u["speaker"])
     return None
 
 
@@ -1554,6 +1583,9 @@ class LiveVolcAsrHandler:
             "audio": {"format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1},
             "request": {
                 "model_name": "bigmodel",
+                "enable_nonstream": settings.VOLC_ASR_ENABLE_NONSTREAM,
+                "enable_speaker_info": settings.VOLC_ASR_SPEAKER_INFO,
+                "ssd_version": settings.VOLC_ASR_SSD_VERSION,
                 "enable_itn": True,
                 "enable_punc": True,
                 "enable_ddc": True,
@@ -1691,6 +1723,7 @@ class LiveVolcAsrHandler:
                 raise RuntimeError(err_text)
             payload = resp.payload_msg
             text = _extract_text(payload) if payload else None
+            speaker = _extract_speaker(payload) if payload else None
             is_last = bool(resp.is_last_package)
             is_definite = bool((payload.get("result") or {}).get("definite", False)) if payload else False
             should_accumulate = is_definite or is_last
@@ -1698,13 +1731,14 @@ class LiveVolcAsrHandler:
                 if should_accumulate:
                     self._transcript_parts.append(text)
                 if self._ws_alive:
-                    await self._ws.send_json(
-                        {
-                            "type": "final" if is_definite else "partial",
-                            "text": text,
-                            "accumulated": "".join(self._transcript_parts) if should_accumulate else "".join(self._transcript_parts) + text,
-                        }
-                    )
+                    msg: Dict[str, Any] = {
+                        "type": "final" if is_definite else "partial",
+                        "text": text,
+                        "accumulated": "".join(self._transcript_parts) if should_accumulate else "".join(self._transcript_parts) + text,
+                    }
+                    if speaker:
+                        msg["speaker"] = speaker
+                    await self._ws.send_json(msg)
             if is_last:
                 break
         stop_event.set()
