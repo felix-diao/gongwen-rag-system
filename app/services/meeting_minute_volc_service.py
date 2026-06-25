@@ -169,18 +169,19 @@ def _extract_text(payload: Optional[dict]) -> Optional[str]:
 
 
 def _format_speaker(speaker: Any) -> Optional[str]:
-    """把火山返回的 speaker 对象/字符串格式化成展示名。"""
+    """把火山返回的 speaker 对象/字符串/整数格式化成展示名。"""
     if isinstance(speaker, dict):
         return speaker.get("name") or speaker.get("id") or None
-    if isinstance(speaker, str) and speaker:
-        return speaker
+    if isinstance(speaker, (str, int)) and str(speaker):
+        return str(speaker)
     return None
 
 
 def _extract_speaker(payload: Optional[dict]) -> Optional[str]:
     """从火山实时 ASR 回包中提取说话人标识。
 
-    说话人信息通常在 result.speaker 或 result.utterances[].speaker 中。
+    说话人信息可能在 result.speaker、result.utterances[].speaker 或
+    result.utterances[].additions.speaker_id 中。
     """
     if not payload:
         return None
@@ -192,64 +193,22 @@ def _extract_speaker(payload: Optional[dict]) -> Optional[str]:
     utterances = result.get("utterances")
     if isinstance(utterances, list):
         for u in utterances:
-            if isinstance(u, dict) and "speaker" in u:
-                return _format_speaker(u["speaker"])
+            if not isinstance(u, dict):
+                continue
+            # 火山 ASR 2.0 说话人分离通常放在 additions.speaker_id
+            additions = u.get("additions")
+            if isinstance(additions, dict):
+                sid = additions.get("speaker_id")
+                if sid is not None:
+                    return _format_speaker(sid)
+            for key in ("speaker", "speaker_id", "spk", "spk_id"):
+                if key in u:
+                    return _format_speaker(u[key])
+    # 顶层 payload fallback
+    for key in ("speaker", "speaker_id", "spk", "spk_id"):
+        if key in payload:
+            return _format_speaker(payload[key])
     return None
-
-
-def _is_definite_result(payload: Optional[dict]) -> bool:
-    """判断火山实时 ASR 回包是否为确定分句（final）。
-
-    官方文档中 definite 字段在 result.utterances[].definite，
-    部分旧版本也可能在 result.definite，这里做兼容处理。
-    """
-    if not payload:
-        return False
-    result = payload.get("result") if isinstance(payload, dict) else None
-    if not isinstance(result, dict):
-        return False
-    if result.get("definite") is True:
-        return True
-    utterances = result.get("utterances")
-    if isinstance(utterances, list):
-        return any(isinstance(u, dict) and u.get("definite") is True for u in utterances)
-    return False
-
-
-def _iter_definite_utterances(payload: Optional[dict]):
-    """迭代所有新的确定分句，返回 (text, speaker)。"""
-    if not payload:
-        return
-    result = payload.get("result") if isinstance(payload, dict) else None
-    if not isinstance(result, dict):
-        return
-    utterances = result.get("utterances")
-    if not isinstance(utterances, list):
-        # 兼容旧版：result.definite + result.text
-        if result.get("definite") is True:
-            text = result.get("text")
-            if isinstance(text, str) and text:
-                yield text, _format_speaker(result.get("speaker"))
-        return
-    for u in utterances:
-        if not isinstance(u, dict):
-            continue
-        if u.get("definite") is not True:
-            continue
-        text = u.get("text")
-        if not isinstance(text, str) or not text:
-            continue
-        speaker = _format_speaker(u.get("speaker"))
-        yield text, speaker
-
-
-def _utterance_key(utterance: dict) -> tuple:
-    """用于去重的 utterance 标识。"""
-    return (
-        utterance.get("start_time"),
-        utterance.get("end_time"),
-        utterance.get("text"),
-    )
 
 
 def _require_text_field(item: dict, field_group: tuple[str, ...], scope: str) -> str:
@@ -1605,7 +1564,8 @@ class LiveVolcAsrHandler:
         self._creator_id = creator_id
         self._audio_chunks: List[bytes] = []
         self._transcript_parts: List[str] = []
-        self._seen_utterance_keys: set = set()
+        self._last_utterance_index = -1
+        self._speaker_name_map: Dict[str, str] = {}
         self._session_id: Optional[int] = None
         self._sample_rate = 16000
         self._channels = 1
@@ -1778,62 +1738,68 @@ class LiveVolcAsrHandler:
                     err_text = f"{err_text} ({detail})"
                 raise RuntimeError(err_text)
             payload = resp.payload_msg
-            text = _extract_text(payload) if payload else None
-            is_last = bool(resp.is_last_package)
-            is_definite = _is_definite_result(payload)
+            if not payload or not isinstance(payload, dict):
+                if resp.is_last_package:
+                    break
+                continue
 
-            # 1) 发送所有新的确定分句（final），带说话人信息
-            if is_definite and payload:
-                result = payload.get("result") or {}
-                utterances = result.get("utterances") if isinstance(result, dict) else None
-                for utt_text, utt_speaker in _iter_definite_utterances(payload):
-                    # 用 utterance key 去重，避免同一分句重复发送
-                    if isinstance(utterances, list):
-                        key = None
-                        for u in utterances:
-                            if isinstance(u, dict) and u.get("text") == utt_text:
-                                key = _utterance_key(u)
-                                break
-                        if key and key in self._seen_utterance_keys:
-                            continue
-                        if key:
-                            self._seen_utterance_keys.add(key)
-                    self._transcript_parts.append(utt_text)
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                if resp.is_last_package:
+                    break
+                continue
+
+            utterances = result.get("utterances")
+            is_last = bool(resp.is_last_package)
+
+            if isinstance(utterances, list):
+                for i, u in enumerate(utterances):
+                    if i <= self._last_utterance_index:
+                        continue
+                    if not isinstance(u, dict):
+                        continue
+
+                    text = u.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+
+                    is_definite = bool(u.get("definite", False))
+
+                    # 提取说话人 ID 并映射为“说话人1/2/3...”
+                    speaker_name = None
+                    additions = u.get("additions")
+                    if isinstance(additions, dict):
+                        speaker_id = additions.get("speaker_id")
+                        if speaker_id is not None:
+                            sid = str(speaker_id)
+                            if sid not in self._speaker_name_map:
+                                self._speaker_name_map[sid] = f"说话人{len(self._speaker_name_map) + 1}"
+                            speaker_name = self._speaker_name_map[sid]
+
+                    # 累积到 transcript_parts，用于最终落盘
+                    self._transcript_parts.append(text)
+                    self._last_utterance_index = i
+
                     if self._ws_alive:
                         msg: Dict[str, Any] = {
-                            "type": "final",
-                            "text": utt_text,
+                            "type": "final" if is_definite else "partial",
+                            "text": text,
                             "accumulated": "".join(self._transcript_parts),
                         }
-                        if utt_speaker:
-                            msg["speaker"] = utt_speaker
+                        if speaker_name:
+                            msg["speaker"] = speaker_name
                         await self._ws.send_json(msg)
 
-            # 2) 普通 partial 结果
-            elif text and not is_last:
-                if self._ws_alive:
-                    await self._ws.send_json(
-                        {
-                            "type": "partial",
-                            "text": text,
-                            "accumulated": "".join(self._transcript_parts) + text,
-                        }
-                    )
-
-            # 3) 最后一包兜底：把剩余文本 flush 进去
-            if is_last and text:
-                # 避免和已发送的 definite utterance 重复
-                tail = text
-                joined = "".join(self._transcript_parts)
-                if joined and tail.startswith(joined):
-                    tail = tail[len(joined):]
-                if tail and tail not in self._transcript_parts:
-                    self._transcript_parts.append(tail)
+            # 兜底：如果 result 没有 utterances 但又有 text，按旧模式推一把
+            elif "text" in result and isinstance(result["text"], str):
+                text = result["text"]
+                if text.strip():
+                    self._transcript_parts.append(text)
                     if self._ws_alive:
                         await self._ws.send_json(
                             {
-                                "type": "final",
-                                "text": tail,
+                                "type": "final" if is_last else "partial",
+                                "text": text,
                                 "accumulated": "".join(self._transcript_parts),
                             }
                         )
