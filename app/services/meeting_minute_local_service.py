@@ -31,6 +31,9 @@ import aiohttp
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from starlette.websockets import WebSocketDisconnect
+from uvicorn.protocols.utils import ClientDisconnected
+from websockets.exceptions import ConnectionClosed
 
 from app.config import settings
 from app.models import database, schemas
@@ -1398,6 +1401,21 @@ class LiveLocalAsrHandler:
         # HTTP 滑窗分段时 merge_pair 的累计稿，异常收尾时写入 DB 便于排障
         self._live_http_merged: str = ""
 
+    async def _safe_send_json(self, payload: dict) -> bool:
+        if not self._ws_alive:
+            return False
+        try:
+            await self._ws.send_json(payload)
+            return True
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            self._ws_alive = False
+            logger.info(
+                "本地实时 ASR 前端 WebSocket 已断开，停止推送 meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+            return False
+
     async def run(self) -> None:
         # `run` 是实时会话总入口，负责创建 ASR session、启动双向转发、并在结束时统一收尾。
         self._service._assert_meeting_exists(self._db, self._meeting_id)
@@ -1411,7 +1429,7 @@ class LiveLocalAsrHandler:
         self._db.commit()
         self._db.refresh(asr_session)
         self._session_id = asr_session.id
-        await self._ws.send_json({"type": "session_created", "session_id": self._session_id})
+        await self._safe_send_json({"type": "session_created", "session_id": self._session_id})
 
         try:
             logger.info("开始本地实时 ASR 会话 meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
@@ -1438,8 +1456,7 @@ class LiveLocalAsrHandler:
             )
             asr_session.error_msg = str(exc)
             self._db.commit()
-            if self._ws_alive:
-                await self._ws.send_json({"type": "error", "message": str(exc)})
+            await self._safe_send_json({"type": "error", "message": str(exc)})
             raise
 
     async def _forward_audio(self, qwen_ws, stop_event: asyncio.Event) -> None:
@@ -1479,8 +1496,8 @@ class LiveLocalAsrHandler:
             if _is_partial_transcription_event(event_type):
                 raw_text = _extract_transcription_text(payload)
                 text = raw_text.strip() if isinstance(raw_text, str) else ""
-                if text and self._ws_alive:
-                    await self._ws.send_json(
+                if text:
+                    await self._safe_send_json(
                         {
                             "type": "partial",
                             "text": text,
@@ -1492,8 +1509,8 @@ class LiveLocalAsrHandler:
                 text = raw_text.strip() if isinstance(raw_text, str) else ""
                 if text:
                     self._final_parts.append(text)
-                if text and self._ws_alive:
-                    await self._ws.send_json(
+                if text:
+                    await self._safe_send_json(
                         {"type": "final", "text": text, "accumulated": "".join(self._final_parts)}
                     )
             elif event_type == "session.finished":
@@ -1536,8 +1553,7 @@ class LiveLocalAsrHandler:
         asr_session.duration_seconds = duration
         self._db.commit()
 
-        if self._ws_alive:
-            await self._ws.send_json({"type": "saving_audio", "session_id": self._session_id})
+        await self._safe_send_json({"type": "saving_audio", "session_id": self._session_id})
 
         try:
             audio_record = meeting_audio_service.create_audio_from_path(
@@ -1577,18 +1593,17 @@ class LiveLocalAsrHandler:
             duration,
         )
 
-        if self._ws_alive:
-            await self._ws.send_json(
-                {
-                    "type": "completed",
-                    "session_id": self._session_id,
-                    "audio_id": audio_record.id,
-                    "transcript": transcript,
-                    "stream_transcript_text": transcript,
-                    "audio_uploaded": True,
-                    "duration_seconds": duration,
-                }
-            )
+        await self._safe_send_json(
+            {
+                "type": "completed",
+                "session_id": self._session_id,
+                "audio_id": audio_record.id,
+                "transcript": transcript,
+                "stream_transcript_text": transcript,
+                "audio_uploaded": True,
+                "duration_seconds": duration,
+            }
+        )
 
     async def _finalize_from_ws_transcript(self) -> None:
         transcript = "".join(self._final_parts)
@@ -1601,7 +1616,7 @@ class LiveLocalAsrHandler:
             return
         if merged.startswith(old_merged):
             delta = merged[len(old_merged) :]
-            await self._ws.send_json(
+            await self._safe_send_json(
                 {
                     "type": "partial",
                     "text": delta,
@@ -1610,7 +1625,7 @@ class LiveLocalAsrHandler:
                 }
             )
         else:
-            await self._ws.send_json(
+            await self._safe_send_json(
                 {
                     "type": "partial",
                     "accumulated": merged,
@@ -1696,14 +1711,13 @@ class LiveLocalAsrHandler:
                     cursor += step_bytes
                     seg_idx += 1
 
-            if self._ws_alive:
-                await self._ws.send_json(
-                    {
-                        "type": "transcribing",
-                        "session_id": self._session_id,
-                        "mode": "http_chunk_incremental",
-                    }
-                )
+            await self._safe_send_json(
+                {
+                    "type": "transcribing",
+                    "session_id": self._session_id,
+                    "mode": "http_chunk_incremental",
+                }
+            )
 
             while True:
                 raw = await self._ws.receive()

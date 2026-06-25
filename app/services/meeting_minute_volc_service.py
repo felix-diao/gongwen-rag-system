@@ -37,6 +37,9 @@ from app.models import database, schemas
 from app.services.meeting_audio_service import meeting_audio_service
 from app.services.websocket_manager import meeting_ws_manager
 from app.utils.logger import get_logger
+from starlette.websockets import WebSocketDisconnect
+from uvicorn.protocols.utils import ClientDisconnected
+from websockets.exceptions import ConnectionClosed
 
 logger = get_logger("meeting_volc_minutes_service")
 
@@ -1600,6 +1603,21 @@ class LiveVolcAsrHandler:
         self._sample_width = 2
         self._ws_alive = True
 
+    async def _safe_send_json(self, payload: dict) -> bool:
+        if not self._ws_alive:
+            return False
+        try:
+            await self._ws.send_json(payload)
+            return True
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            self._ws_alive = False
+            logger.info(
+                "火山实时 ASR 前端 WebSocket 已断开，停止推送 meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+            return False
+
     @staticmethod
     def _auth_headers() -> Dict[str, str]:
         app_key = settings.VOLC_ASR_APP_KEY
@@ -1666,7 +1684,7 @@ class LiveVolcAsrHandler:
         self._db.commit()
         self._db.refresh(asr_session)
         self._session_id = asr_session.id
-        await self._ws.send_json({"type": "session_created", "session_id": self._session_id})
+        await self._safe_send_json({"type": "session_created", "session_id": self._session_id})
 
         try:
             logger.info("开始火山实时 ASR 会话 meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
@@ -1696,8 +1714,7 @@ class LiveVolcAsrHandler:
             asr_session.stream_transcript_text = "".join(self._transcript_parts)
             asr_session.error_msg = str(exc)
             self._db.commit()
-            if self._ws_alive:
-                await self._ws.send_json({"type": "error", "message": str(exc)})
+            await self._safe_send_json({"type": "error", "message": str(exc)})
             raise
 
     async def _forward_audio(self, volc_ws, stop_event: asyncio.Event, seq: int) -> None:
@@ -1812,29 +1829,27 @@ class LiveVolcAsrHandler:
                     self._transcript_parts.append(text)
                     self._last_utterance_index = i
 
-                    if self._ws_alive:
-                        msg: Dict[str, Any] = {
-                            "type": "final" if is_definite else "partial",
-                            "text": text,
-                            "accumulated": "".join(self._transcript_parts),
-                        }
-                        if speaker_name:
-                            msg["speaker"] = speaker_name
-                        await self._ws.send_json(msg)
+                    msg: Dict[str, Any] = {
+                        "type": "final" if is_definite else "partial",
+                        "text": text,
+                        "accumulated": "".join(self._transcript_parts),
+                    }
+                    if speaker_name:
+                        msg["speaker"] = speaker_name
+                    await self._safe_send_json(msg)
 
             # 兜底：如果 result 没有 utterances 但又有 text，按旧模式推一把
             elif "text" in result and isinstance(result["text"], str):
                 text = result["text"]
                 if text.strip():
                     self._transcript_parts.append(text)
-                    if self._ws_alive:
-                        await self._ws.send_json(
-                            {
-                                "type": "final" if is_last else "partial",
-                                "text": text,
-                                "accumulated": "".join(self._transcript_parts),
-                            }
-                        )
+                    await self._safe_send_json(
+                        {
+                            "type": "final" if is_last else "partial",
+                            "text": text,
+                            "accumulated": "".join(self._transcript_parts),
+                        }
+                    )
 
             if is_last:
                 break
@@ -1898,19 +1913,17 @@ class LiveVolcAsrHandler:
                 self._session_id,
                 recording_session_id,
             )
-            if self._ws_alive:
-                await self._ws.send_json(
-                    {
-                        "type": "session_saved",
-                        "session_id": self._session_id,
-                        "transcript": transcript,
-                    }
-                )
+            await self._safe_send_json(
+                {
+                    "type": "session_saved",
+                    "session_id": self._session_id,
+                    "transcript": transcript,
+                }
+            )
             return
 
         # 显式 stop：合并同一次录音的所有片段
-        if self._ws_alive:
-            await self._ws.send_json({"type": "merging_audio", "session_id": self._session_id})
+        await self._safe_send_json({"type": "merging_audio", "session_id": self._session_id})
 
         audio_record = await self._merge_and_upload_recording(
             wav_dir, recording_session_id, transcript
@@ -1924,17 +1937,16 @@ class LiveVolcAsrHandler:
             audio_record.duration_seconds or 0,
         )
 
-        if self._ws_alive:
-            await self._ws.send_json(
-                {
-                    "type": "completed",
-                    "session_id": self._session_id,
-                    "audio_id": audio_record.id,
-                    "transcript": transcript,
-                    "audio_uploaded": True,
-                    "duration_seconds": audio_record.duration_seconds,
-                }
-            )
+        await self._safe_send_json(
+            {
+                "type": "completed",
+                "session_id": self._session_id,
+                "audio_id": audio_record.id,
+                "transcript": transcript,
+                "audio_uploaded": True,
+                "duration_seconds": audio_record.duration_seconds,
+            }
+        )
 
     async def _merge_and_upload_recording(
         self,
