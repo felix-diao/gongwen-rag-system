@@ -238,6 +238,32 @@ def _save_pcm_as_wav(
     return frame_count / sample_rate
 
 
+def _merge_wav_files(part_paths: List[Path], dest_path: Path) -> None:
+    """把多个同格式 WAV 文件按顺序合并成一个。
+
+    假设所有文件都是 PCM_S16LE、单声道、16kHz。
+    """
+    if not part_paths:
+        raise ValueError("没有可合并的 WAV 片段")
+
+    params: Optional[tuple] = None
+    frames: List[bytes] = []
+    for p in part_paths:
+        with wave.open(str(p), "rb") as wf:
+            if params is None:
+                params = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+            frames.append(wf.readframes(wf.getnframes()))
+
+    if params is None:
+        raise ValueError("无法读取 WAV 参数")
+
+    with wave.open(str(dest_path), "wb") as wf:
+        wf.setnchannels(params[0])
+        wf.setsampwidth(params[1])
+        wf.setframerate(params[2])
+        wf.writeframes(b"".join(frames))
+
+
 class _VolcMinutesApi:
     # 说明：封装妙记提交与查询，隔离 HTTP 协议细节。
 
@@ -1567,6 +1593,8 @@ class LiveVolcAsrHandler:
         self._last_utterance_index = -1
         self._speaker_name_map: Dict[str, str] = {}
         self._session_id: Optional[int] = None
+        self._recording_session_id: Optional[str] = None
+        self._explicit_stop = False
         self._sample_rate = 16000
         self._channels = 1
         self._sample_width = 2
@@ -1685,11 +1713,15 @@ class LiveVolcAsrHandler:
                 ctrl = json.loads(raw["text"])
                 action = ctrl.get("action")
                 if action == "stop":
+                    self._explicit_stop = True
                     stop_event.set()
                     break
                 if action == "config":
                     self._sample_rate = int(ctrl.get("rate", self._sample_rate))
                     self._channels = int(ctrl.get("channels", self._channels))
+                    rsid = ctrl.get("recording_session_id")
+                    if isinstance(rsid, str) and rsid.strip():
+                        self._recording_session_id = rsid.strip()
                 continue
             if raw.get("bytes"):
                 chunk = raw["bytes"]
@@ -1811,8 +1843,9 @@ class LiveVolcAsrHandler:
     async def _finalize(self) -> None:
         # 统一收尾：
         # 1) 拼接转写文本并更新 ASR 会话；
-        # 2) 把 PCM 片段落成 WAV；
-        # 3) 上传 WAV 并回传最终 completed 事件。
+        # 2) 把 PCM 片段落成 WAV 片段；
+        # 3) 如果是显式 stop（用户结束录音），合并同一次录音的所有片段并上传；
+        #    如果是 pause/timeout 导致的断开，只保存片段，不生成 MeetingAudio。
         transcript = "".join(self._transcript_parts)
         asr_session = (
             self._db.query(database.VolcAsrSession)
@@ -1826,11 +1859,19 @@ class LiveVolcAsrHandler:
 
         wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))
         wav_dir.mkdir(parents=True, exist_ok=True)
-        wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
+
+        # 兼容旧客户端：没有 recording_session_id 时退回到单 session 老逻辑
+        recording_session_id = self._recording_session_id
+        if recording_session_id:
+            wav_path = wav_dir / f"meeting_{self._meeting_id}_recording_{recording_session_id}_part_{self._session_id}.wav"
+        else:
+            wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
+
         logger.info(
-            "开始落盘火山实时录音 meeting_id=%s session_id=%s wav_path=%s",
+            "开始落盘火山实时录音 meeting_id=%s session_id=%s recording_session_id=%s wav_path=%s",
             self._meeting_id,
             self._session_id,
+            recording_session_id,
             wav_path,
         )
 
@@ -1844,34 +1885,43 @@ class LiveVolcAsrHandler:
         asr_session.status = "completed"
         asr_session.duration_seconds = duration
         asr_session.stream_transcript_text = transcript
-
-        if self._ws_alive:
-            await self._ws.send_json({"type": "saving_audio", "session_id": self._session_id})
-
-        # 统一复用 meeting_audio_service 的上传/TOS链路，不在本服务重复维护上传实现。
-        try:
-            audio_record = meeting_audio_service.create_audio_from_path(
-                db=self._db,
-                meeting_id=self._meeting_id,
-                provider="volc",
-                creator_id=self._creator_id,
-                source_path=wav_path,
-                file_name=f"live_{self._session_id}.wav",
-                content_type="audio/wav",
-            )
-        finally:
-            try:
-                wav_path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("火山实时录音临时 WAV 清理失败 path=%s", wav_path)
-        asr_session.source_audio_id = audio_record.id
+        asr_session.recording_session_id = recording_session_id
+        asr_session.audio_part_path = str(wav_path)
         self._db.commit()
+
+        # 非显式 stop（pause/timeout）时，只保存片段，等待后续合并
+        if not self._explicit_stop or not recording_session_id:
+            logger.info(
+                "火山实时 ASR 片段已保存 meeting_id=%s session_id=%s recording_session_id=%s "
+                "等待结束录音时合并",
+                self._meeting_id,
+                self._session_id,
+                recording_session_id,
+            )
+            if self._ws_alive:
+                await self._ws.send_json(
+                    {
+                        "type": "session_saved",
+                        "session_id": self._session_id,
+                        "transcript": transcript,
+                    }
+                )
+            return
+
+        # 显式 stop：合并同一次录音的所有片段
+        if self._ws_alive:
+            await self._ws.send_json({"type": "merging_audio", "session_id": self._session_id})
+
+        audio_record = await self._merge_and_upload_recording(
+            wav_dir, recording_session_id, transcript
+        )
+
         logger.info(
-            "火山实时 ASR 会话完成 meeting_id=%s session_id=%s audio_id=%s duration=%.3f",
+            "火山实时 ASR 录音合并完成 meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f",
             self._meeting_id,
-            self._session_id,
+            recording_session_id,
             audio_record.id,
-            duration,
+            audio_record.duration_seconds or 0,
         )
 
         if self._ws_alive:
@@ -1882,9 +1932,77 @@ class LiveVolcAsrHandler:
                     "audio_id": audio_record.id,
                     "transcript": transcript,
                     "audio_uploaded": True,
-                    "duration_seconds": duration,
+                    "duration_seconds": audio_record.duration_seconds,
                 }
             )
+
+    async def _merge_and_upload_recording(
+        self,
+        wav_dir: Path,
+        recording_session_id: str,
+        final_session_transcript: str,
+    ) -> database.MeetingAudio:
+        """合并同一次录音的所有 WAV 片段并上传到 TOS。"""
+        # 1. 查询该录音 session 下的所有 ASR 会话
+        sessions = (
+            self._db.query(database.VolcAsrSession)
+            .filter(
+                database.VolcAsrSession.recording_session_id == recording_session_id,
+                database.VolcAsrSession.status == "completed",
+            )
+            .order_by(database.VolcAsrSession.created_at.asc())
+            .all()
+        )
+        if not sessions:
+            raise RuntimeError(f"没有找到录音 session 的 ASR 记录: {recording_session_id}")
+
+        # 2. 收集所有存在的 WAV 片段
+        part_paths: List[Path] = []
+        merged_transcript_parts: List[str] = []
+        for sess in sessions:
+            if sess.audio_part_path and Path(sess.audio_part_path).exists():
+                part_paths.append(Path(sess.audio_part_path))
+            if sess.stream_transcript_text:
+                merged_transcript_parts.append(sess.stream_transcript_text)
+
+        if not part_paths:
+            raise RuntimeError(f"录音 session {recording_session_id} 没有可合并的音频片段")
+
+        # 3. 合并 WAV
+        merged_path = wav_dir / f"meeting_{self._meeting_id}_recording_{recording_session_id}_merged.wav"
+        _merge_wav_files(part_paths, merged_path)
+
+        # 4. 上传合并后的文件
+        try:
+            audio_record = meeting_audio_service.create_audio_from_path(
+                db=self._db,
+                meeting_id=self._meeting_id,
+                provider="volc",
+                creator_id=self._creator_id,
+                source_path=merged_path,
+                file_name=f"recording_{recording_session_id}.wav",
+                content_type="audio/wav",
+            )
+        finally:
+            try:
+                merged_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("合并 WAV 临时文件清理失败 path=%s", merged_path)
+
+        # 5. 回填所有 session 的 source_audio_id，并聚合转写文本
+        merged_transcript = "".join(merged_transcript_parts)
+        for sess in sessions:
+            sess.source_audio_id = audio_record.id
+        self._db.commit()
+
+        # 6. 清理原始片段文件
+        for p in part_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("录音片段清理失败 path=%s", p)
+
+        return audio_record
 
 
 volc_meeting_minute_service = VolcMeetingMinuteService()

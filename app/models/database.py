@@ -256,6 +256,10 @@ class VolcAsrSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     # 关联 meetings.id
     meeting_id = Column(Integer, index=True, nullable=False)
+    # 一次连续录音的标识，断连重连时复用
+    recording_session_id = Column(String(64), index=True, nullable=True)
+    # 本次会话录音片段的本地路径（结束录音时用于合并）
+    audio_part_path = Column(String(512), nullable=True)
     # 关联 meeting_audios.id，录音上传后回填
     source_audio_id = Column(Integer, index=True)
     # pending / completed / failed 等
