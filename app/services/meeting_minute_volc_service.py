@@ -1803,11 +1803,8 @@ class LiveVolcAsrHandler:
 
             if isinstance(utterances, list):
                 for i, u in enumerate(utterances):
-                    if i <= self._last_utterance_index:
-                        continue
                     if not isinstance(u, dict):
                         continue
-
                     text = u.get("text")
                     if not isinstance(text, str) or not text.strip():
                         continue
@@ -1825,18 +1822,32 @@ class LiveVolcAsrHandler:
                                 self._speaker_name_map[sid] = f"说话人{len(self._speaker_name_map) + 1}"
                             speaker_name = self._speaker_name_map[sid]
 
-                    # 累积到 transcript_parts，用于最终落盘
-                    self._transcript_parts.append(text)
-                    self._last_utterance_index = i
-
-                    msg: Dict[str, Any] = {
-                        "type": "final" if is_definite else "partial",
-                        "text": text,
-                        "accumulated": "".join(self._transcript_parts),
-                    }
-                    if speaker_name:
-                        msg["speaker"] = speaker_name
-                    await self._safe_send_json(msg)
+                    if is_definite:
+                        # 确定分句：落袋并推进索引
+                        if i > self._last_utterance_index:
+                            self._transcript_parts.append(text)
+                            self._last_utterance_index = i
+                            await self._safe_send_json(
+                                {
+                                    "type": "final",
+                                    "text": text,
+                                    "accumulated": "".join(self._transcript_parts),
+                                    "speaker": speaker_name,
+                                }
+                            )
+                    else:
+                        # 未确定分句：只作为 partial 展示，不推进索引
+                        # 这样它后续变成 definite 时还能再发一次 final
+                        last_indefinite_index = i
+                        if i > self._last_utterance_index:
+                            await self._safe_send_json(
+                                {
+                                    "type": "partial",
+                                    "text": text,
+                                    "accumulated": "".join(self._transcript_parts) + text,
+                                    "speaker": speaker_name,
+                                }
+                            )
 
             # 兜底：如果 result 没有 utterances 但又有 text，按旧模式推一把
             elif "text" in result and isinstance(result["text"], str):
