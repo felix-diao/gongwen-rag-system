@@ -1595,6 +1595,7 @@ class LiveVolcAsrHandler:
         self._transcript_parts: List[str] = []
         self._last_utterance_index = -1
         self._speaker_name_map: Dict[str, str] = {}
+        self._max_result_text: str = ""
         self._session_id: Optional[int] = None
         self._recording_session_id: Optional[str] = None
         self._explicit_stop = False
@@ -1798,6 +1799,11 @@ class LiveVolcAsrHandler:
                     break
                 continue
 
+            # 保留所有响应里出现过的最长全量文本，作为兜底
+            full_text = result.get("text")
+            if isinstance(full_text, str) and len(full_text) > len(self._max_result_text):
+                self._max_result_text = full_text
+
             utterances = result.get("utterances")
             is_last = bool(resp.is_last_package)
 
@@ -1872,7 +1878,9 @@ class LiveVolcAsrHandler:
         # 2) 把 PCM 片段落成 WAV 片段；
         # 3) 如果是显式 stop（用户结束录音），合并同一次录音的所有片段并上传；
         #    如果是 pause/timeout 导致的断开，只保存片段，不生成 MeetingAudio。
-        transcript = "".join(self._transcript_parts)
+        # 用 definite 分句拼接文本 和 所有响应里最长全量文本 两者取最长，避免漏字
+        parts_text = "".join(self._transcript_parts)
+        transcript = parts_text if len(parts_text) >= len(self._max_result_text) else self._max_result_text
         asr_session = (
             self._db.query(database.VolcAsrSession)
             .filter(database.VolcAsrSession.id == self._session_id)
