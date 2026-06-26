@@ -1711,6 +1711,19 @@ class LiveVolcAsrHandler:
             await self._finalize()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Volc live ASR run failed meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
+
+            # ASR 失败时，已录制的音频片段仍有价值，尝试保存下来。
+            if self._audio_chunks:
+                try:
+                    await self._save_partial_audio()
+                except Exception as save_exc:  # noqa: BLE001
+                    logger.warning(
+                        "ASR 失败时保存部分音频失败 meeting_id=%s session_id=%s: %s",
+                        self._meeting_id,
+                        self._session_id,
+                        save_exc,
+                    )
+
             asr_session.status = "failed"
             asr_session.stream_transcript_text = "".join(self._transcript_parts)
             asr_session.error_msg = str(exc)
@@ -1967,6 +1980,73 @@ class LiveVolcAsrHandler:
             }
         )
 
+    async def _save_partial_audio(self) -> None:
+        """ASR 失败时，把已录制的 PCM 片段保存为 WAV 并关联 MeetingAudio。
+
+        这样即使火山服务端超时/异常，用户录音数据也不会丢失，
+        后续仍可合并到同一次 recording_session_id 的完整录音中。
+        """
+        if not self._audio_chunks:
+            return
+
+        asr_session = (
+            self._db.query(database.VolcAsrSession)
+            .filter(database.VolcAsrSession.id == self._session_id)
+            .first()
+        )
+        if not asr_session:
+            raise RuntimeError("ASR 会话不存在")
+
+        wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))
+        wav_dir.mkdir(parents=True, exist_ok=True)
+
+        recording_session_id = self._recording_session_id
+        if recording_session_id:
+            wav_path = wav_dir / f"meeting_{self._meeting_id}_recording_{recording_session_id}_part_{self._session_id}.wav"
+        else:
+            wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
+
+        logger.info(
+            "保存火山实时 ASR 部分音频 meeting_id=%s session_id=%s recording_session_id=%s wav_path=%s",
+            self._meeting_id,
+            self._session_id,
+            recording_session_id,
+            wav_path,
+        )
+
+        duration = _save_pcm_as_wav(
+            self._audio_chunks,
+            wav_path,
+            sample_rate=self._sample_rate,
+            channels=self._channels,
+            sample_width=self._sample_width,
+        )
+
+        audio_record = meeting_audio_service.create_audio_from_path(
+            db=self._db,
+            meeting_id=self._meeting_id,
+            provider="volc",
+            creator_id=self._creator_id,
+            source_path=wav_path,
+            file_name=wav_path.name,
+            content_type="audio/wav",
+        )
+
+        asr_session.source_audio_id = audio_record.id
+        asr_session.duration_seconds = duration
+        asr_session.recording_session_id = recording_session_id
+        asr_session.audio_part_path = str(wav_path)
+        # status 保持原样（调用方会设为 failed），但 audio_part_path 必须落盘
+        self._db.commit()
+
+        logger.info(
+            "火山实时 ASR 部分音频已保存 meeting_id=%s session_id=%s audio_id=%s duration=%.3f",
+            self._meeting_id,
+            self._session_id,
+            audio_record.id,
+            duration,
+        )
+
     async def _merge_and_upload_recording(
         self,
         wav_dir: Path,
@@ -1979,7 +2059,8 @@ class LiveVolcAsrHandler:
             self._db.query(database.VolcAsrSession)
             .filter(
                 database.VolcAsrSession.recording_session_id == recording_session_id,
-                database.VolcAsrSession.status == "completed",
+                database.VolcAsrSession.status.in_(["completed", "failed"]),
+                database.VolcAsrSession.audio_part_path.isnot(None),
             )
             .order_by(database.VolcAsrSession.created_at.asc())
             .all()
