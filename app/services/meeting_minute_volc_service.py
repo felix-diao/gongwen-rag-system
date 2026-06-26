@@ -1571,6 +1571,176 @@ class VolcMeetingMinuteService:
                     )
                 )
 
+    async def finalize_recording_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        recording_session_id: Optional[str] = None,
+        max_wait_seconds: int = 10,
+    ) -> Optional[database.MeetingAudio]:
+        """结束录音时统一合并同一次 recording_session 的所有片段。
+
+        流程：
+        1. 等待同 recording_session_id 下所有 processing 的 ASR 会话结束。
+        2. 收集 completed/failed 且带 audio_part_path 的会话。
+        3. 如果已有最新 merged 音频且晚于所有 part，直接返回。
+        4. 合并 WAV 片段并上传 TOS，创建 MeetingAudio。
+        5. 回填所有相关 session 的 source_audio_id。
+        6. 清理本地 part 片段文件。
+
+        参数:
+            recording_session_id: 录音 session id；为空时从最新 ASR 会话推断。
+            max_wait_seconds: 等待 processing 会话结束的最大秒数。
+        """
+        self._assert_meeting_exists(db, meeting_id)
+
+        # 推断 recording_session_id
+        if not recording_session_id:
+            latest_session = self._latest_asr_session(db, meeting_id)
+            if not latest_session:
+                logger.warning("会议没有任何 ASR 会话 meeting_id=%s", meeting_id)
+                return None
+            recording_session_id = latest_session.recording_session_id
+            if not recording_session_id:
+                # 旧数据没有 recording_session_id，退回到最新音频逻辑
+                logger.info("会议没有 recording_session_id，使用最新音频 meeting_id=%s", meeting_id)
+                return self._latest_volc_audio(db, meeting_id)
+
+        # 等待所有 processing 会话结束
+        for waited in range(max_wait_seconds):
+            processing_count = (
+                db.query(database.VolcAsrSession)
+                .filter(
+                    database.VolcAsrSession.meeting_id == meeting_id,
+                    database.VolcAsrSession.recording_session_id == recording_session_id,
+                    database.VolcAsrSession.status == "processing",
+                )
+                .count()
+            )
+            if processing_count == 0:
+                break
+            logger.info(
+                "等待 ASR 会话结束 meeting_id=%s recording_session_id=%s processing=%d waited=%d",
+                meeting_id,
+                recording_session_id,
+                processing_count,
+                waited,
+            )
+            await asyncio.sleep(1)
+        else:
+            logger.warning(
+                "等待 ASR 会话结束超时 meeting_id=%s recording_session_id=%s max_wait=%d",
+                meeting_id,
+                recording_session_id,
+                max_wait_seconds,
+            )
+
+        # 收集可合并的会话
+        sessions = (
+            db.query(database.VolcAsrSession)
+            .filter(
+                database.VolcAsrSession.meeting_id == meeting_id,
+                database.VolcAsrSession.recording_session_id == recording_session_id,
+                database.VolcAsrSession.status.in_(["completed", "failed"]),
+                database.VolcAsrSession.audio_part_path.isnot(None),
+            )
+            .order_by(database.VolcAsrSession.created_at.asc())
+            .all()
+        )
+        if not sessions:
+            logger.warning(
+                "没有可合并的 ASR 片段 meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+            return None
+
+        # 检查是否已经有更新的 merged 音频
+        latest_part_update = max(
+            (sess.updated_at or sess.created_at for sess in sessions),
+            default=None,
+        )
+        existing_merged_ids = {sess.source_audio_id for sess in sessions if sess.source_audio_id}
+        existing_merged = None
+        if existing_merged_ids:
+            existing_merged = (
+                db.query(database.MeetingAudio)
+                .filter(
+                    database.MeetingAudio.id.in_(existing_merged_ids),
+                    database.MeetingAudio.provider == "volc",
+                )
+                .order_by(database.MeetingAudio.updated_at.desc())
+                .first()
+            )
+        if existing_merged and latest_part_update and existing_merged.updated_at >= latest_part_update:
+            logger.info(
+                "已有最新合并音频，无需重新合并 meeting_id=%s recording_session_id=%s audio_id=%s",
+                meeting_id,
+                recording_session_id,
+                existing_merged.id,
+            )
+            return existing_merged
+
+        # 取会议 creator_id 作为音频创建者
+        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
+        creator_id = meeting.creator_id if meeting else None
+
+        # 合并并上传
+        wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))
+        wav_dir.mkdir(parents=True, exist_ok=True)
+
+        part_paths = [Path(sess.audio_part_path) for sess in sessions if sess.audio_part_path]
+        if not part_paths or not all(p.exists() for p in part_paths):
+            missing = [str(p) for p in part_paths if not p.exists()]
+            logger.error(
+                "部分音频片段文件缺失 meeting_id=%s recording_session_id=%s missing=%s",
+                meeting_id,
+                recording_session_id,
+                missing,
+            )
+            raise RuntimeError(f"音频片段文件缺失: {missing}")
+
+        merged_path = wav_dir / f"meeting_{meeting_id}_recording_{recording_session_id}_merged.wav"
+        _merge_wav_files(part_paths, merged_path)
+
+        try:
+            audio_record = meeting_audio_service.create_audio_from_path(
+                db=db,
+                meeting_id=meeting_id,
+                provider="volc",
+                creator_id=creator_id,
+                source_path=merged_path,
+                file_name=f"recording_{recording_session_id}.wav",
+                content_type="audio/wav",
+            )
+        finally:
+            try:
+                merged_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("合并 WAV 临时文件清理失败 path=%s", merged_path)
+
+        total_duration = sum((sess.duration_seconds or 0) for sess in sessions)
+        audio_record.duration_seconds = total_duration
+        for sess in sessions:
+            sess.source_audio_id = audio_record.id
+        db.commit()
+
+        # 清理本地 part 片段文件
+        for p in part_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("录音片段清理失败 path=%s", p)
+
+        logger.info(
+            "录音合并完成 meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f sessions=%d",
+            meeting_id,
+            recording_session_id,
+            audio_record.id,
+            total_duration,
+            len(sessions),
+        )
+        return audio_record
 
 class LiveVolcAsrHandler:
     # 核心职责：
@@ -2124,176 +2294,6 @@ class LiveVolcAsrHandler:
 
         return audio_record
 
-    async def finalize_recording_async(
-        self,
-        db: Session,
-        meeting_id: int,
-        recording_session_id: Optional[str] = None,
-        max_wait_seconds: int = 10,
-    ) -> Optional[database.MeetingAudio]:
-        """结束录音时统一合并同一次 recording_session 的所有片段。
-
-        流程：
-        1. 等待同 recording_session_id 下所有 processing 的 ASR 会话结束。
-        2. 收集 completed/failed 且带 audio_part_path 的会话。
-        3. 如果已有最新 merged 音频且晚于所有 part，直接返回。
-        4. 合并 WAV 片段并上传 TOS，创建 MeetingAudio。
-        5. 回填所有相关 session 的 source_audio_id。
-        6. 清理本地 part 片段文件。
-
-        参数:
-            recording_session_id: 录音 session id；为空时从最新 ASR 会话推断。
-            max_wait_seconds: 等待 processing 会话结束的最大秒数。
-        """
-        self._assert_meeting_exists(db, meeting_id)
-
-        # 推断 recording_session_id
-        if not recording_session_id:
-            latest_session = self._latest_asr_session(db, meeting_id)
-            if not latest_session:
-                logger.warning("会议没有任何 ASR 会话 meeting_id=%s", meeting_id)
-                return None
-            recording_session_id = latest_session.recording_session_id
-            if not recording_session_id:
-                # 旧数据没有 recording_session_id，退回到最新音频逻辑
-                logger.info("会议没有 recording_session_id，使用最新音频 meeting_id=%s", meeting_id)
-                return self._latest_volc_audio(db, meeting_id)
-
-        # 等待所有 processing 会话结束
-        for waited in range(max_wait_seconds):
-            processing_count = (
-                db.query(database.VolcAsrSession)
-                .filter(
-                    database.VolcAsrSession.meeting_id == meeting_id,
-                    database.VolcAsrSession.recording_session_id == recording_session_id,
-                    database.VolcAsrSession.status == "processing",
-                )
-                .count()
-            )
-            if processing_count == 0:
-                break
-            logger.info(
-                "等待 ASR 会话结束 meeting_id=%s recording_session_id=%s processing=%d waited=%d",
-                meeting_id,
-                recording_session_id,
-                processing_count,
-                waited,
-            )
-            await asyncio.sleep(1)
-        else:
-            logger.warning(
-                "等待 ASR 会话结束超时 meeting_id=%s recording_session_id=%s max_wait=%d",
-                meeting_id,
-                recording_session_id,
-                max_wait_seconds,
-            )
-
-        # 收集可合并的会话
-        sessions = (
-            db.query(database.VolcAsrSession)
-            .filter(
-                database.VolcAsrSession.meeting_id == meeting_id,
-                database.VolcAsrSession.recording_session_id == recording_session_id,
-                database.VolcAsrSession.status.in_(["completed", "failed"]),
-                database.VolcAsrSession.audio_part_path.isnot(None),
-            )
-            .order_by(database.VolcAsrSession.created_at.asc())
-            .all()
-        )
-        if not sessions:
-            logger.warning(
-                "没有可合并的 ASR 片段 meeting_id=%s recording_session_id=%s",
-                meeting_id,
-                recording_session_id,
-            )
-            return None
-
-        # 检查是否已经有更新的 merged 音频
-        latest_part_update = max(
-            (sess.updated_at or sess.created_at for sess in sessions),
-            default=None,
-        )
-        existing_merged_ids = {sess.source_audio_id for sess in sessions if sess.source_audio_id}
-        existing_merged = None
-        if existing_merged_ids:
-            existing_merged = (
-                db.query(database.MeetingAudio)
-                .filter(
-                    database.MeetingAudio.id.in_(existing_merged_ids),
-                    database.MeetingAudio.provider == "volc",
-                )
-                .order_by(database.MeetingAudio.updated_at.desc())
-                .first()
-            )
-        if existing_merged and latest_part_update and existing_merged.updated_at >= latest_part_update:
-            logger.info(
-                "已有最新合并音频，无需重新合并 meeting_id=%s recording_session_id=%s audio_id=%s",
-                meeting_id,
-                recording_session_id,
-                existing_merged.id,
-            )
-            return existing_merged
-
-        # 取会议 creator_id 作为音频创建者
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        creator_id = meeting.creator_id if meeting else None
-
-        # 合并并上传
-        wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))
-        wav_dir.mkdir(parents=True, exist_ok=True)
-
-        part_paths = [Path(sess.audio_part_path) for sess in sessions if sess.audio_part_path]
-        if not part_paths or not all(p.exists() for p in part_paths):
-            missing = [str(p) for p in part_paths if not p.exists()]
-            logger.error(
-                "部分音频片段文件缺失 meeting_id=%s recording_session_id=%s missing=%s",
-                meeting_id,
-                recording_session_id,
-                missing,
-            )
-            raise RuntimeError(f"音频片段文件缺失: {missing}")
-
-        merged_path = wav_dir / f"meeting_{meeting_id}_recording_{recording_session_id}_merged.wav"
-        _merge_wav_files(part_paths, merged_path)
-
-        try:
-            audio_record = meeting_audio_service.create_audio_from_path(
-                db=db,
-                meeting_id=meeting_id,
-                provider="volc",
-                creator_id=creator_id,
-                source_path=merged_path,
-                file_name=f"recording_{recording_session_id}.wav",
-                content_type="audio/wav",
-            )
-        finally:
-            try:
-                merged_path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("合并 WAV 临时文件清理失败 path=%s", merged_path)
-
-        total_duration = sum((sess.duration_seconds or 0) for sess in sessions)
-        audio_record.duration_seconds = total_duration
-        for sess in sessions:
-            sess.source_audio_id = audio_record.id
-        db.commit()
-
-        # 清理本地 part 片段文件
-        for p in part_paths:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("录音片段清理失败 path=%s", p)
-
-        logger.info(
-            "录音合并完成 meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f sessions=%d",
-            meeting_id,
-            recording_session_id,
-            audio_record.id,
-            total_duration,
-            len(sessions),
-        )
-        return audio_record
 
 
 volc_meeting_minute_service = VolcMeetingMinuteService()
