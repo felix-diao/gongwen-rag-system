@@ -781,6 +781,17 @@ class VolcMinutesCancelResponse(BaseModel):
     job_id: int
     source_audio_id: Optional[int] = None
     task_id: Optional[str] = None
+
+
+class VolcFinalizeRecordingRequest(BaseModel):
+    """结束录音并合并音频片段请求。"""
+    recording_session_id: Optional[str] = None
+
+
+class VolcFinalizeRecordingResponse(BaseModel):
+    """结束录音并合并音频片段响应。"""
+    audio_id: int
+    file_url: Optional[str] = None
     status: Literal["cancelled"] = "cancelled"
 
 

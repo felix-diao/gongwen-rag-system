@@ -239,6 +239,8 @@ class MeetingAudio(Base):
     file_type = Column(String(64))
     # 处理状态：uploaded / submitted / completed / failed 等
     status = Column(String(32), default="uploaded", nullable=False)
+    # 音频时长（秒），上传后回填
+    duration_seconds = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -7,7 +7,7 @@ GET 聚合流式稿、精准转写、说话人分段、摘要、待办与任务�
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, WebSocket
 from sqlalchemy.orm import Session
@@ -115,8 +115,51 @@ def submit_minutes(
     )
 
 
-# 基于会议最新音频自动生成火山会议纪要。
-# 1. 查找该会议最新的 volc 音频。
+# 结束录音并合并同一次 recording_session 的所有音频片段。
+@router.post(
+    "/{meeting_id}/finalize-recording",
+    response_model=StandardResponse[schemas.VolcFinalizeRecordingResponse],
+)
+async def finalize_recording(
+    meeting_id: int,
+    payload: schemas.VolcFinalizeRecordingRequest | None = Body(None),
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    payload = payload or schemas.VolcFinalizeRecordingRequest()
+    logger.info(
+        "结束录音并合并音频请求 meeting_id=%s recording_session_id=%s",
+        meeting_id,
+        payload.recording_session_id,
+    )
+    try:
+        audio = await volc_meeting_minute_service.finalize_recording_async(
+            db=db,
+            meeting_id=meeting_id,
+            recording_session_id=payload.recording_session_id,
+        )
+    except ValueError as exc:
+        logger.warning("结束录音并合并音频失败 meeting_id=%s error=%s", meeting_id, exc)
+        raise _http_from_volc_minutes_value_error(exc) from exc
+    except RuntimeError as exc:
+        logger.warning("结束录音并合并音频失败 meeting_id=%s error=%s", meeting_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not audio:
+        raise HTTPException(status_code=400, detail="未找到可合并的录音片段")
+
+    logger.info(
+        "结束录音并合并音频成功 meeting_id=%s audio_id=%s",
+        meeting_id,
+        audio.id,
+    )
+    return StandardResponse(
+        success=True,
+        data={"audio_id": audio.id, "file_url": audio.file_url},
+        message="录音已合并",
+    )
+
+
 # 2. 调用 submit_minutes 提交妙记任务。
 # 3. 返回 VolcMinutesJobInDB。
 @router.post(
@@ -125,17 +168,28 @@ def submit_minutes(
 )
 def generate_minutes(
     meeting_id: int,
+    audio_id: Optional[int] = Query(None, description="指定使用的音频 id，不传则取最新音频"),
     db: Session = Depends(database.get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    logger.info("生成火山纪要请求 meeting_id=%s", meeting_id)
-    # 查找最新音频
-    audio = volc_meeting_minute_service._latest_volc_audio(db, meeting_id)
+    logger.info("生成火山纪要请求 meeting_id=%s audio_id=%s", meeting_id, audio_id)
+    # 查找音频：指定 audio_id 优先，否则取最新
+    if audio_id:
+        audio = (
+            volc_meeting_minute_service._volc_audio_query(db)
+            .filter(
+                database.MeetingAudio.id == audio_id,
+                database.MeetingAudio.meeting_id == meeting_id,
+            )
+            .first()
+        )
+    else:
+        audio = volc_meeting_minute_service._latest_volc_audio(db, meeting_id)
     if not audio:
         raise HTTPException(status_code=400, detail="未找到该会议的音频记录")
     if not audio.file_url:
         raise HTTPException(status_code=400, detail="音频缺少 file_url，无法提交语音妙记")
-    
+
     # 提交妙记任务
     try:
         record = volc_meeting_minute_service.submit_minutes(
