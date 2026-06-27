@@ -793,6 +793,7 @@ class VolcFinalizeRecordingResponse(BaseModel):
     """结束录音并合并音频片段响应。"""
     audio_id: int
     file_url: Optional[str] = None
+    status: Optional[str] = None
 
 
 class VolcFinalizeAndGenerateRequest(BaseModel):
@@ -806,6 +807,7 @@ class VolcFinalizeAndGenerateResponse(BaseModel):
         "submitted",
         "already_submitted",
         "failed_no_audio",
+        "accepted",
     ]
     audio_id: Optional[int] = None
     job_id: Optional[int] = None

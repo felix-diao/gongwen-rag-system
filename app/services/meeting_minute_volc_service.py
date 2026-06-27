@@ -25,7 +25,7 @@ import uuid
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 import requests
@@ -549,7 +549,10 @@ class VolcMeetingMinuteService:
         meeting_id: int,
         recording_session_id: str,
     ) -> Dict[str, Any]:
-        """合并同一次录音的所有片段，并保证只提交一次纪要任务。"""
+        """合并同一次录音的所有片段，并保证只提交一次纪要任务。
+
+        音频上传改为异步：本方法快速返回，上传完成后的妙记提交由上传回调负责。
+        """
         if not recording_session_id:
             raise ValueError("recording_session_id 不能为空")
 
@@ -564,6 +567,7 @@ class VolcMeetingMinuteService:
                 db=db,
                 meeting_id=meeting_id,
                 recording_session_id=recording_session_id,
+                auto_submit_minutes=True,
             )
 
             if not audio:
@@ -602,17 +606,37 @@ class VolcMeetingMinuteService:
                         "job_status": job.status,
                     }
 
-            job = self.submit_minutes(
-                db=db,
-                meeting_id=meeting_id,
-                audio_id=audio.id,
-            )
+            audio_status = str(audio.status or "").strip().lower()
 
+            # 上传失败：源文件已不可用，无法再次提交。
+            if audio_status == "failed":
+                return {
+                    "status": "failed_no_audio",
+                    "audio_id": audio.id,
+                    "job_id": None,
+                    "job_status": None,
+                }
+
+            # 已经上传完成（例如之前调用过 finalize-recording）：立即提交。
+            if audio_status == "uploaded":
+                job = self.submit_minutes(
+                    db=db,
+                    meeting_id=meeting_id,
+                    audio_id=audio.id,
+                )
+                return {
+                    "status": "submitted",
+                    "audio_id": audio.id,
+                    "job_id": job.id,
+                    "job_status": job.status,
+                }
+
+            # 正在上传：由上传完成回调自动提交妙记。
             return {
-                "status": "submitted",
+                "status": "accepted",
                 "audio_id": audio.id,
-                "job_id": job.id,
-                "job_status": job.status,
+                "job_id": None,
+                "job_status": None,
             }
 
     @staticmethod
@@ -1787,6 +1811,7 @@ class VolcMeetingMinuteService:
         meeting_id: int,
         recording_session_id: Optional[str] = None,
         max_wait_seconds: int = 10,
+        auto_submit_minutes: bool = False,
     ) -> Optional[database.MeetingAudio]:
         """结束录音时统一合并同一次 recording_session 的所有片段。
 
@@ -1794,13 +1819,14 @@ class VolcMeetingMinuteService:
         1. 等待同 recording_session_id 下所有 processing 的 ASR 会话结束。
         2. 收集 completed/failed 且带 audio_part_path 的会话。
         3. 如果已有最新 merged 音频且晚于所有 part，直接返回。
-        4. 合并 WAV 片段并上传 TOS，创建 MeetingAudio。
+        4. 合并 WAV 片段并异步上传 TOS，创建 MeetingAudio（status='uploading'）。
         5. 回填所有相关 session 的 source_audio_id。
         6. 清理本地 part 片段文件。
 
         参数:
             recording_session_id: 录音 session id；为空时从最新 ASR 会话推断。
             max_wait_seconds: 等待 processing 会话结束的最大秒数。
+            auto_submit_minutes: 上传完成后是否自动提交妙记任务。
         """
         self._assert_meeting_exists(db, meeting_id)
 
@@ -1902,10 +1928,14 @@ class VolcMeetingMinuteService:
                 return existing_merged
 
         # 取会议 creator_id 作为音频创建者
-        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
-        creator_id = meeting.creator_id if meeting else None
+        # 使用 raw SQL 避免本地模型列与部署库不一致（如 meetings.provider）
+        creator_row = db.execute(
+            database.text("SELECT creator_id FROM meetings WHERE id = :meeting_id LIMIT 1"),
+            {"meeting_id": meeting_id},
+        ).first()
+        creator_id = creator_row.creator_id if creator_row else None
 
-        # 合并并上传
+        # 合并并异步上传
         wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))
         wav_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1923,21 +1953,58 @@ class VolcMeetingMinuteService:
         merged_path = wav_dir / f"meeting_{meeting_id}_recording_{recording_session_id}_merged.wav"
         _merge_wav_files(part_paths, merged_path)
 
-        try:
-            audio_record = meeting_audio_service.create_audio_from_path(
-                db=db,
-                meeting_id=meeting_id,
-                provider="volc",
-                creator_id=creator_id,
-                source_path=merged_path,
-                file_name=f"recording_{recording_session_id}.wav",
-                content_type="audio/wav",
-            )
-        finally:
-            try:
-                merged_path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("合并 WAV 临时文件清理失败 path=%s", merged_path)
+        on_upload_complete: Optional[Callable[[database.MeetingAudio], None]] = None
+        if auto_submit_minutes:
+
+            def _on_upload_complete(uploaded_audio: database.MeetingAudio) -> None:
+                """音频上传成功后自动提交妙记任务。"""
+                db_callback = database.SessionLocal()
+                try:
+                    existing_job = (
+                        db_callback.query(database.VolcMinutesJob)
+                        .filter(
+                            database.VolcMinutesJob.meeting_id == meeting_id,
+                            database.VolcMinutesJob.source_audio_id == uploaded_audio.id,
+                        )
+                        .order_by(database.VolcMinutesJob.id.desc())
+                        .first()
+                    )
+                    if existing_job:
+                        job_status = str(existing_job.status or "").strip().lower()
+                        if (
+                            job_status not in MINUTES_FAILED_STATUS
+                            and job_status not in MINUTES_CANCELLED_STATUS
+                        ):
+                            logger.info(
+                                "妙记任务已存在，跳过自动提交 "
+                                "meeting_id=%s audio_id=%s job_id=%s",
+                                meeting_id,
+                                uploaded_audio.id,
+                                existing_job.id,
+                            )
+                            return
+                    self.submit_minutes(db_callback, meeting_id, uploaded_audio.id)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "自动提交妙记失败 meeting_id=%s audio_id=%s",
+                        meeting_id,
+                        uploaded_audio.id,
+                    )
+                finally:
+                    db_callback.close()
+
+            on_upload_complete = _on_upload_complete
+
+        audio_record = meeting_audio_service.create_audio_from_path_async(
+            db=db,
+            meeting_id=meeting_id,
+            provider="volc",
+            creator_id=creator_id,
+            source_path=merged_path,
+            file_name=f"recording_{recording_session_id}.wav",
+            content_type="audio/wav",
+            on_upload_complete=on_upload_complete,
+        )
 
         total_duration = sum((sess.duration_seconds or 0) for sess in sessions)
         audio_record.duration_seconds = total_duration
@@ -1953,7 +2020,8 @@ class VolcMeetingMinuteService:
                 logger.warning("录音片段清理失败 path=%s", p)
 
         logger.info(
-            "录音合并完成 meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f sessions=%d",
+            "录音合并完成并已启动异步上传 "
+            "meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f sessions=%d",
             meeting_id,
             recording_session_id,
             audio_record.id,

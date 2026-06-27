@@ -22,7 +22,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional, Tuple, cast
+from typing import Callable, Literal, Optional, Tuple, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -279,6 +279,115 @@ class MeetingAudioService:
         db.commit()
         db.refresh(record)
         return record
+
+    def create_audio_from_path_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        provider: Provider,
+        creator_id: Optional[str],
+        source_path: Path,
+        file_name: str,
+        content_type: Optional[str],
+        on_upload_complete: Optional[Callable[[database.MeetingAudio], None]] = None,
+    ) -> database.MeetingAudio:
+        """先持久化音频记录（status='uploading'），再由后台线程上传。
+
+        适用场景：需要立即拿到 audio_id 并返回响应，但上传本身可能耗时较长
+        （例如火山录音收尾）。上传成功后会触发 on_upload_complete 回调。
+        """
+        self._assert_meeting_exists(db, meeting_id)
+        if not source_path.exists() or not source_path.is_file():
+            raise HTTPException(status_code=400, detail="本地音频文件不存在")
+        if not file_name:
+            raise HTTPException(status_code=400, detail="音频文件名不能为空")
+        normalized_content_type = self._validate_content_type(content_type)
+        self._assert_upload_quota(db, meeting_id, provider)
+
+        suffix = Path(file_name).suffix or source_path.suffix or ".bin"
+        object_key = f"{meeting_id}/{provider}/{uuid4().hex}{suffix}"
+        audio_cls = database.LocalMeetingAudio if provider == "local" else database.VolcMeetingAudio
+        record = audio_cls(
+            meeting_id=meeting_id,
+            provider=provider,
+            creator_id=creator_id,
+            file_name=file_name,
+            object_key=object_key,
+            file_url=None,
+            file_type=normalized_content_type,
+            status="uploading",
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+
+        thread = threading.Thread(
+            target=self._run_upload_from_path,
+            args=(record.id, source_path, object_key, normalized_content_type, on_upload_complete),
+            daemon=True,
+            name=f"meeting-audio-upload-from-path-{record.id}",
+        )
+        thread.start()
+        logger.info(
+            "已启动音频异步上传 meeting_id=%s provider=%s audio_id=%s object_key=%s",
+            meeting_id,
+            provider,
+            record.id,
+            object_key,
+        )
+        return record
+
+    def _run_upload_from_path(
+        self,
+        audio_id: int,
+        source_path: Path,
+        object_key: str,
+        content_type: str,
+        on_upload_complete: Optional[Callable[[database.MeetingAudio], None]],
+    ) -> None:
+        db = database.SessionLocal()
+        try:
+            file_url = self._get_uploader().upload_file(source_path, object_key, content_type)
+            record = (
+                db.query(database.MeetingAudio)
+                .filter(database.MeetingAudio.id == audio_id)
+                .first()
+            )
+            if record is None:
+                logger.error("异步上传完成但音频记录不存在 audio_id=%s", audio_id)
+                return
+            record.status = "uploaded"
+            record.file_url = file_url
+            db.commit()
+            db.refresh(record)
+            logger.info(
+                "音频异步上传完成 audio_id=%s object_key=%s file_url=%s",
+                audio_id,
+                object_key,
+                file_url,
+            )
+            if on_upload_complete:
+                try:
+                    on_upload_complete(record)
+                except Exception:  # noqa: BLE001
+                    logger.exception("音频上传完成回调执行失败 audio_id=%s", audio_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("音频异步上传失败 audio_id=%s object_key=%s", audio_id, object_key)
+            record = (
+                db.query(database.MeetingAudio)
+                .filter(database.MeetingAudio.id == audio_id)
+                .first()
+            )
+            if record is not None:
+                record.status = "failed"
+                record.error_msg = str(exc)
+                db.commit()
+        finally:
+            db.close()
+            try:
+                source_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("异步上传源文件清理失败 path=%s", source_path)
 
     def _build_upload_task_schema(
         self,

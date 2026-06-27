@@ -137,6 +137,7 @@ async def finalize_recording(
             db=db,
             meeting_id=meeting_id,
             recording_session_id=payload.recording_session_id,
+            auto_submit_minutes=False,
         )
     except ValueError as exc:
         logger.warning("结束录音并合并音频失败 meeting_id=%s error=%s", meeting_id, exc)
@@ -149,13 +150,18 @@ async def finalize_recording(
         raise HTTPException(status_code=400, detail="未找到可合并的录音片段")
 
     logger.info(
-        "结束录音并合并音频成功 meeting_id=%s audio_id=%s",
+        "结束录音并合并音频成功 meeting_id=%s audio_id=%s status=%s",
         meeting_id,
         audio.id,
+        audio.status,
     )
     return StandardResponse(
         success=True,
-        data={"audio_id": audio.id, "file_url": audio.file_url},
+        data={
+            "audio_id": audio.id,
+            "file_url": audio.file_url,
+            "status": audio.status,
+        },
         message="录音已合并",
     )
 
@@ -234,6 +240,10 @@ async def finalize_and_generate(
         message = "录音已合并，会议纪要任务已提交"
     elif status == "already_submitted":
         message = "录音和会议纪要任务已经完成收尾"
+    elif status == "accepted":
+        message = "录音正在上传，会议纪要将在上传完成后自动生成"
+    elif status == "failed_no_audio" and result.get("audio_id"):
+        message = "录音上传失败，无法生成会议纪要"
     else:
         message = "没有找到可用录音，无法生成会议纪要"
 
