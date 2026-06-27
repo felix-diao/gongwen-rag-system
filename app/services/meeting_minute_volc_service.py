@@ -1928,12 +1928,8 @@ class VolcMeetingMinuteService:
                 return existing_merged
 
         # 取会议 creator_id 作为音频创建者
-        # 使用 raw SQL 避免本地模型列与部署库不一致（如 meetings.provider）
-        creator_row = db.execute(
-            database.text("SELECT creator_id FROM meetings WHERE id = :meeting_id LIMIT 1"),
-            {"meeting_id": meeting_id},
-        ).first()
-        creator_id = creator_row.creator_id if creator_row else None
+        meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
+        creator_id = meeting.creator_id if meeting else None
 
         # 合并并异步上传
         wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))

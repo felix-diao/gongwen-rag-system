@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -347,7 +348,29 @@ class MeetingAudioService:
     ) -> None:
         db = database.SessionLocal()
         try:
-            file_url = self._get_uploader().upload_file(source_path, object_key, content_type)
+            max_retries = 3
+            base_delay_seconds = 1.0
+            file_url: Optional[str] = None
+
+            for attempt in range(max_retries):
+                try:
+                    file_url = self._get_uploader().upload_file(source_path, object_key, content_type)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if attempt >= max_retries - 1:
+                        raise
+                    delay = base_delay_seconds * (2 ** attempt)
+                    logger.warning(
+                        "音频异步上传失败，准备重试 audio_id=%s object_key=%s attempt=%d/%d delay=%.1fs error=%s",
+                        audio_id,
+                        object_key,
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+
             record = (
                 db.query(database.MeetingAudio)
                 .filter(database.MeetingAudio.id == audio_id)
@@ -372,7 +395,7 @@ class MeetingAudioService:
                 except Exception:  # noqa: BLE001
                     logger.exception("音频上传完成回调执行失败 audio_id=%s", audio_id)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("音频异步上传失败 audio_id=%s object_key=%s", audio_id, object_key)
+            logger.exception("音频异步上传最终失败 audio_id=%s object_key=%s", audio_id, object_key)
             record = (
                 db.query(database.MeetingAudio)
                 .filter(database.MeetingAudio.id == audio_id)
