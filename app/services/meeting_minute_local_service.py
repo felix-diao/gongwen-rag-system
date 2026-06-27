@@ -833,15 +833,6 @@ class LocalMeetingMinuteService:
                 raise ValueError("当前转写会话尚未生成有效文本")
         if asr_session is None:
             asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
-        if asr_session is None:
-            # 前端 stop 后立即关 WS 发起 generate，后端可能尚未完成转写落库
-            # 轮询等待转写就绪，最多 10 秒
-            for _ in range(10):
-                time.sleep(1)
-                db.expire_all()
-                asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
-                if asr_session:
-                    break
         if not asr_session:
             raise ValueError("当前会议尚无可用转写文本（请完成实时录音、HTTP 分段录音或已上传音频转写）")
         _mark_local_generate_active(asr_session.id)
