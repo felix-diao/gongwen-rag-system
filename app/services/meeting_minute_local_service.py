@@ -26,7 +26,7 @@ import uuid
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 from fastapi import HTTPException
@@ -531,11 +531,47 @@ def _save_pcm_as_wav(
     return frame_count / sample_rate
 
 
+def _merge_wav_files(part_paths: List[Path], output_path: Path) -> None:
+    """合并参数一致的 WAV 片段。"""
+    if not part_paths:
+        raise ValueError("没有可合并的 WAV 片段")
+
+    with wave.open(str(part_paths[0]), "rb") as first:
+        params = first.getparams()
+        frames = [first.readframes(first.getnframes())]
+
+    for part_path in part_paths[1:]:
+        with wave.open(str(part_path), "rb") as current:
+            current_params = current.getparams()
+            if current_params[:3] != params[:3]:
+                raise RuntimeError(
+                    f"WAV 参数不一致，无法合并: {part_path}"
+                )
+            frames.append(current.readframes(current.getnframes()))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(output_path), "wb") as output:
+        output.setparams(params)
+        for frame in frames:
+            output.writeframes(frame)
+
+
 class LocalMeetingMinuteService:
     # 设计约束：
     # 1) local 模式只依赖“当前最新流式转写”生成纪要，因此生成入口必须严格校验 ASR 会话存在；
     # 2) 当前纪要视图（summary/todo）与历史快照（session）同时维护，确保“可编辑”和“可回放”两种能力都成立；
     # 3) 不做静默失败兜底：LLM、转写、数据库任一环节出错，都必须留下明确日志和错误文案。
+
+    def __init__(self) -> None:
+        # key = (meeting_id, recording_session_id)
+        self._pending_finalize_tasks: Dict[
+            tuple[int, str],
+            asyncio.Task,
+        ] = {}
+        self._finalize_locks: Dict[
+            tuple[int, str],
+            asyncio.Lock,
+        ] = {}
 
     def _assert_meeting_exists(self, db: Session, meeting_id: int) -> None:
         exists = db.execute(
@@ -686,6 +722,118 @@ class LocalMeetingMinuteService:
             .first()
         )
 
+    def cancel_delayed_finalize(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> None:
+        """前端使用同一 recording_session_id 重连后，取消延迟收尾。"""
+        key = (meeting_id, recording_session_id)
+        task = self._pending_finalize_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+            logger.info(
+                "取消本地录音延迟收尾 meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+
+    def schedule_delayed_finalize(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> None:
+        """WS 异常断开后延迟收尾，给前端自动重连留时间。"""
+        if not recording_session_id:
+            return
+
+        key = (meeting_id, recording_session_id)
+        existing = self._pending_finalize_tasks.get(key)
+        if existing and not existing.done():
+            return
+
+        task = asyncio.create_task(
+            self._delayed_finalize_recording(
+                meeting_id=meeting_id,
+                recording_session_id=recording_session_id,
+            )
+        )
+        self._pending_finalize_tasks[key] = task
+        logger.info(
+            "已安排本地录音延迟收尾 meeting_id=%s recording_session_id=%s delay=%ss",
+            meeting_id,
+            recording_session_id,
+            settings.VOLC_RECORDING_RECONNECT_GRACE_SECONDS,
+        )
+
+    async def _delayed_finalize_recording(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> None:
+        key = (meeting_id, recording_session_id)
+        current_task = asyncio.current_task()
+
+        try:
+            await asyncio.sleep(
+                settings.VOLC_RECORDING_RECONNECT_GRACE_SECONDS
+            )
+
+            db = SessionLocal()
+            try:
+                processing_count = (
+                    db.query(database.LocalAsrSession)
+                    .filter(
+                        database.LocalAsrSession.meeting_id == meeting_id,
+                        database.LocalAsrSession.recording_session_id == recording_session_id,
+                        database.LocalAsrSession.status == "processing",
+                    )
+                    .count()
+                )
+                if processing_count > 0:
+                    logger.info(
+                        "本地录音已重连或仍在处理，跳过延迟收尾 "
+                        "meeting_id=%s recording_session_id=%s processing=%d",
+                        meeting_id,
+                        recording_session_id,
+                        processing_count,
+                    )
+                    return
+
+                result = await self.finalize_and_generate_async(
+                    db=db,
+                    meeting_id=meeting_id,
+                    recording_session_id=recording_session_id,
+                )
+                logger.info(
+                    "本地录音延迟收尾完成 "
+                    "meeting_id=%s recording_session_id=%s result=%s",
+                    meeting_id,
+                    recording_session_id,
+                    result,
+                )
+            finally:
+                db.close()
+
+        except asyncio.CancelledError:
+            logger.info(
+                "本地录音延迟收尾任务已取消 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "本地录音延迟收尾失败 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+        finally:
+            if self._pending_finalize_tasks.get(key) is current_task:
+                self._pending_finalize_tasks.pop(key, None)
+
     @staticmethod
     def _assert_local_audio(db: Session, meeting_id: int, audio_id: int) -> database.MeetingAudio:
         rec = (
@@ -804,6 +952,324 @@ class LocalMeetingMinuteService:
             )
             .first()
         )
+
+    async def finalize_and_generate_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> Dict[str, Any]:
+        """合并同一次本地录音的所有片段，并保证只生成一次纪要。"""
+        if not recording_session_id:
+            raise ValueError("recording_session_id 不能为空")
+
+        key = (meeting_id, recording_session_id)
+        lock = self._finalize_locks.setdefault(
+            key,
+            asyncio.Lock(),
+        )
+
+        async with lock:
+            audio = await self.finalize_recording_async(
+                db=db,
+                meeting_id=meeting_id,
+                recording_session_id=recording_session_id,
+                auto_generate_minutes=True,
+            )
+
+            if not audio:
+                return {
+                    "status": "failed_no_audio",
+                    "audio_id": None,
+                    "asr_session_id": None,
+                }
+
+            latest_session = (
+                db.query(database.LocalAsrSession)
+                .filter(
+                    database.LocalAsrSession.meeting_id == meeting_id,
+                    database.LocalAsrSession.source_audio_id == audio.id,
+                )
+                .order_by(database.LocalAsrSession.id.desc())
+                .first()
+            )
+
+            existing_minutes = self._latest_minutes_session(db, meeting_id)
+            if (
+                existing_minutes
+                and existing_minutes.source_audio_id == audio.id
+            ):
+                return {
+                    "status": "already_submitted",
+                    "audio_id": audio.id,
+                    "asr_session_id": latest_session.id if latest_session else None,
+                }
+
+            audio_status = str(audio.status or "").strip().lower()
+            if audio_status == "failed":
+                return {
+                    "status": "failed_no_audio",
+                    "audio_id": audio.id,
+                    "asr_session_id": latest_session.id if latest_session else None,
+                }
+
+            if audio_status == "uploaded":
+                self.generate_minutes(
+                    db=db,
+                    meeting_id=meeting_id,
+                    asr_session_id=latest_session.id if latest_session else None,
+                )
+                return {
+                    "status": "submitted",
+                    "audio_id": audio.id,
+                    "asr_session_id": latest_session.id if latest_session else None,
+                }
+
+            return {
+                "status": "accepted",
+                "audio_id": audio.id,
+                "asr_session_id": latest_session.id if latest_session else None,
+            }
+
+    async def finalize_recording_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        recording_session_id: Optional[str] = None,
+        max_wait_seconds: int = 10,
+        auto_generate_minutes: bool = False,
+    ) -> Optional[database.MeetingAudio]:
+        """结束本地录音时统一合并同一次 recording_session 的所有片段。"""
+        self._assert_meeting_exists(db, meeting_id)
+
+        if not recording_session_id:
+            latest_session = self._latest_asr_session(db, meeting_id)
+            if not latest_session:
+                logger.warning("会议没有任何本地 ASR 会话 meeting_id=%s", meeting_id)
+                return None
+            recording_session_id = latest_session.recording_session_id
+            if not recording_session_id:
+                logger.info(
+                    "会议没有 recording_session_id，使用最新本地音频 meeting_id=%s",
+                    meeting_id,
+                )
+                return self._latest_local_audio(db, meeting_id)
+
+        for waited in range(max_wait_seconds):
+            processing_count = (
+                db.query(database.LocalAsrSession)
+                .filter(
+                    database.LocalAsrSession.meeting_id == meeting_id,
+                    database.LocalAsrSession.recording_session_id == recording_session_id,
+                    database.LocalAsrSession.status == "processing",
+                )
+                .count()
+            )
+            if processing_count == 0:
+                break
+            logger.info(
+                "等待本地 ASR 会话结束 meeting_id=%s recording_session_id=%s processing=%d waited=%d",
+                meeting_id,
+                recording_session_id,
+                processing_count,
+                waited,
+            )
+            await asyncio.sleep(1)
+        else:
+            logger.warning(
+                "等待本地 ASR 会话结束超时 meeting_id=%s recording_session_id=%s max_wait=%d",
+                meeting_id,
+                recording_session_id,
+                max_wait_seconds,
+            )
+
+        sessions = (
+            db.query(database.LocalAsrSession)
+            .filter(
+                database.LocalAsrSession.meeting_id == meeting_id,
+                database.LocalAsrSession.recording_session_id == recording_session_id,
+                database.LocalAsrSession.status.in_(["completed", "failed"]),
+                database.LocalAsrSession.audio_part_path.isnot(None),
+            )
+            .order_by(database.LocalAsrSession.created_at.asc())
+            .all()
+        )
+        if not sessions:
+            logger.warning(
+                "没有可合并的本地 ASR 片段 meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+            return None
+
+        existing_merged_ids = {
+            sess.source_audio_id
+            for sess in sessions
+            if sess.source_audio_id is not None
+        }
+        if (
+            len(existing_merged_ids) == 1
+            and all(sess.source_audio_id is not None for sess in sessions)
+        ):
+            existing_audio_id = next(iter(existing_merged_ids))
+            existing_audio = (
+                db.query(database.MeetingAudio)
+                .filter(
+                    database.MeetingAudio.id == existing_audio_id,
+                    database.MeetingAudio.meeting_id == meeting_id,
+                    database.MeetingAudio.provider == "local",
+                )
+                .first()
+            )
+            if existing_audio:
+                logger.info(
+                    "本地录音已经完成合并，无需重复处理 "
+                    "meeting_id=%s recording_session_id=%s audio_id=%s",
+                    meeting_id,
+                    recording_session_id,
+                    existing_audio.id,
+                )
+                return existing_audio
+
+        creator_row = db.execute(
+            text("SELECT creator_id FROM meetings WHERE id = :meeting_id LIMIT 1"),
+            {"meeting_id": meeting_id},
+        ).first()
+        creator_id = creator_row.creator_id if creator_row else None
+
+        wav_dir = Path(
+            settings.QWEN_ASR_AUDIO_SAVE_DIR
+            or os.path.join(settings.UPLOAD_DIR, "local_asr_recordings")
+        )
+        wav_dir.mkdir(parents=True, exist_ok=True)
+
+        part_paths = [
+            Path(sess.audio_part_path)
+            for sess in sessions
+            if sess.audio_part_path
+        ]
+        if not part_paths or not all(p.exists() for p in part_paths):
+            missing = [str(p) for p in part_paths if not p.exists()]
+            logger.error(
+                "部分本地音频片段文件缺失 meeting_id=%s recording_session_id=%s missing=%s",
+                meeting_id,
+                recording_session_id,
+                missing,
+            )
+            raise RuntimeError(f"本地音频片段文件缺失: {missing}")
+
+        merged_path = (
+            wav_dir
+            / f"meeting_{meeting_id}_recording_{recording_session_id}_merged.wav"
+        )
+        _merge_wav_files(part_paths, merged_path)
+
+        latest_session = sessions[-1]
+        merged_transcript = "\n".join(
+            [
+                (sess.stream_transcript_text or "").strip()
+                for sess in sessions
+                if (sess.stream_transcript_text or "").strip()
+            ]
+        )
+        total_duration = sum((sess.duration_seconds or 0) for sess in sessions)
+
+        on_upload_complete: Optional[Callable[[database.MeetingAudio], None]] = None
+        if auto_generate_minutes:
+
+            def _on_upload_complete(uploaded_audio: database.MeetingAudio) -> None:
+                db_callback = SessionLocal()
+                try:
+                    callback_session = (
+                        db_callback.query(database.LocalAsrSession)
+                        .filter(
+                            database.LocalAsrSession.meeting_id == meeting_id,
+                            database.LocalAsrSession.source_audio_id == uploaded_audio.id,
+                        )
+                        .order_by(database.LocalAsrSession.id.desc())
+                        .first()
+                    )
+                    if not callback_session:
+                        logger.warning(
+                            "本地音频上传完成但未找到 ASR 会话 "
+                            "meeting_id=%s audio_id=%s",
+                            meeting_id,
+                            uploaded_audio.id,
+                        )
+                        return
+
+                    existing_minutes = self._latest_minutes_session(
+                        db_callback,
+                        meeting_id,
+                    )
+                    if (
+                        existing_minutes
+                        and existing_minutes.source_audio_id == uploaded_audio.id
+                    ):
+                        logger.info(
+                            "本地纪要已存在，跳过自动生成 "
+                            "meeting_id=%s audio_id=%s session_id=%s",
+                            meeting_id,
+                            uploaded_audio.id,
+                            existing_minutes.id,
+                        )
+                        return
+
+                    self.generate_minutes(
+                        db=db_callback,
+                        meeting_id=meeting_id,
+                        asr_session_id=callback_session.id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "自动生成本地纪要失败 meeting_id=%s audio_id=%s",
+                        meeting_id,
+                        uploaded_audio.id,
+                    )
+                finally:
+                    db_callback.close()
+
+            on_upload_complete = _on_upload_complete
+
+        audio_record = meeting_audio_service.create_audio_from_path_async(
+            db=db,
+            meeting_id=meeting_id,
+            provider="local",
+            creator_id=creator_id,
+            source_path=merged_path,
+            file_name=f"recording_{recording_session_id}.wav",
+            content_type="audio/wav",
+            on_upload_complete=on_upload_complete,
+        )
+
+        audio_record.duration_seconds = total_duration
+
+        for sess in sessions:
+            sess.source_audio_id = audio_record.id
+            sess.status = "completed"
+            sess.error_msg = None
+
+        latest_session.stream_transcript_text = merged_transcript
+        latest_session.duration_seconds = total_duration
+        db.commit()
+        db.refresh(audio_record)
+
+        for p in part_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("本地录音片段清理失败 path=%s", p)
+
+        logger.info(
+            "本地录音合并完成并已启动异步上传 "
+            "meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f sessions=%d",
+            meeting_id,
+            recording_session_id,
+            audio_record.id,
+            total_duration,
+            len(sessions),
+        )
+        return audio_record
 
     def generate_minutes(
         self,
@@ -1395,10 +1861,12 @@ class LiveLocalAsrHandler:
         self._audio_chunks: List[bytes] = []
         self._final_parts: List[str] = []
         self._session_id: Optional[int] = None
+        self._recording_session_id: Optional[str] = None
         self._sample_rate = 16000
         self._channels = 1
         self._sample_width = 2
         self._ws_alive = True
+        self._client_disconnected = False
         # HTTP 滑窗分段时 merge_pair 的累计稿，异常收尾时写入 DB 便于排障
         self._live_http_merged: str = ""
 
@@ -1451,10 +1919,30 @@ class LiveLocalAsrHandler:
                 await self._finalize_from_ws_transcript()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Local live ASR run failed meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
-            asr_session.status = "failed"
-            asr_session.stream_transcript_text = (self._live_http_merged or "").strip() or "".join(
+            transcript = (self._live_http_merged or "").strip() or "".join(
                 self._final_parts
             )
+
+            if self._audio_chunks and self._recording_session_id:
+                await self._save_audio_part_for_later(
+                    transcript=transcript,
+                    error_msg=str(exc),
+                )
+                self._service.schedule_delayed_finalize(
+                    meeting_id=self._meeting_id,
+                    recording_session_id=self._recording_session_id,
+                )
+                await self._safe_send_json(
+                    {
+                        "type": "session_saved",
+                        "session_id": self._session_id,
+                        "recording_session_id": self._recording_session_id,
+                    }
+                )
+                return
+
+            asr_session.status = "failed"
+            asr_session.stream_transcript_text = transcript
             asr_session.error_msg = str(exc)
             self._db.commit()
             await self._safe_send_json({"type": "error", "message": str(exc)})
@@ -1463,10 +1951,27 @@ class LiveLocalAsrHandler:
     async def _forward_audio(self, qwen_ws, stop_event: asyncio.Event) -> None:
         # 前端到 Qwen 的上行链路：控制消息负责 stop/config，二进制消息负责真正音频内容。
         while not stop_event.is_set():
-            raw = await self._ws.receive()
+            try:
+                raw = await asyncio.wait_for(
+                    self._ws.receive(),
+                    timeout=settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "本地实时 ASR 前端 WS 空闲超时 meeting_id=%s session_id=%s timeout=%ss",
+                    self._meeting_id,
+                    self._session_id,
+                    settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
+                )
+                self._ws_alive = False
+                self._client_disconnected = True
+                stop_event.set()
+                break
+
             msg_type = raw.get("type", "")
             if msg_type in {"websocket.disconnect", "websocket.close"}:
                 self._ws_alive = False
+                self._client_disconnected = True
                 stop_event.set()
                 break
             if raw.get("text"):
@@ -1478,6 +1983,21 @@ class LiveLocalAsrHandler:
                 if action == "config":
                     self._sample_rate = int(ctrl.get("rate", self._sample_rate))
                     self._channels = int(ctrl.get("channels", self._channels))
+                    rsid = ctrl.get("recording_session_id")
+                    if isinstance(rsid, str) and rsid.strip():
+                        self._recording_session_id = rsid.strip()
+                        asr_session = (
+                            self._db.query(database.LocalAsrSession)
+                            .filter(database.LocalAsrSession.id == self._session_id)
+                            .first()
+                        )
+                        if asr_session:
+                            asr_session.recording_session_id = self._recording_session_id
+                            self._db.commit()
+                        self._service.cancel_delayed_finalize(
+                            meeting_id=self._meeting_id,
+                            recording_session_id=self._recording_session_id,
+                        )
                 continue
             if raw.get("bytes"):
                 chunk = raw["bytes"]
@@ -1525,11 +2045,18 @@ class LiveLocalAsrHandler:
             settings.QWEN_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "local_asr_recordings")
         )
         wav_dir.mkdir(parents=True, exist_ok=True)
-        wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
+        if self._recording_session_id:
+            wav_path = (
+                wav_dir
+                / f"meeting_{self._meeting_id}_recording_{self._recording_session_id}_part_{self._session_id}.wav"
+            )
+        else:
+            wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
         logger.info(
-            "开始落盘本地实时录音 meeting_id=%s session_id=%s wav_path=%s",
+            "开始落盘本地实时录音 meeting_id=%s session_id=%s recording_session_id=%s wav_path=%s",
             self._meeting_id,
             self._session_id,
+            self._recording_session_id,
             wav_path,
         )
         duration = _save_pcm_as_wav(
@@ -1541,8 +2068,54 @@ class LiveLocalAsrHandler:
         )
         return wav_path, duration
 
+    async def _save_audio_part_for_later(
+        self,
+        transcript: str,
+        error_msg: Optional[str] = None,
+    ) -> None:
+        """保存当前 WS 会话已有音频片段，等待同一 recording_session_id 最终合并。"""
+        if not self._session_id:
+            return
+        if not self._audio_chunks:
+            logger.warning(
+                "本地实时 ASR 没有可保存的音频片段 meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+            return
+
+        wav_path, duration = self._materialize_wav_path()
+        asr_session = (
+            self._db.query(database.LocalAsrSession)
+            .filter(database.LocalAsrSession.id == self._session_id)
+            .first()
+        )
+        if not asr_session:
+            return
+
+        asr_session.recording_session_id = self._recording_session_id
+        asr_session.audio_part_path = str(wav_path)
+        asr_session.stream_transcript_text = transcript
+        asr_session.duration_seconds = duration
+        asr_session.error_msg = error_msg
+
+        if self._recording_session_id:
+            asr_session.status = "completed"
+            self._db.commit()
+            logger.info(
+                "本地实时 ASR 片段已保存 meeting_id=%s session_id=%s recording_session_id=%s wav_path=%s duration=%.3f",
+                self._meeting_id,
+                self._session_id,
+                self._recording_session_id,
+                wav_path,
+                duration,
+            )
+            return
+
+        self._db.commit()
+
     async def _finalize_common(self, transcript: str, duration: float, wav_path: Path) -> None:
-        """先落转写与时长（仍为 processing），TOS 上传成功后再标 completed，避免上传失败却已是 completed。"""
+        """先落转写与时长；有 recording_session_id 时只保存片段，最终统一合并。"""
         asr_session = (
             self._db.query(database.LocalAsrSession)
             .filter(database.LocalAsrSession.id == self._session_id)
@@ -1550,11 +2123,43 @@ class LiveLocalAsrHandler:
         )
         if not asr_session:
             raise RuntimeError("ASR 会话不存在")
+        asr_session.recording_session_id = self._recording_session_id
         asr_session.stream_transcript_text = transcript
         asr_session.duration_seconds = duration
+        asr_session.audio_part_path = str(wav_path)
         self._db.commit()
 
         await self._safe_send_json({"type": "saving_audio", "session_id": self._session_id})
+
+        if self._recording_session_id:
+            asr_session.status = "completed"
+            asr_session.error_msg = None
+            self._db.commit()
+            logger.info(
+                "本地实时 ASR 片段完成 meeting_id=%s session_id=%s recording_session_id=%s duration=%.3f",
+                self._meeting_id,
+                self._session_id,
+                self._recording_session_id,
+                duration,
+            )
+
+            if self._client_disconnected:
+                self._service.schedule_delayed_finalize(
+                    meeting_id=self._meeting_id,
+                    recording_session_id=self._recording_session_id,
+                )
+
+            await self._safe_send_json(
+                {
+                    "type": "completed",
+                    "session_id": self._session_id,
+                    "transcript": transcript,
+                    "stream_transcript_text": transcript,
+                    "audio_uploaded": False,
+                    "duration_seconds": duration,
+                }
+            )
+            return
 
         try:
             audio_record = meeting_audio_service.create_audio_from_path(
@@ -1721,10 +2326,26 @@ class LiveLocalAsrHandler:
             )
 
             while True:
-                raw = await self._ws.receive()
+                try:
+                    raw = await asyncio.wait_for(
+                        self._ws.receive(),
+                        timeout=settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "本地 HTTP 实时 ASR 前端 WS 空闲超时 meeting_id=%s session_id=%s timeout=%ss",
+                        self._meeting_id,
+                        self._session_id,
+                        settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
+                    )
+                    self._ws_alive = False
+                    self._client_disconnected = True
+                    break
+
                 msg_type = raw.get("type", "")
                 if msg_type in {"websocket.disconnect", "websocket.close"}:
                     self._ws_alive = False
+                    self._client_disconnected = True
                     break
                 if raw.get("text"):
                     ctrl = json.loads(raw["text"])
@@ -1734,6 +2355,21 @@ class LiveLocalAsrHandler:
                     if action == "config":
                         self._sample_rate = int(ctrl.get("rate", self._sample_rate))
                         self._channels = int(ctrl.get("channels", self._channels))
+                        rsid = ctrl.get("recording_session_id")
+                        if isinstance(rsid, str) and rsid.strip():
+                            self._recording_session_id = rsid.strip()
+                            asr_session = (
+                                self._db.query(database.LocalAsrSession)
+                                .filter(database.LocalAsrSession.id == self._session_id)
+                                .first()
+                            )
+                            if asr_session:
+                                asr_session.recording_session_id = self._recording_session_id
+                                self._db.commit()
+                            self._service.cancel_delayed_finalize(
+                                meeting_id=self._meeting_id,
+                                recording_session_id=self._recording_session_id,
+                            )
                         # 与前端约定：config 应在首包 PCM 之前；若晚到则仅影响后续滑窗尺寸
                         frame = self._channels * self._sample_width
                         bytes_per_sec = self._sample_rate * frame

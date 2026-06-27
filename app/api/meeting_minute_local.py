@@ -124,6 +124,67 @@ def generate_minutes(
     )
     return StandardResponse(success=True, data=data, message="会议纪要生成成功")
 
+@router.post(
+    "/{meeting_id}/finalize-and-generate",
+    response_model=StandardResponse[
+        schemas.LocalFinalizeAndGenerateResponse
+    ],
+)
+async def finalize_and_generate(
+    meeting_id: int,
+    payload: schemas.LocalFinalizeAndGenerateRequest,
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    recording_session_id = payload.recording_session_id.strip()
+    if not recording_session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="recording_session_id 不能为空",
+        )
+
+    logger.info(
+        "结束本地录音并生成会议纪要请求 "
+        "meeting_id=%s recording_session_id=%s",
+        meeting_id,
+        recording_session_id,
+    )
+
+    local_meeting_minute_service.cancel_delayed_finalize(
+        meeting_id=meeting_id,
+        recording_session_id=recording_session_id,
+    )
+
+    try:
+        result = await local_meeting_minute_service.finalize_and_generate_async(
+            db=db,
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "结束本地录音并生成会议纪要失败 "
+            "meeting_id=%s recording_session_id=%s error=%s",
+            meeting_id,
+            recording_session_id,
+            exc,
+        )
+        raise _http_from_local_minutes_value_error(exc) from exc
+    except RuntimeError as exc:
+        logger.warning(
+            "结束本地录音并生成会议纪要失败 "
+            "meeting_id=%s recording_session_id=%s error=%s",
+            meeting_id,
+            recording_session_id,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return StandardResponse(
+        success=True,
+        data=result,
+        message="本地录音正在上传，会议纪要将在上传完成后自动生成",
+    )
 
 # 读取当前会议的「展示用」纪要聚合（转写稿、摘要、待办、状态）。
 # 1. 会议不存在则 404。

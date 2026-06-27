@@ -814,6 +814,22 @@ class VolcFinalizeAndGenerateResponse(BaseModel):
     job_status: Optional[str] = None
 
 
+class LocalFinalizeAndGenerateRequest(BaseModel):
+    """结束本地录音、合并音频并生成会议纪要请求。"""
+    recording_session_id: str
+
+
+class LocalFinalizeAndGenerateResponse(BaseModel):
+    """结束本地录音、合并音频并生成会议纪要响应。"""
+    status: Literal[
+        "submitted",
+        "already_submitted",
+        "failed_no_audio",
+        "accepted",
+    ]
+    audio_id: Optional[int] = None
+    asr_session_id: Optional[int] = None
+
 class VolcSpeakerSegmentInDB(BaseModel):
     """火山说话人分段响应模型（由 volc_accurate_transcriptions.speaker_segments_json 解析展开）。"""
     model_config = ConfigDict(from_attributes=True)
