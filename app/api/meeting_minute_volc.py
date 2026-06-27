@@ -159,6 +159,102 @@ async def finalize_recording(
         message="录音已合并",
     )
 
+# 结束录音、合并音频并提交会议纪要。
+# 同一个 recording_session_id 重复调用时，不重复合并和提交。
+@router.post(
+    "/{meeting_id}/finalize-and-generate",
+    response_model=StandardResponse[
+        schemas.VolcFinalizeAndGenerateResponse
+    ],
+)
+async def finalize_and_generate(
+    meeting_id: int,
+    payload: schemas.VolcFinalizeAndGenerateRequest,
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    recording_session_id = (
+        payload.recording_session_id.strip()
+    )
+    if not recording_session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="recording_session_id 不能为空",
+        )
+
+    logger.info(
+        "结束录音并生成会议纪要请求 "
+        "meeting_id=%s recording_session_id=%s",
+        meeting_id,
+        recording_session_id,
+    )
+
+    # 用户主动结束录音时，取消 WS 异常断开创建的延迟任务。
+    # 后续由当前 HTTP 请求立即完成收尾。
+    volc_meeting_minute_service.cancel_delayed_finalize(
+        meeting_id=meeting_id,
+        recording_session_id=recording_session_id,
+    )
+
+    try:
+        result = (
+            await volc_meeting_minute_service.finalize_and_generate_async(
+                db=db,
+                meeting_id=meeting_id,
+                recording_session_id=recording_session_id,
+            )
+        )
+    except ValueError as exc:
+        logger.warning(
+            "结束录音并生成会议纪要失败 "
+            "meeting_id=%s recording_session_id=%s error=%s",
+            meeting_id,
+            recording_session_id,
+            exc,
+        )
+        raise _http_from_volc_minutes_value_error(
+            exc
+        ) from exc
+    except RuntimeError as exc:
+        logger.warning(
+            "结束录音并生成会议纪要失败 "
+            "meeting_id=%s recording_session_id=%s error=%s",
+            meeting_id,
+            recording_session_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
+
+    status = str(result["status"])
+
+    if status == "submitted":
+        message = "录音已合并，会议纪要任务已提交"
+    elif status == "already_submitted":
+        message = "录音和会议纪要任务已经完成收尾"
+    else:
+        message = "没有找到可用录音，无法生成会议纪要"
+
+    logger.info(
+        "结束录音并生成会议纪要完成 "
+        "meeting_id=%s recording_session_id=%s "
+        "status=%s audio_id=%s job_id=%s",
+        meeting_id,
+        recording_session_id,
+        status,
+        result.get("audio_id"),
+        result.get("job_id"),
+    )
+
+    return StandardResponse(
+        success=status != "failed_no_audio",
+        data=schemas.VolcFinalizeAndGenerateResponse(
+            **result
+        ),
+        message=message,
+    )
 
 # 2. 调用 submit_minutes 提交妙记任务。
 # 3. 返回 VolcMinutesJobInDB。

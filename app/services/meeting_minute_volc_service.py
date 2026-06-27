@@ -25,7 +25,7 @@ import uuid
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import requests
@@ -368,6 +368,19 @@ class VolcMeetingMinuteService:
         self._poll_stop: Dict[int, threading.Event] = {}
         self._poll_lock = threading.Lock()
 
+        # 前端 WS 异常断开后，等待用户重连的延迟收尾任务。
+        # key = (meeting_id, recording_session_id)
+        self._pending_finalize_tasks: Dict[
+            Tuple[int, str],
+            asyncio.Task,
+        ] = {}
+
+        # 防止同一次录音被多个入口同时触发收尾。
+        self._finalize_locks: Dict[
+            Tuple[int, str],
+            asyncio.Lock,
+        ] = {}
+
     def _assert_meeting_exists(self, db: Session, meeting_id: int) -> None:
         exists = db.execute(
             text("SELECT 1 FROM meetings WHERE id = :meeting_id LIMIT 1"),
@@ -404,6 +417,203 @@ class VolcMeetingMinuteService:
             .order_by(database.VolcAsrSession.updated_at.desc(), database.VolcAsrSession.id.desc())
             .first()
         )
+    
+    def cancel_delayed_finalize(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> None:
+        """前端使用同一 recording_session_id 重连后，取消延迟收尾。"""
+        key = (meeting_id, recording_session_id)
+        task = self._pending_finalize_tasks.pop(key, None)
+
+        if task and not task.done():
+            task.cancel()
+            logger.info(
+                "取消录音延迟收尾 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+
+    def schedule_delayed_finalize(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> None:
+        """WS 异常断开后，创建等待用户重连的延迟收尾任务。"""
+        if not recording_session_id:
+            return
+
+        key = (meeting_id, recording_session_id)
+        existing_task = self._pending_finalize_tasks.get(key)
+
+        if existing_task and not existing_task.done():
+            return
+
+        task = asyncio.create_task(
+            self._delayed_finalize_recording(
+                meeting_id=meeting_id,
+                recording_session_id=recording_session_id,
+            )
+        )
+        self._pending_finalize_tasks[key] = task
+
+        logger.info(
+            "已创建录音延迟收尾任务 "
+            "meeting_id=%s recording_session_id=%s delay=%ss",
+            meeting_id,
+            recording_session_id,
+            settings.VOLC_RECORDING_RECONNECT_GRACE_SECONDS,
+        )
+
+    async def _delayed_finalize_recording(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> None:
+        """等待重连超时后，检查是否仍需自动收尾。"""
+        key = (meeting_id, recording_session_id)
+        current_task = asyncio.current_task()
+
+        try:
+            await asyncio.sleep(
+                settings.VOLC_RECORDING_RECONNECT_GRACE_SECONDS
+            )
+
+            db = database.SessionLocal()
+            try:
+                # 如果出现同 recording_session_id 的 processing 会话，
+                # 说明前端已经重新建立 WS，不能结束录音。
+                active_session = (
+                    db.query(database.VolcAsrSession)
+                    .filter(
+                        database.VolcAsrSession.meeting_id == meeting_id,
+                        database.VolcAsrSession.recording_session_id
+                        == recording_session_id,
+                        database.VolcAsrSession.status == "processing",
+                    )
+                    .order_by(database.VolcAsrSession.id.desc())
+                    .first()
+                )
+
+                if active_session:
+                    logger.info(
+                        "录音已经恢复，跳过延迟收尾 "
+                        "meeting_id=%s recording_session_id=%s "
+                        "active_session_id=%s",
+                        meeting_id,
+                        recording_session_id,
+                        active_session.id,
+                    )
+                    return
+
+                result = await self.finalize_and_generate_async(
+                    db=db,
+                    meeting_id=meeting_id,
+                    recording_session_id=recording_session_id,
+                )
+
+                logger.info(
+                    "录音延迟收尾完成 "
+                    "meeting_id=%s recording_session_id=%s result=%s",
+                    meeting_id,
+                    recording_session_id,
+                    result,
+                )
+            finally:
+                db.close()
+
+        except asyncio.CancelledError:
+            logger.info(
+                "录音延迟收尾任务已取消 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "录音延迟收尾失败 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+        finally:
+            if self._pending_finalize_tasks.get(key) is current_task:
+                self._pending_finalize_tasks.pop(key, None)
+
+    async def finalize_and_generate_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> Dict[str, Any]:
+        """合并同一次录音的所有片段，并保证只提交一次纪要任务。"""
+        if not recording_session_id:
+            raise ValueError("recording_session_id 不能为空")
+
+        key = (meeting_id, recording_session_id)
+        lock = self._finalize_locks.setdefault(
+            key,
+            asyncio.Lock(),
+        )
+
+        async with lock:
+            audio = await self.finalize_recording_async(
+                db=db,
+                meeting_id=meeting_id,
+                recording_session_id=recording_session_id,
+            )
+
+            if not audio:
+                return {
+                    "status": "failed_no_audio",
+                    "audio_id": None,
+                    "job_id": None,
+                    "job_status": None,
+                }
+
+            # 同一个合并音频如果已经有未失败的妙记任务，
+            # 直接返回原任务，不重复提交。
+            jobs = (
+                db.query(database.VolcMinutesJob)
+                .filter(
+                    database.VolcMinutesJob.meeting_id == meeting_id,
+                    database.VolcMinutesJob.source_audio_id == audio.id,
+                )
+                .order_by(database.VolcMinutesJob.id.desc())
+                .all()
+            )
+
+            for job in jobs:
+                job_status = str(
+                    job.status or ""
+                ).strip().lower()
+
+                if (
+                    job_status not in MINUTES_FAILED_STATUS
+                    and job_status not in MINUTES_CANCELLED_STATUS
+                ):
+                    return {
+                        "status": "already_submitted",
+                        "audio_id": audio.id,
+                        "job_id": job.id,
+                        "job_status": job.status,
+                    }
+
+            job = self.submit_minutes(
+                db=db,
+                meeting_id=meeting_id,
+                audio_id=audio.id,
+            )
+
+            return {
+                "status": "submitted",
+                "audio_id": audio.id,
+                "job_id": job.id,
+                "job_status": job.status,
+            }
 
     @staticmethod
     def _asr_session_for_minutes_snapshot(
@@ -1655,31 +1865,41 @@ class VolcMeetingMinuteService:
             )
             return None
 
-        # 检查是否已经有更新的 merged 音频
-        latest_part_update = max(
-            (sess.updated_at or sess.created_at for sess in sessions),
-            default=None,
-        )
-        existing_merged_ids = {sess.source_audio_id for sess in sessions if sess.source_audio_id}
-        existing_merged = None
-        if existing_merged_ids:
+        # 如果所有片段都已经关联同一个 MeetingAudio，
+        # 说明该 recording_session 已经完成过合并，直接返回。
+        existing_merged_ids = {
+            sess.source_audio_id
+            for sess in sessions
+            if sess.source_audio_id is not None
+        }
+
+        if (
+            len(existing_merged_ids) == 1
+            and all(
+                sess.source_audio_id is not None
+                for sess in sessions
+            )
+        ):
+            existing_audio_id = next(iter(existing_merged_ids))
             existing_merged = (
                 db.query(database.MeetingAudio)
                 .filter(
-                    database.MeetingAudio.id.in_(existing_merged_ids),
+                    database.MeetingAudio.id == existing_audio_id,
+                    database.MeetingAudio.meeting_id == meeting_id,
                     database.MeetingAudio.provider == "volc",
                 )
-                .order_by(database.MeetingAudio.updated_at.desc())
                 .first()
             )
-        if existing_merged and latest_part_update and existing_merged.updated_at >= latest_part_update:
-            logger.info(
-                "已有最新合并音频，无需重新合并 meeting_id=%s recording_session_id=%s audio_id=%s",
-                meeting_id,
-                recording_session_id,
-                existing_merged.id,
-            )
-            return existing_merged
+
+            if existing_merged:
+                logger.info(
+                    "录音已经完成合并，无需重复处理 "
+                    "meeting_id=%s recording_session_id=%s audio_id=%s",
+                    meeting_id,
+                    recording_session_id,
+                    existing_merged.id,
+                )
+                return existing_merged
 
         # 取会议 creator_id 作为音频创建者
         meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
@@ -1774,6 +1994,12 @@ class LiveVolcAsrHandler:
         self._sample_width = 2
         self._ws_alive = True
 
+        # 前端是否已经明确结束或异常离线
+        self._client_finished = False
+
+        # 仅用于日志区分 user_stop / ws_disconnect / idle_timeout
+        self._disconnect_reason: Optional[str] = None
+
     async def _safe_send_json(self, payload: dict) -> bool:
         if not self._ws_alive:
             return False
@@ -1840,13 +2066,185 @@ class LiveVolcAsrHandler:
         compressed = gzip.compress(chunk or b"")
         return bytes(header) + struct.pack(">i", seq) + struct.pack(">I", len(compressed)) + compressed
 
+    async def _run_asr_once(self, retry_count: int) -> None:
+        """建立一次火山 ASR 连接，并处理音频发送和识别结果接收。"""
+        stop_event = asyncio.Event()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                ASR_WS_URL,
+                headers=self._auth_headers(),
+            ) as volc_ws:
+                seq = 1
+                await volc_ws.send_bytes(
+                    self._build_init_packet(seq)
+                )
+                seq += 1
+
+                init_response = await asyncio.wait_for(
+                    volc_ws.receive(),
+                    timeout=10,
+                )
+
+                if init_response.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }:
+                    raise RuntimeError(
+                        "火山实时 ASR 初始化连接失败"
+                    )
+
+                if retry_count > 0:
+                    await self._safe_send_json(
+                        {
+                            "type": "asr_recovered",
+                            "retry_count": retry_count,
+                        }
+                    )
+
+                send_task = asyncio.create_task(
+                    self._forward_audio(
+                        volc_ws,
+                        stop_event,
+                        seq,
+                    )
+                )
+                recv_task = asyncio.create_task(
+                    self._recv_asr_result(
+                        volc_ws,
+                        stop_event,
+                    )
+                )
+
+                try:
+                    done, _ = await asyncio.wait(
+                        {
+                            send_task,
+                            recv_task,
+                        },
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if send_task in done:
+                        send_task.result()
+
+                        try:
+                            await asyncio.wait_for(
+                                recv_task,
+                                timeout=10,
+                            )
+                        except Exception:
+                            if not self._client_finished:
+                                raise
+
+                            logger.warning(
+                                "客户端已结束，但火山 ASR 尾包响应异常，"
+                                "继续保存已有录音 "
+                                "meeting_id=%s session_id=%s",
+                                self._meeting_id,
+                                self._session_id,
+                            )
+                    else:
+                        recv_task.result()
+
+                        if not self._client_finished:
+                            raise RuntimeError(
+                                "火山实时 ASR 连接意外结束"
+                            )
+                finally:
+                    for task in (
+                        send_task,
+                        recv_task,
+                    ):
+                        if not task.done():
+                            task.cancel()
+
+                    await asyncio.gather(
+                        send_task,
+                        recv_task,
+                        return_exceptions=True,
+                    )
+
+    async def _run_asr_with_retry(self) -> None:
+        """火山 ASR 临时异常时进行指数退避重试。"""
+        max_retries = max(
+            0,
+            int(settings.VOLC_ASR_MAX_RETRIES),
+        )
+        base_delay = max(
+            0.0,
+            float(
+                settings.VOLC_ASR_RETRY_BASE_DELAY_SECONDS
+            ),
+        )
+        retry_count = 0
+
+        while True:
+            # 每次重新连接火山后，utterance 下标会重新从 0 开始。
+            # 这里只重置下标，之前的转录文本和录音数据继续保留。
+            self._last_utterance_index = -1
+
+            try:
+                await self._run_asr_once(
+                    retry_count=retry_count,
+                )
+                return
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                RuntimeError,
+            ) as exc:
+                if self._client_finished:
+                    raise
+
+                if retry_count >= max_retries:
+                    raise RuntimeError(
+                        f"火山实时 ASR 重试 {max_retries} 次后仍然失败: {exc}"
+                    ) from exc
+
+                retry_count += 1
+                delay_seconds = base_delay * (
+                    2 ** (retry_count - 1)
+                )
+
+                logger.warning(
+                    "火山实时 ASR 异常，准备重试 "
+                    "meeting_id=%s session_id=%s "
+                    "retry=%s/%s delay=%ss error=%s",
+                    self._meeting_id,
+                    self._session_id,
+                    retry_count,
+                    max_retries,
+                    delay_seconds,
+                    exc,
+                )
+
+                await self._safe_send_json(
+                    {
+                        "type": "asr_retrying",
+                        "retry_count": retry_count,
+                        "max_retries": max_retries,
+                        "delay_seconds": delay_seconds,
+                        "message": str(exc),
+                    }
+                )
+
+                await asyncio.sleep(delay_seconds)
+
     async def run(self) -> None:
         # 实时 ASR 主流程：
-        # 1) 建立前端 websocket 与火山 websocket；
-        # 2) 并发执行“转发音频”和“接收识别结果”；
-        # 3) 结束后统一落盘并上传音频。
-        self._service._assert_meeting_exists(self._db, self._meeting_id)
+        # 1) 建立前端 websocket；
+        # 2) 建立火山 websocket，异常时自动重试；
+        # 3) 保存当前录音片段；
+        # 4) 前端异常断开时启动延迟收尾。
+        self._service._assert_meeting_exists(
+            self._db,
+            self._meeting_id,
+        )
         await self._ws.accept()
+
         asr_session = database.VolcAsrSession(
             meeting_id=self._meeting_id,
             status="processing",
@@ -1855,83 +2253,252 @@ class LiveVolcAsrHandler:
         self._db.commit()
         self._db.refresh(asr_session)
         self._session_id = asr_session.id
-        await self._safe_send_json({"type": "session_created", "session_id": self._session_id})
+
+        await self._safe_send_json(
+            {
+                "type": "session_created",
+                "session_id": self._session_id,
+            }
+        )
 
         try:
-            logger.info("开始火山实时 ASR 会话 meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
-            stop_event = asyncio.Event()
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(ASR_WS_URL, headers=self._auth_headers()) as volc_ws:
-                    seq = 1
-                    await volc_ws.send_bytes(self._build_init_packet(seq))
-                    seq += 1
-                    await volc_ws.receive()  # 初始化应答
+            logger.info(
+                "开始火山实时 ASR 会话 "
+                "meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
 
-                    send_task = asyncio.create_task(self._forward_audio(volc_ws, stop_event, seq))
-                    recv_task = asyncio.create_task(self._recv_asr_result(volc_ws, stop_event))
-                    try:
-                        await asyncio.gather(send_task, recv_task)
-                    except BaseException:
-                        for t in (send_task, recv_task):
-                            if not t.done():
-                                t.cancel()
-                        await asyncio.gather(send_task, recv_task, return_exceptions=True)
-                        raise
-
+            await self._run_asr_with_retry()
             await self._finalize()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Volc live ASR run failed meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
 
-            # ASR 失败时，已录制的音频片段仍有价值，尝试保存下来。
+            # 用户手动点击结束时，由前端调用收尾接口。
+            # 只有 WS 异常断开或长时间无消息时，才启动 120 秒延迟收尾。
+            if (
+                not self._explicit_stop
+                and not self._ws_alive
+                and self._recording_session_id
+            ):
+                self._service.schedule_delayed_finalize(
+                    meeting_id=self._meeting_id,
+                    recording_session_id=(
+                        self._recording_session_id
+                    ),
+                )
+
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Volc live ASR run failed "
+                "meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+            )
+
+            partial_audio_saved = False
+
+            # ASR 重试全部失败后，先保存已经接收到的录音。
             if self._audio_chunks:
                 try:
                     await self._save_partial_audio()
+                    partial_audio_saved = True
                 except Exception as save_exc:  # noqa: BLE001
                     logger.warning(
-                        "ASR 失败时保存部分音频失败 meeting_id=%s session_id=%s: %s",
+                        "ASR 失败时保存部分音频失败 "
+                        "meeting_id=%s session_id=%s: %s",
                         self._meeting_id,
                         self._session_id,
                         save_exc,
                     )
 
             asr_session.status = "failed"
-            asr_session.stream_transcript_text = "".join(self._transcript_parts)
+            asr_session.stream_transcript_text = "".join(
+                self._transcript_parts
+            )
             asr_session.error_msg = str(exc)
             self._db.commit()
-            await self._safe_send_json({"type": "error", "message": str(exc)})
-            raise
+
+            # ASR 最终失败，但存在录音时，仍然合并录音并生成会议纪要。
+            if (
+                partial_audio_saved
+                and self._recording_session_id
+            ):
+                try:
+                    result = (
+                        await self._service.finalize_and_generate_async(
+                            db=self._db,
+                            meeting_id=self._meeting_id,
+                            recording_session_id=(
+                                self._recording_session_id
+                            ),
+                        )
+                    )
+
+                    await self._safe_send_json(
+                        {
+                            "type": "recording_auto_finalized",
+                            **result,
+                        }
+                    )
+                    return
+                except Exception as finalize_exc:  # noqa: BLE001
+                    logger.exception(
+                        "ASR 失败后的自动收尾失败 "
+                        "meeting_id=%s "
+                        "recording_session_id=%s",
+                        self._meeting_id,
+                        self._recording_session_id,
+                    )
+
+                    await self._safe_send_json(
+                        {
+                            "type": "error",
+                            "message": str(finalize_exc),
+                        }
+                    )
+                    return
+
+            # 没有任何录音，才真正按失败处理。
+            await self._safe_send_json(
+                {
+                    "type": "error",
+                    "message": str(exc),
+                }
+            )
 
     async def _forward_audio(self, volc_ws, stop_event: asyncio.Event, seq: int) -> None:
         # 从前端 websocket 读取控制消息和 PCM 分片，转成火山协议包发送。
-        while not stop_event.is_set():
-            raw = await self._ws.receive()
-            msg_type = raw.get("type", "")
-            if msg_type in {"websocket.disconnect", "websocket.close"}:
-                self._ws_alive = False
-                stop_event.set()
-                break
-            if raw.get("text"):
-                ctrl = json.loads(raw["text"])
-                action = ctrl.get("action")
-                if action == "stop":
-                    self._explicit_stop = True
+        # 录音期间 PCM 是活跃信号，暂停期间 heartbeat 是活跃信号。
+        try:
+            while not stop_event.is_set():
+                try:
+                    raw = await asyncio.wait_for(
+                        self._ws.receive(),
+                        timeout=settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "前端 WebSocket 长时间无消息 "
+                        "meeting_id=%s session_id=%s timeout=%ss",
+                        self._meeting_id,
+                        self._session_id,
+                        settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
+                    )
+                    self._ws_alive = False
+                    self._client_finished = True
+                    self._disconnect_reason = "idle_timeout"
                     stop_event.set()
                     break
-                if action == "config":
-                    self._sample_rate = int(ctrl.get("rate", self._sample_rate))
-                    self._channels = int(ctrl.get("channels", self._channels))
-                    rsid = ctrl.get("recording_session_id")
-                    if isinstance(rsid, str) and rsid.strip():
-                        self._recording_session_id = rsid.strip()
-                continue
-            if raw.get("bytes"):
-                chunk = raw["bytes"]
-                self._audio_chunks.append(chunk)
-                await volc_ws.send_bytes(self._build_audio_packet(seq, chunk, False))
-                seq += 1
+                except (
+                    WebSocketDisconnect,
+                    ClientDisconnected,
+                    ConnectionClosed,
+                ):
+                    self._ws_alive = False
+                    self._client_finished = True
+                    self._disconnect_reason = "ws_disconnect"
+                    stop_event.set()
+                    break
 
-        # 无论 stop 来源是什么，都要显式发结束包，确保服务端尽快收敛。
-        await volc_ws.send_bytes(self._build_audio_packet(-seq, b"\x00" * 160, True))
+                msg_type = raw.get("type", "")
+                if msg_type in {"websocket.disconnect", "websocket.close"}:
+                    self._ws_alive = False
+                    self._client_finished = True
+                    self._disconnect_reason = "ws_disconnect"
+                    stop_event.set()
+                    break
+
+                if raw.get("text"):
+                    try:
+                        ctrl = json.loads(raw["text"])
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "忽略非法 WebSocket 控制消息 "
+                            "meeting_id=%s session_id=%s",
+                            self._meeting_id,
+                            self._session_id,
+                        )
+                        continue
+
+                    action = ctrl.get("action")
+
+                    if action == "stop":
+                        self._explicit_stop = True
+                        self._client_finished = True
+                        self._disconnect_reason = "user_stop"
+                        stop_event.set()
+                        break
+
+                    if action == "config":
+                        self._sample_rate = int(
+                            ctrl.get("rate", self._sample_rate)
+                        )
+                        self._channels = int(
+                            ctrl.get("channels", self._channels)
+                        )
+
+                        rsid = ctrl.get("recording_session_id")
+                        if isinstance(rsid, str) and rsid.strip():
+                            self._recording_session_id = rsid.strip()
+
+                            # 收到 config 后立即落库。
+                            # 后续才能判断相同 recording_session_id 是否已经重连。
+                            asr_session = (
+                                self._db.query(database.VolcAsrSession)
+                                .filter(
+                                    database.VolcAsrSession.id == self._session_id
+                                )
+                                .first()
+                            )
+                            if asr_session:
+                                asr_session.recording_session_id = (
+                                    self._recording_session_id
+                                )
+                                self._db.commit()
+
+                            # 使用同一个 recording_session_id 建立新 WS，
+                            # 说明前端已经重连成功，取消旧连接创建的延迟收尾。
+                            self._service.cancel_delayed_finalize(
+                                meeting_id=self._meeting_id,
+                                recording_session_id=(
+                                    self._recording_session_id
+                                ),
+                            )
+
+                        continue
+
+                    if action == "heartbeat":
+                        # 收到 heartbeat 本身就表示前端仍然存活。
+                        continue
+
+                    continue
+
+                if raw.get("bytes"):
+                    chunk = raw["bytes"]
+                    self._audio_chunks.append(chunk)
+                    await volc_ws.send_bytes(
+                        self._build_audio_packet(seq, chunk, False)
+                    )
+                    seq += 1
+        finally:
+            # 用户停止、WS断开或连接超时时，通知火山结束当前ASR流。
+            # 火山ASR自身异常时，client_finished仍为False，
+            # 不在这里发送尾包，后续由重试逻辑重新连接火山。
+            if self._client_finished:
+                try:
+                    await volc_ws.send_bytes(
+                        self._build_audio_packet(
+                            -seq,
+                            b"\x00" * 160,
+                            True,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "发送火山ASR结束包失败 "
+                        "meeting_id=%s session_id=%s",
+                        self._meeting_id,
+                        self._session_id,
+                    )
 
     async def _recv_asr_result(self, volc_ws, stop_event: asyncio.Event) -> None:
         # 消费火山二进制回包：提取 partial/final 文本，必要时持久化并回推给前端。

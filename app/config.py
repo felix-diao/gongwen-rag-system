@@ -106,8 +106,21 @@ class Settings(BaseSettings):
     VOLC_ASR_SPEAKER_INFO: bool = True
     # 大模型 SSD 版本：开启说话人分离时必须为 "200"
     VOLC_ASR_SSD_VERSION: str = "200"
-    # 是否开启二遍识别（流式+非流式），说话人分离依赖该能力
+    # 是否开启二遍识别（流式+非流式）
     VOLC_ASR_ENABLE_NONSTREAM: bool = True
+
+    # 火山 ASR 临时异常后的最大重试次数
+    VOLC_ASR_MAX_RETRIES: int = 3
+
+    # 火山 ASR 重试基础间隔，实际为 1秒、2秒、4秒
+    VOLC_ASR_RETRY_BASE_DELAY_SECONDS: float = 1.0
+
+    # 前端 WS 最长无消息时间。
+    # 录音时 PCM 是活跃信号，暂停时 heartbeat 是活跃信号。
+    VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS: int = 90
+
+    # 前端 WS 异常断开后，等待用户重连的时间
+    VOLC_RECORDING_RECONNECT_GRACE_SECONDS: int = 120
 
     # 火山引擎对象存储配置
     VOLC_TOS_ENDPOINT: str = "https://tos-cn-beijing.volces.com"
