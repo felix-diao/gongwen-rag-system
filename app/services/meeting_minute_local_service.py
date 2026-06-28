@@ -2164,6 +2164,11 @@ class LiveLocalAsrHandler:
                         if asr_session:
                             asr_session.recording_session_id = self._recording_session_id
                             self._db.commit()
+                        self._service.register_live_handler(
+                            meeting_id=self._meeting_id,
+                            recording_session_id=self._recording_session_id,
+                            handler=self,
+                        )
                         self._service.cancel_delayed_finalize(
                             meeting_id=self._meeting_id,
                             recording_session_id=self._recording_session_id,
@@ -2515,7 +2520,9 @@ class LiveLocalAsrHandler:
                 msg_type = raw.get("type", "")
                 if msg_type in {"websocket.disconnect", "websocket.close"}:
                     self._ws_alive = False
-                    self._client_disconnected = True
+                    self._client_disconnected = (
+                        not self._recover_finalize_requested
+                    )
                     break
                 if raw.get("text"):
                     ctrl = json.loads(raw["text"])
@@ -2536,6 +2543,11 @@ class LiveLocalAsrHandler:
                             if asr_session:
                                 asr_session.recording_session_id = self._recording_session_id
                                 self._db.commit()
+                            self._service.register_live_handler(
+                                meeting_id=self._meeting_id,
+                                recording_session_id=self._recording_session_id,
+                                handler=self,
+                            )
                             self._service.cancel_delayed_finalize(
                                 meeting_id=self._meeting_id,
                                 recording_session_id=self._recording_session_id,

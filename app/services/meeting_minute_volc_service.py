@@ -488,6 +488,44 @@ class VolcMeetingMinuteService:
                 )
 
         return None
+
+    def register_live_handler(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+        handler: "LiveVolcAsrHandler",
+    ) -> None:
+        if not recording_session_id:
+            return
+        self._active_live_handlers[
+            (meeting_id, recording_session_id)
+        ] = handler
+
+    def unregister_live_handler(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+        handler: "LiveVolcAsrHandler",
+    ) -> None:
+        if not recording_session_id:
+            return
+        key = (meeting_id, recording_session_id)
+        if self._active_live_handlers.get(key) is handler:
+            self._active_live_handlers.pop(key, None)
+
+    async def request_active_recording_finalize(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> bool:
+        handler = self._active_live_handlers.get(
+            (meeting_id, recording_session_id)
+        )
+        if not handler:
+            return False
+
+        await handler.request_recover_finalize()
+        return True
     
     def cancel_delayed_finalize(
         self,
@@ -613,6 +651,40 @@ class VolcMeetingMinuteService:
         finally:
             if self._pending_finalize_tasks.get(key) is current_task:
                 self._pending_finalize_tasks.pop(key, None)
+
+    async def recover_and_finalize_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> Dict[str, Any]:
+        """用户回到列表/详情时，主动推进异常录音收尾。"""
+        if not recording_session_id:
+            raise ValueError("recording_session_id 不能为空")
+
+        self.cancel_delayed_finalize(
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
+
+        active_requested = await self.request_active_recording_finalize(
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
+
+        if active_requested:
+            logger.info(
+                "已通知火山实时录音 handler 主动收尾 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+
+        return await self.finalize_and_generate_async(
+            db=db,
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
 
     async def finalize_and_generate_async(
         self,

@@ -266,6 +266,85 @@ async def finalize_and_generate(
         message=message,
     )
 
+
+@router.post(
+    "/{meeting_id}/recover-and-finalize",
+    response_model=StandardResponse[
+        schemas.VolcFinalizeAndGenerateResponse
+    ],
+)
+async def recover_and_finalize(
+    meeting_id: int,
+    payload: schemas.VolcFinalizeAndGenerateRequest,
+    db: Session = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    recording_session_id = payload.recording_session_id.strip()
+    if not recording_session_id:
+        raise HTTPException(status_code=400, detail="recording_session_id 不能为空")
+
+    logger.info(
+        "恢复异常录音并生成会议纪要请求 "
+        "meeting_id=%s recording_session_id=%s",
+        meeting_id,
+        recording_session_id,
+    )
+
+    try:
+        result = await volc_meeting_minute_service.recover_and_finalize_async(
+            db=db,
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "恢复异常录音并生成会议纪要失败 "
+            "meeting_id=%s recording_session_id=%s error=%s",
+            meeting_id,
+            recording_session_id,
+            exc,
+        )
+        raise _http_from_volc_minutes_value_error(exc) from exc
+    except RuntimeError as exc:
+        logger.warning(
+            "恢复异常录音并生成会议纪要失败 "
+            "meeting_id=%s recording_session_id=%s error=%s",
+            meeting_id,
+            recording_session_id,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    status = str(result["status"])
+    if status == "submitted":
+        message = "异常录音已收尾，会议纪要任务已提交"
+    elif status == "already_submitted":
+        message = "会议纪要已提交，无需重复处理"
+    elif status == "accepted":
+        message = "异常录音正在上传，会议纪要将在上传完成后自动生成"
+    else:
+        message = "未找到可用录音，无法生成会议纪要"
+
+    logger.info(
+        "恢复异常录音并生成会议纪要完成 "
+        "meeting_id=%s recording_session_id=%s "
+        "status=%s audio_id=%s job_id=%s",
+        meeting_id,
+        recording_session_id,
+        status,
+        result.get("audio_id"),
+        result.get("job_id"),
+    )
+
+    return StandardResponse(
+        success=status != "failed_no_audio",
+        data=schemas.VolcFinalizeAndGenerateResponse(
+            **result
+        ),
+        message=message,
+    )
+
+
 # 2. 调用 submit_minutes 提交妙记任务。
 # 3. 返回 VolcMinutesJobInDB。
 @router.post(
