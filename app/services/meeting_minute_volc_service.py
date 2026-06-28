@@ -18,6 +18,7 @@ import asyncio
 import gzip
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -53,6 +54,9 @@ MINUTES_CANCELABLE_STATUS = {"submitted", *MINUTES_RUNNING_STATUS}
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
 EMPTY_SUMMARY_HINT = "摘要为空，可能因录音内容较短或有效信息不足，暂未生成摘要。"
 
+_DEFAULT_MEETING_TITLE_RE = re.compile(r"^会议 \d{2}/\d{2} \d{2}:\d{2}(:\d{2})?$")
+# 与前端 MEETING_TITLE_MAX_LEN 保持一致（移动端会议名称限制 20 字符）。
+_MEETING_TITLE_MAX_LEN = 20
 
 class ProtocolVersion:
     V1 = 1
@@ -1225,17 +1229,6 @@ class VolcMeetingMinuteService:
                 audio.id,
                 exc,
             )
-        db.query(database.VolcMeetingSummary).filter(
-            database.VolcMeetingSummary.meeting_id == audio.meeting_id
-        ).delete(synchronize_session=False)
-        db.add(
-            database.VolcMeetingSummary(
-                meeting_id=audio.meeting_id,
-                source_audio_id=audio.id,
-                title=summary_title,
-                paragraph=summary_paragraph,
-            )
-        )
 
         todos_items: List[Dict[str, Optional[str]]] = []
         try:
@@ -1258,6 +1251,69 @@ class VolcMeetingMinuteService:
                 audio.id,
                 exc,
             )
+            
+        summary_is_empty = (
+            not summary_paragraph
+            or summary_paragraph == EMPTY_SUMMARY_HINT
+        )
+        title_is_empty = not (summary_title and summary_title.strip())
+
+        if (summary_is_empty or title_is_empty) and (transcript_text or "").strip():
+            llm_summary = self._llm_fallback_minutes(
+                meeting_id=audio.meeting_id,
+                transcript=transcript_text,
+            )
+            if llm_summary:
+                fb_title = (llm_summary.get("summary") or {}).get("title")
+                fb_paragraph = (llm_summary.get("summary") or {}).get("paragraph")
+                fb_todos = llm_summary.get("todos") or []
+                if summary_is_empty and isinstance(fb_paragraph, str) and fb_paragraph.strip():
+                    summary_paragraph = fb_paragraph.strip()
+                    logger.info(
+                        "volc 摘要 LLM 兜底成功 meeting_id=%s audio_id=%s paragraph_len=%d",
+                        audio.meeting_id, audio.id, len(summary_paragraph),
+                    )
+                if title_is_empty and isinstance(fb_title, str) and fb_title.strip():
+                    summary_title = fb_title.strip()
+                    logger.info(
+                        "volc 标题 LLM 兜底成功 meeting_id=%s audio_id=%s title=%s",
+                        audio.meeting_id, audio.id, summary_title,
+                    )
+                # 火山待办为空但 LLM 兜底有 todos：补上
+                if not todos_items and isinstance(fb_todos, list):
+                    for it in fb_todos:
+                        if not isinstance(it, dict):
+                            continue
+                        content = str(it.get("content") or "").strip()
+                        if not content:
+                            continue
+                        ex = it.get("executor")
+                        et = it.get("execution_time")
+                        todos_items.append(
+                            {
+                                "content": content,
+                                "executor": str(ex).strip() if isinstance(ex, str) and ex.strip() else None,
+                                "execution_time": str(et).strip() if isinstance(et, str) and et.strip() else None,
+                            }
+                        )
+                    if todos_items:
+                        logger.info(
+                            "volc 待办 LLM 兜底补充 meeting_id=%s audio_id=%s count=%d",
+                            audio.meeting_id, audio.id, len(todos_items),
+                        )
+        
+        db.query(database.VolcMeetingSummary).filter(
+            database.VolcMeetingSummary.meeting_id == audio.meeting_id
+        ).delete(synchronize_session=False)
+        db.add(
+            database.VolcMeetingSummary(
+                meeting_id=audio.meeting_id,
+                source_audio_id=audio.id,
+                title=summary_title,
+                paragraph=summary_paragraph,
+            )
+        )
+        
         db.query(database.VolcMeetingTodo).filter(
             database.VolcMeetingTodo.meeting_id == audio.meeting_id
         ).delete(synchronize_session=False)
@@ -1271,6 +1327,30 @@ class VolcMeetingMinuteService:
                     execution_time=item["execution_time"],
                 )
             )
+        
+        if summary_title and summary_title.strip():
+            try:
+                meeting_row = (
+                    db.query(database.Meeting)
+                    .filter(database.Meeting.id == audio.meeting_id)
+                    .first()
+                )
+                if meeting_row and _DEFAULT_MEETING_TITLE_RE.match(
+                    (meeting_row.title or "").strip()
+                ):
+                    new_title = summary_title.strip()[:_MEETING_TITLE_MAX_LEN]
+                    logger.info(
+                        "volc 妙记完成后自动回填 meetings.title meeting_id=%s old=%s new=%s",
+                        meeting_row.id, meeting_row.title, new_title,
+                    )
+                    meeting_row.title = new_title
+                    # 不在这里 commit，外层 _poll_loop 会统一 commit
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "volc 自动回填 meetings.title 失败（忽略，不影响主流程）meeting_id=%s error=%s",
+                    audio.meeting_id, exc,
+                )
+        
         return {
             "transcript_text": transcript_text,
             "speaker_segments_json": seg_json or "[]",
@@ -1289,6 +1369,61 @@ class VolcMeetingMinuteService:
                 ensure_ascii=False,
             ),
         }
+    
+    def _llm_fallback_minutes(
+        self,
+        meeting_id: int,
+        transcript: str,
+    ) -> Optional[Dict[str, Any]]:
+        """火山妙记摘要/标题为空时，用本地 LLM 基于转写文本兜底生成完整纪要。
+
+        复用 LocalMeetingMinuteService._call_llm，保持两条链路 prompt 完全一致。
+        - 转写为空：直接返回 None，不浪费 LLM 调用；
+        - 任何异常一律返回 None，由调用方决定是否回退到 EMPTY_SUMMARY_HINT。
+        """
+        text_to_use = (transcript or "").strip()
+        if not text_to_use:
+            return None
+        try:
+            # 延迟 import 避免顶层循环依赖（local 服务里也会反向引用 volc 模块）
+            from app.services.meeting_minute_local_service import (
+                local_meeting_minute_service,
+            )
+
+            # 取会议标题作为 LLM 提示上下文（拿不到就用"会议"占位，不影响主流程）。
+            # 必须用独立的 SessionLocal，避免污染外层 _poll_loop 的事务。
+            meeting_title_for_prompt = "会议"
+            _title_db = database.SessionLocal()
+            try:
+                meeting_title_for_prompt = (
+                    local_meeting_minute_service._get_meeting_title(
+                        _title_db, meeting_id
+                    )
+                    or "会议"
+                )
+            except Exception:
+                meeting_title_for_prompt = "会议"
+            finally:
+                try:
+                    _title_db.close()
+                except Exception:
+                    pass
+
+            # duration_seconds 给 0：local 的 prompt 会按转写字符数自动选档。
+            payload = local_meeting_minute_service._call_llm(
+                meeting_title=meeting_title_for_prompt,
+                transcript=text_to_use,
+                duration_seconds=0,
+            )
+            if isinstance(payload, dict):
+                return payload
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "volc LLM 兜底生成纪要失败 meeting_id=%s error=%s",
+                meeting_id, exc,
+            )
+            return None
 
     @staticmethod
     def _pick_result_source(result: Dict[str, Any], candidates: tuple[str, ...], label: str) -> Any:
