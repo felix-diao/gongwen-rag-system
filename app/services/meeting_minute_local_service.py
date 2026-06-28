@@ -568,6 +568,10 @@ class LocalMeetingMinuteService:
             tuple[int, str],
             asyncio.Task,
         ] = {}
+        self._active_live_handlers: Dict[
+            tuple[int, str],
+            "LiveLocalAsrHandler",
+        ] = {}
         self._finalize_locks: Dict[
             tuple[int, str],
             asyncio.Lock,
@@ -721,6 +725,108 @@ class LocalMeetingMinuteService:
             .order_by(database.MeetingAudio.updated_at.desc(), database.MeetingAudio.id.desc())
             .first()
         )
+
+    def _recoverable_recording_info(
+        self,
+        db: Session,
+        meeting_id: int,
+        summary: Optional[database.LocalMeetingSummary],
+    ) -> Optional[schemas.RecoverableRecordingInfo]:
+        if summary:
+            return None
+
+        sessions = (
+            db.query(database.LocalAsrSession)
+            .filter(
+                database.LocalAsrSession.meeting_id == meeting_id,
+                database.LocalAsrSession.recording_session_id.isnot(None),
+            )
+            .order_by(
+                database.LocalAsrSession.updated_at.desc(),
+                database.LocalAsrSession.id.desc(),
+            )
+            .all()
+        )
+
+        seen_recording_ids: set[str] = set()
+        for session in sessions:
+            recording_session_id = (
+                session.recording_session_id or ""
+            ).strip()
+            if not recording_session_id:
+                continue
+            if recording_session_id in seen_recording_ids:
+                continue
+            seen_recording_ids.add(recording_session_id)
+
+            related_sessions = [
+                item
+                for item in sessions
+                if item.recording_session_id == recording_session_id
+            ]
+            has_audio_part = any(
+                bool(item.audio_part_path) for item in related_sessions
+            )
+            has_audio_id = any(
+                item.source_audio_id is not None
+                for item in related_sessions
+            )
+            has_processing = any(
+                str(item.status or "").lower() == "processing"
+                for item in related_sessions
+            )
+
+            if has_audio_id:
+                continue
+
+            if has_processing or has_audio_part:
+                return schemas.RecoverableRecordingInfo(
+                    provider="local",
+                    recording_session_id=recording_session_id,
+                    asr_session_id=session.id,
+                    status="active" if has_processing else "saved_part",
+                    has_audio_part=has_audio_part,
+                )
+
+        return None
+
+    def register_live_handler(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+        handler: "LiveLocalAsrHandler",
+    ) -> None:
+        if not recording_session_id:
+            return
+        self._active_live_handlers[
+            (meeting_id, recording_session_id)
+        ] = handler
+
+    def unregister_live_handler(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+        handler: "LiveLocalAsrHandler",
+    ) -> None:
+        if not recording_session_id:
+            return
+        key = (meeting_id, recording_session_id)
+        if self._active_live_handlers.get(key) is handler:
+            self._active_live_handlers.pop(key, None)
+
+    async def request_active_recording_finalize(
+        self,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> bool:
+        handler = self._active_live_handlers.get(
+            (meeting_id, recording_session_id)
+        )
+        if not handler:
+            return False
+
+        await handler.request_recover_finalize()
+        return True
 
     def cancel_delayed_finalize(
         self,
@@ -951,6 +1057,40 @@ class LocalMeetingMinuteService:
                 database.LocalMeetingMinutesSession.id.desc(),
             )
             .first()
+        )
+
+    async def recover_and_finalize_async(
+        self,
+        db: Session,
+        meeting_id: int,
+        recording_session_id: str,
+    ) -> Dict[str, Any]:
+        """用户回到列表/详情时，主动推进异常录音收尾。"""
+        if not recording_session_id:
+            raise ValueError("recording_session_id 不能为空")
+
+        self.cancel_delayed_finalize(
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
+
+        active_requested = await self.request_active_recording_finalize(
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
+        )
+
+        if active_requested:
+            logger.info(
+                "已通知本地实时录音 handler 主动收尾 "
+                "meeting_id=%s recording_session_id=%s",
+                meeting_id,
+                recording_session_id,
+            )
+
+        return await self.finalize_and_generate_async(
+            db=db,
+            meeting_id=meeting_id,
+            recording_session_id=recording_session_id,
         )
 
     async def finalize_and_generate_async(
@@ -1462,6 +1602,11 @@ class LocalMeetingMinuteService:
             source_audio_id = display_session.source_audio_id
 
         source_audio = self._local_audio_by_id(db, meeting_id, source_audio_id)
+        recoverable_recording = self._recoverable_recording_info(
+            db=db,
+            meeting_id=meeting_id,
+            summary=summary,
+        )
         return schemas.LocalMeetingMinutesResponse(
             transcript_text=transcript,
             stream_transcript_text=transcript,
@@ -1476,6 +1621,7 @@ class LocalMeetingMinuteService:
                 if source_audio
                 else (latest_audio.status if latest_audio else (display_session.status if display_session else None))
             ),
+            recoverable_recording=recoverable_recording,
             summary=schemas.LocalMeetingSummaryInDB.model_validate(summary) if summary else None,
             todos=[schemas.LocalMeetingTodoInDB.model_validate(x) for x in todos],
         )
@@ -1867,6 +2013,7 @@ class LiveLocalAsrHandler:
         self._sample_width = 2
         self._ws_alive = True
         self._client_disconnected = False
+        self._recover_finalize_requested = False
         # HTTP 滑窗分段时 merge_pair 的累计稿，异常收尾时写入 DB 便于排障
         self._live_http_merged: str = ""
 
@@ -1884,6 +2031,20 @@ class LiveLocalAsrHandler:
                 self._session_id,
             )
             return False
+
+    async def request_recover_finalize(self) -> None:
+        """由 HTTP 恢复入口主动关闭当前实时 WS，让 run() 尽快落盘。"""
+        self._recover_finalize_requested = True
+        self._client_disconnected = False
+        try:
+            await self._ws.close(code=1000, reason="recover_finalize")
+        except Exception:
+            logger.warning(
+                "主动关闭本地实时 WS 失败 meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+                exc_info=True,
+            )
 
     async def run(self) -> None:
         # `run` 是实时会话总入口，负责创建 ASR session、启动双向转发、并在结束时统一收尾。
@@ -1947,6 +2108,13 @@ class LiveLocalAsrHandler:
             self._db.commit()
             await self._safe_send_json({"type": "error", "message": str(exc)})
             raise
+        finally:
+            if self._recording_session_id:
+                self._service.unregister_live_handler(
+                    meeting_id=self._meeting_id,
+                    recording_session_id=self._recording_session_id,
+                    handler=self,
+                )
 
     async def _forward_audio(self, qwen_ws, stop_event: asyncio.Event) -> None:
         # 前端到 Qwen 的上行链路：控制消息负责 stop/config，二进制消息负责真正音频内容。
@@ -1971,7 +2139,9 @@ class LiveLocalAsrHandler:
             msg_type = raw.get("type", "")
             if msg_type in {"websocket.disconnect", "websocket.close"}:
                 self._ws_alive = False
-                self._client_disconnected = True
+                self._client_disconnected = (
+                    not self._recover_finalize_requested
+                )
                 stop_event.set()
                 break
             if raw.get("text"):

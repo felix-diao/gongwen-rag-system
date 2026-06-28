@@ -375,6 +375,13 @@ class VolcMeetingMinuteService:
             asyncio.Task,
         ] = {}
 
+        # 当前仍在内存中的实时录音 handler。
+        # 用户回到列表/详情时，可通过 recover-and-finalize 主动要求它落盘。
+        self._active_live_handlers: Dict[
+            Tuple[int, str],
+            "LiveVolcAsrHandler",
+        ] = {}
+
         # 防止同一次录音被多个入口同时触发收尾。
         self._finalize_locks: Dict[
             Tuple[int, str],
@@ -417,6 +424,70 @@ class VolcMeetingMinuteService:
             .order_by(database.VolcAsrSession.updated_at.desc(), database.VolcAsrSession.id.desc())
             .first()
         )
+
+    def _recoverable_recording_info(
+        self,
+        db: Session,
+        meeting_id: int,
+        summary: Optional[database.VolcMeetingSummary],
+    ) -> Optional[schemas.RecoverableRecordingInfo]:
+        if summary:
+            return None
+
+        sessions = (
+            db.query(database.VolcAsrSession)
+            .filter(
+                database.VolcAsrSession.meeting_id == meeting_id,
+                database.VolcAsrSession.recording_session_id.isnot(None),
+            )
+            .order_by(
+                database.VolcAsrSession.updated_at.desc(),
+                database.VolcAsrSession.id.desc(),
+            )
+            .all()
+        )
+
+        seen_recording_ids: set[str] = set()
+        for session in sessions:
+            recording_session_id = (
+                session.recording_session_id or ""
+            ).strip()
+            if not recording_session_id:
+                continue
+            if recording_session_id in seen_recording_ids:
+                continue
+            seen_recording_ids.add(recording_session_id)
+
+            related_sessions = [
+                item
+                for item in sessions
+                if item.recording_session_id == recording_session_id
+            ]
+            has_audio_part = any(
+                bool(item.audio_part_path) for item in related_sessions
+            )
+            has_audio_id = any(
+                item.source_audio_id is not None
+                for item in related_sessions
+            )
+            has_processing = any(
+                str(item.status or "").lower() == "processing"
+                for item in related_sessions
+            )
+
+            if has_audio_id:
+                continue
+
+            if has_processing or has_audio_part:
+                return schemas.RecoverableRecordingInfo(
+                    provider="volc",
+                    recording_session_id=recording_session_id,
+                    asr_session_id=session.id,
+                    status="active" if has_processing else "saved_part",
+                    has_audio_part=has_audio_part,
+                )
+
+        return None
     
     def cancel_delayed_finalize(
         self,
@@ -1424,6 +1495,11 @@ class VolcMeetingMinuteService:
 
         summary = self._meeting_summary(db, meeting_id)
         todos = self._meeting_todos(db, meeting_id)
+        recoverable_recording = self._recoverable_recording_info(
+            db=db,
+            meeting_id=meeting_id,
+            summary=summary,
+        )
         return schemas.VolcMeetingMinutesResponse(
             stream_transcript_text=stream_text,
             transcript_text=transcript_text,
@@ -1434,6 +1510,7 @@ class VolcMeetingMinuteService:
                 if latest_audio
                 else (asr_session.status if asr_session else None)
             ),
+            recoverable_recording=recoverable_recording,
             speaker_segments=[
                 schemas.SpeakerSegment.model_validate(m.model_dump())
                 for m in speaker_segment_models
@@ -2061,7 +2138,10 @@ class LiveVolcAsrHandler:
         # 前端是否已经明确结束或异常离线
         self._client_finished = False
 
-        # 仅用于日志区分 user_stop / ws_disconnect / idle_timeout
+        # 恢复入口主动要求当前 handler 结束并落盘。
+        self._recover_finalize_requested = False
+
+        # 仅用于日志区分 user_stop / ws_disconnect / idle_timeout / recover_finalize
         self._disconnect_reason: Optional[str] = None
 
     async def _safe_send_json(self, payload: dict) -> bool:
@@ -2078,6 +2158,22 @@ class LiveVolcAsrHandler:
                 self._session_id,
             )
             return False
+
+    async def request_recover_finalize(self) -> None:
+        """由 HTTP 恢复入口主动关闭当前实时 WS，让 run() 尽快落盘。"""
+        self._recover_finalize_requested = True
+        self._explicit_stop = True
+        self._client_finished = True
+        self._disconnect_reason = "recover_finalize"
+        try:
+            await self._ws.close(code=1000, reason="recover_finalize")
+        except Exception:
+            logger.warning(
+                "主动关闭火山实时 WS 失败 meeting_id=%s session_id=%s",
+                self._meeting_id,
+                self._session_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _auth_headers() -> Dict[str, str]:
@@ -2428,6 +2524,13 @@ class LiveVolcAsrHandler:
                     "message": str(exc),
                 }
             )
+        finally:
+            if self._recording_session_id:
+                self._service.unregister_live_handler(
+                    meeting_id=self._meeting_id,
+                    recording_session_id=self._recording_session_id,
+                    handler=self,
+                )
 
     async def _forward_audio(self, volc_ws, stop_event: asyncio.Event, seq: int) -> None:
         # 从前端 websocket 读取控制消息和 PCM 分片，转成火山协议包发送。
@@ -2518,6 +2621,14 @@ class LiveVolcAsrHandler:
                                     self._recording_session_id
                                 )
                                 self._db.commit()
+
+                            self._service.register_live_handler(
+                                meeting_id=self._meeting_id,
+                                recording_session_id=(
+                                    self._recording_session_id
+                                ),
+                                handler=self,
+                            )
 
                             # 使用同一个 recording_session_id 建立新 WS，
                             # 说明前端已经重连成功，取消旧连接创建的延迟收尾。

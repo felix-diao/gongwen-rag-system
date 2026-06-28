@@ -1,0 +1,62 @@
+ebc81d5 | 2026-06-26 10:47:55 +0800 | Di-Heqiu <18303611177@163.com> | fix(volc-live-asr): partial/final 去重并避免重复显示
+[1mdiff --git a/app/services/meeting_minute_volc_service.py b/app/services/meeting_minute_volc_service.py[m
+[1mindex 5a4ff19..34109c7 100644[m
+[1m--- a/app/services/meeting_minute_volc_service.py[m
+[1m+++ b/app/services/meeting_minute_volc_service.py[m
+[36m@@ -1803,11 +1803,8 @@[m [mclass LiveVolcAsrHandler:[m
+ [m
+             if isinstance(utterances, list):[m
+                 for i, u in enumerate(utterances):[m
+[31m-                    if i <= self._last_utterance_index:[m
+[31m-                        continue[m
+                     if not isinstance(u, dict):[m
+                         continue[m
+[31m-[m
+                     text = u.get("text")[m
+                     if not isinstance(text, str) or not text.strip():[m
+                         continue[m
+[36m@@ -1825,18 +1822,32 @@[m [mclass LiveVolcAsrHandler:[m
+                                 self._speaker_name_map[sid] = f"说话人{len(self._speaker_name_map) + 1}"[m
+                             speaker_name = self._speaker_name_map[sid][m
+ [m
+[31m-                    # 累积到 transcript_parts，用于最终落盘[m
+[31m-                    self._transcript_parts.append(text)[m
+[31m-                    self._last_utterance_index = i[m
+[31m-[m
+[31m-                    msg: Dict[str, Any] = {[m
+[31m-                        "type": "final" if is_definite else "partial",[m
+[31m-                        "text": text,[m
+[31m-                        "accumulated": "".join(self._transcript_parts),[m
+[31m-                    }[m
+[31m-                    if speaker_name:[m
+[31m-                        msg["speaker"] = speaker_name[m
+[31m-                    await self._safe_send_json(msg)[m
+[32m+[m[32m                    if is_definite:[m
+[32m+[m[32m                        # 确定分句：落袋并推进索引[m
+[32m+[m[32m                        if i > self._last_utterance_index:[m
+[32m+[m[32m                            self._transcript_parts.append(text)[m
+[32m+[m[32m                            self._last_utterance_index = i[m
+[32m+[m[32m                            await self._safe_send_json([m
+[32m+[m[32m                                {[m
+[32m+[m[32m                                    "type": "final",[m
+[32m+[m[32m                                    "text": text,[m
+[32m+[m[32m                                    "accumulated": "".join(self._transcript_parts),[m
+[32m+[m[32m                                    "speaker": speaker_name,[m
+[32m+[m[32m                                }[m
+[32m+[m[32m                            )[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        # 未确定分句：只作为 partial 展示，不推进索引[m
+[32m+[m[32m                        # 这样它后续变成 definite 时还能再发一次 final[m
+[32m+[m[32m                        last_indefinite_index = i[m
+[32m+[m[32m                        if i > self._last_utterance_index:[m
+[32m+[m[32m                            await self._safe_send_json([m
+[32m+[m[32m                                {[m
+[32m+[m[32m                                    "type": "partial",[m
+[32m+[m[32m                                    "text": text,[m
+[32m+[m[32m                                    "accumulated": "".join(self._transcript_parts) + text,[m
+[32m+[m[32m                                    "speaker": speaker_name,[m
+[32m+[m[32m                                }[m
+[32m+[m[32m                            )[m
+ [m
+             # 兜底：如果 result 没有 utterances 但又有 text，按旧模式推一把[m
+             elif "text" in result and isinstance(result["text"], str):[m

@@ -628,7 +628,7 @@ class AIRateResponse(BaseData):
 
 class MeetingBase(BaseModel):
     """会议基础字段。"""
-    title: str
+    title: str = Field(..., max_length=20, description="会议名称，最长 20 个字符")
     date: datetime
     location: Optional[str] = None
     host: Optional[str] = None
@@ -649,7 +649,7 @@ class MeetingUpdate(MeetingBase):
 
     meeting_domain 支持部分更新，因此重写必填字段为可选。
     """
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=20, description="会议名称，最长 20 个字符")
     date: Optional[datetime] = None
 
 
@@ -814,6 +814,15 @@ class VolcFinalizeAndGenerateResponse(BaseModel):
     job_status: Optional[str] = None
 
 
+class RecoverableRecordingInfo(BaseModel):
+    """异常中断后可恢复收尾的录音信息。"""
+    provider: Literal["volc", "local"]
+    recording_session_id: str
+    asr_session_id: Optional[int] = None
+    status: Literal["active", "saved_part"]
+    has_audio_part: bool = False
+
+
 class LocalFinalizeAndGenerateRequest(BaseModel):
     """结束本地录音、合并音频并生成会议纪要请求。"""
     recording_session_id: str
@@ -870,6 +879,7 @@ class VolcMeetingMinutesResponse(BaseModel):
     minutes_job_id: Optional[int] = None
     minutes_job_status: Optional[str] = None
     audio_status: Optional[str] = None
+    recoverable_recording: Optional[RecoverableRecordingInfo] = None
     speaker_segments: List[SpeakerSegment] = Field(default_factory=list)
     summary: Optional[VolcMeetingSummaryInDB] = None
     todos: List[VolcMeetingTodoInDB] = Field(default_factory=list)
@@ -990,6 +1000,7 @@ class LocalMeetingMinutesResponse(BaseModel):
     processing_status: Optional[str] = None
     source_audio_id: Optional[int] = None
     audio_status: Optional[str] = None
+    recoverable_recording: Optional[RecoverableRecordingInfo] = None
     summary: Optional[LocalMeetingSummaryInDB] = None
     todos: List[LocalMeetingTodoInDB] = Field(default_factory=list)
 
