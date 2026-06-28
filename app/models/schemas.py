@@ -627,8 +627,8 @@ class AIRateResponse(BaseData):
 # ========== 会议纪要相关 Schema（统一放在文件最后） ==========
 
 class MeetingBase(BaseModel):
-    """会议基础字段。"""
-    title: str = Field(..., max_length=20, description="会议名称，最长 20 个字符")
+    """会议基础字段。（查询响应也继承此类，因此不加 max_length，避免历史长标题 500）"""
+    title: str
     date: datetime
     location: Optional[str] = None
     host: Optional[str] = None
@@ -641,7 +641,7 @@ class MeetingBase(BaseModel):
 
 class MeetingCreate(MeetingBase):
     """创建会议请求体。"""
-    pass
+    title: str = Field(..., max_length=20, description="会议名称，最长 20 个字符")
 
 
 class MeetingUpdate(MeetingBase):
@@ -651,6 +651,7 @@ class MeetingUpdate(MeetingBase):
     """
     title: Optional[str] = Field(default=None, max_length=20, description="会议名称，最长 20 个字符")
     date: Optional[datetime] = None
+
 
 
 class MeetingInDB(MeetingBase):
