@@ -1761,11 +1761,80 @@ class LocalMeetingMinuteService:
                 temperature=0.2,
                 max_tokens=max_tokens,
             )
-            payload = self._parse_json(raw)
+            payload = self._parse_json_with_repair(
+                raw=raw,
+                max_attempts=3,
+                max_tokens=max_tokens,
+            )
             return self._normalize_payload(payload, meeting_title)
         except Exception as exc:  # noqa: BLE001
             logger.exception("本地会议纪要 LLM 调用失败 meeting_title=%s", meeting_title)
             raise RuntimeError(f"LLM 生成会议纪要失败: {exc}") from exc
+
+    def _parse_json_with_repair(
+        self,
+        raw: str,
+        max_attempts: int = 3,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
+        current_raw = raw
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._parse_json(current_raw)
+            except ValueError as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+
+                logger.warning(
+                    "LLM 返回 JSON 解析失败，尝试修复格式 attempt=%s/%s error=%s",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                current_raw = self._repair_llm_json(
+                    invalid_content=current_raw,
+                    error_message=str(exc),
+                    max_tokens=max_tokens,
+                )
+
+        raise ValueError(
+            f"LLM 返回内容不是合法 JSON，已尝试 {max_attempts} 次仍失败: {last_error}"
+        )
+
+    @staticmethod
+    def _repair_llm_json(
+        invalid_content: str,
+        error_message: str,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        from app.llm_client.generators import get_client
+
+        instruction = (
+            "你是 JSON 格式修复器。"
+            "下面用户会提供一段不合法的 JSON，它本应是会议纪要生成结果。"
+            "请只修复 JSON 语法错误，不要改写原始内容，不要新增字段，不要删除字段，"
+            "不要输出解释，不要输出 Markdown 代码块，只返回修复后的合法 JSON。"
+        )
+        user_msg = (
+            f"JSON 解析错误：\n{error_message}\n\n"
+            f"待修复内容：\n{invalid_content}"
+        )
+
+        cli = get_client()
+        repaired = cli.chat(
+            [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+        if not repaired:
+            raise ValueError("LLM JSON 修复未返回任何内容")
+        return repaired
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
@@ -1781,7 +1850,9 @@ class LocalMeetingMinuteService:
         try:
             payload = json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"LLM 返回内容不是合法 JSON: {cleaned[:300]}") from exc
+            raise ValueError(
+                f"LLM 返回内容不是合法 JSON: {exc}; 内容片段: {cleaned[:300]}"
+            ) from exc
         if not isinstance(payload, dict):
             raise ValueError("LLM 返回内容不是 JSON 对象")
         return payload
