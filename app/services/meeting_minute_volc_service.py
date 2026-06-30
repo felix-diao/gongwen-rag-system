@@ -2442,6 +2442,10 @@ class LiveVolcAsrHandler:
         self._sample_width = 2
         self._ws_alive = True
 
+        # 前端活动计数：收到音频包、heartbeat、config 等消息都会递增。
+        # 火山 timeout 后用它判断本次重连期间前端是否仍然活着。
+        self._client_activity_marker = 0
+
         # 前端是否已经明确结束或异常离线
         self._client_finished = False
 
@@ -2532,6 +2536,15 @@ class LiveVolcAsrHandler:
         header.append(0x00)
         compressed = gzip.compress(chunk or b"")
         return bytes(header) + struct.pack(">i", seq) + struct.pack(">I", len(compressed)) + compressed
+
+    @staticmethod
+    def _is_next_packet_timeout_error(exc: BaseException) -> bool:
+        text = str(exc)
+        return (
+            "Timeout waiting next packet" in text
+            or "waiting next packet timeout" in text
+            or "code=45000081" in text
+        )
 
     async def _run_asr_once(self, retry_count: int) -> None:
         """建立一次火山 ASR 连接，并处理音频发送和识别结果接收。"""
@@ -2645,16 +2658,20 @@ class LiveVolcAsrHandler:
                 settings.VOLC_ASR_RETRY_BASE_DELAY_SECONDS
             ),
         )
-        retry_count = 0
+        timeout_retry_count = 0
+        other_retry_count = 0
 
         while True:
             # 每次重新连接火山后，utterance 下标会重新从 0 开始。
             # 这里只重置下标，之前的转录文本和录音数据继续保留。
             self._last_utterance_index = -1
 
+            activity_marker_before_attempt = self._client_activity_marker
+            retry_count_for_event = max(timeout_retry_count, other_retry_count)
+
             try:
                 await self._run_asr_once(
-                    retry_count=retry_count,
+                    retry_count=retry_count_for_event,
                 )
                 return
             except (
@@ -2666,12 +2683,39 @@ class LiveVolcAsrHandler:
                 if self._client_finished:
                     raise
 
-                if retry_count >= max_retries:
-                    raise RuntimeError(
-                        f"火山实时 ASR 重试 {max_retries} 次后仍然失败: {exc}"
-                    ) from exc
+                is_next_packet_timeout = self._is_next_packet_timeout_error(exc)
+                had_frontend_activity = (
+                    self._client_activity_marker > activity_marker_before_attempt
+                )
 
-                retry_count += 1
+                if is_next_packet_timeout:
+                    # 本次火山 timeout 期间，如果前端仍有音频/心跳/config 消息，
+                    # 说明页面没有假死；下一次 timeout 重新从 1/3 判断。
+                    if had_frontend_activity:
+                        timeout_retry_count = 0
+
+                    if timeout_retry_count >= max_retries:
+                        raise RuntimeError(
+                            "火山实时 ASR timeout 后连续重试 "
+                            f"{max_retries} 次仍未恢复前端音频/心跳: {exc}"
+                        ) from exc
+
+                    timeout_retry_count += 1
+                    retry_count = timeout_retry_count
+                else:
+                    # 非 waiting-next-packet timeout 沿用原来的重试语义，
+                    # 不因为前端 heartbeat 重置，避免掩盖火山服务端/网络通用错误。
+                    if other_retry_count >= max_retries:
+                        raise RuntimeError(
+                            f"火山实时 ASR 重试 {max_retries} 次后仍然失败: {exc}"
+                        ) from exc
+
+                    other_retry_count += 1
+                    retry_count = other_retry_count
+
+                    # 出现非 timeout 错误时，不把之前某次 timeout 的计数带到下一轮。
+                    timeout_retry_count = 0
+
                 delay_seconds = base_delay * (
                     2 ** (retry_count - 1)
                 )
@@ -2679,12 +2723,14 @@ class LiveVolcAsrHandler:
                 logger.warning(
                     "火山实时 ASR 异常，准备重试 "
                     "meeting_id=%s session_id=%s "
-                    "retry=%s/%s delay=%ss error=%s",
+                    "retry=%s/%s delay=%ss timeout=%s frontend_activity=%s error=%s",
                     self._meeting_id,
                     self._session_id,
                     retry_count,
                     max_retries,
                     delay_seconds,
+                    is_next_packet_timeout,
+                    had_frontend_activity,
                     exc,
                 )
 
@@ -2880,6 +2926,9 @@ class LiveVolcAsrHandler:
                     self._disconnect_reason = "ws_disconnect"
                     stop_event.set()
                     break
+
+                if raw.get("text") or raw.get("bytes"):
+                    self._client_activity_marker += 1
 
                 if raw.get("text"):
                     try:
