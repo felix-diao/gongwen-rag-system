@@ -2102,10 +2102,11 @@ class VolcMeetingMinuteService:
         流程：
         1. 等待同 recording_session_id 下所有 processing 的 ASR 会话结束。
         2. 收集 completed/failed 且带 audio_part_path 的会话。
-        3. 如果已有最新 merged 音频且晚于所有 part，直接返回。
-        4. 合并 WAV 片段并异步上传 TOS，创建 MeetingAudio（status='uploading'）。
-        5. 回填所有相关 session 的 source_audio_id。
-        6. 清理本地 part 片段文件。
+        3. 如果所有会话都已关联同一 MeetingAudio → 直接返回（无新内容）。
+        4. 如果有已有合并音频 + 新未合并 session → 追加合并：下载已有 merged.wav，
+           与新 part 合并为新 WAV，创建新 MeetingAudio（status='uploading'）。
+        5. 如果所有会话都是新的 → 首次合并：合并 WAV 片段并异步上传 TOS。
+        6. 上传完成后通过回调自动提交妙记任务（首次合并检查去重，追加合并强制提交）。
 
         参数:
             recording_session_id: 录音 session id；为空时从最新 ASR 会话推断。
@@ -2182,14 +2183,10 @@ class VolcMeetingMinuteService:
             for sess in sessions
             if sess.source_audio_id is not None
         }
+        unmerged_sessions = [s for s in sessions if s.source_audio_id is None]
 
-        if (
-            len(existing_merged_ids) == 1
-            and all(
-                sess.source_audio_id is not None
-                for sess in sessions
-            )
-        ):
+        # 已有合并结果 + 没有未合并 session → 跳过（所有片段都已合并）
+        if existing_merged_ids and not unmerged_sessions:
             existing_audio_id = next(iter(existing_merged_ids))
             existing_merged = (
                 db.query(database.MeetingAudio)
@@ -2200,7 +2197,6 @@ class VolcMeetingMinuteService:
                 )
                 .first()
             )
-
             if existing_merged:
                 logger.info(
                     "录音已经完成合并，无需重复处理 "
@@ -2215,10 +2211,104 @@ class VolcMeetingMinuteService:
         meeting = db.query(database.Meeting).filter(database.Meeting.id == meeting_id).first()
         creator_id = meeting.creator_id if meeting else None
 
-        # 合并并异步上传
-        wav_dir = Path(settings.VOLC_ASR_AUDIO_SAVE_DIR or os.path.join(settings.UPLOAD_DIR, "asr_recordings"))
+        wav_dir = Path(
+            settings.VOLC_ASR_AUDIO_SAVE_DIR
+            or os.path.join(settings.UPLOAD_DIR, "asr_recordings")
+        )
         wav_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── 追加合并：已有合并音频 + 新 session ──────────────────────
+        if existing_merged_ids and unmerged_sessions:
+            existing_audio_id = next(iter(existing_merged_ids))
+            existing_audio = db.query(database.MeetingAudio).get(existing_audio_id)
+
+            logger.info(
+                "发现未合并的 ASR 会话，追加到已有音频 "
+                "meeting_id=%s recording_session_id=%s existing_audio_id=%s unmerged=%d",
+                meeting_id,
+                recording_session_id,
+                existing_audio_id,
+                len(unmerged_sessions),
+            )
+
+            unmerged_part_paths = [
+                Path(sess.audio_part_path) for sess in unmerged_sessions if sess.audio_part_path
+            ]
+            if not unmerged_part_paths or not all(p.exists() for p in unmerged_part_paths):
+                missing = [str(p) for p in unmerged_part_paths if not p.exists()]
+                raise RuntimeError(f"音频片段文件缺失: {missing}")
+
+            # 已有合并文件可能已被系统定期清理，从 TOS 下载恢复
+            merged_path = wav_dir / f"meeting_{meeting_id}_recording_{recording_session_id}_merged.wav"
+            if not merged_path.exists():
+                if existing_audio and existing_audio.object_key:
+                    logger.info(
+                        "本地合并文件不存在，从 TOS 下载 meeting_id=%s audio_id=%s",
+                        meeting_id,
+                        existing_audio_id,
+                    )
+                    meeting_audio_service._get_uploader().download_file(
+                        existing_audio.object_key, merged_path,
+                    )
+                else:
+                    raise RuntimeError(f"无法获取已有合并音频 audio_id={existing_audio_id}")
+
+            v2_path = wav_dir / f"meeting_{meeting_id}_recording_{recording_session_id}_merged_v2.wav"
+            _merge_wav_files([merged_path] + unmerged_part_paths, v2_path)
+
+            on_upload_complete = None
+            if auto_submit_minutes:
+                def _on_append_upload_complete(uploaded_audio: database.MeetingAudio) -> None:
+                    """追加合并上传成功后强制提交妙记（不检查历史任务）。"""
+                    db_callback = database.SessionLocal()
+                    try:
+                        self.submit_minutes(db_callback, meeting_id, uploaded_audio.id)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "追加合并后自动提交妙记失败 meeting_id=%s audio_id=%s",
+                            meeting_id,
+                            uploaded_audio.id,
+                        )
+                    finally:
+                        db_callback.close()
+                on_upload_complete = _on_append_upload_complete
+
+            audio_record = meeting_audio_service.create_audio_from_path_async(
+                db=db,
+                meeting_id=meeting_id,
+                provider="volc",
+                creator_id=creator_id,
+                source_path=v2_path,
+                file_name=f"recording_{recording_session_id}_v2.wav",
+                content_type="audio/wav",
+                on_upload_complete=on_upload_complete,
+            )
+
+            # 累计总时长：原有音频 + 新 session
+            existing_duration = existing_audio.duration_seconds or 0 if existing_audio else 0
+            new_duration = sum((sess.duration_seconds or 0) for sess in unmerged_sessions)
+            audio_record.duration_seconds = existing_duration + new_duration
+
+            # 所有 session 全部指向新音频（已合并的和未合并的都包括）
+            for sess in sessions:
+                sess.source_audio_id = audio_record.id
+            db.commit()
+
+            # 已合并的 session → 删除本地的 part 文件
+            self._cleanup_part_files(sessions)
+
+            logger.info(
+                "录音追加合并完成并已启动异步上传 "
+                "meeting_id=%s recording_session_id=%s audio_id=%s duration=%.3f sessions=%d",
+                meeting_id,
+                recording_session_id,
+                audio_record.id,
+                audio_record.duration_seconds,
+                len(sessions),
+            )
+            return audio_record
+
+        # ── 首次合并：所有 session 都没有合并过 ──────────────────────
         part_paths = [Path(sess.audio_part_path) for sess in sessions if sess.audio_part_path]
         if not part_paths or not all(p.exists() for p in part_paths):
             missing = [str(p) for p in part_paths if not p.exists()]
@@ -2233,7 +2323,7 @@ class VolcMeetingMinuteService:
         merged_path = wav_dir / f"meeting_{meeting_id}_recording_{recording_session_id}_merged.wav"
         _merge_wav_files(part_paths, merged_path)
 
-        on_upload_complete: Optional[Callable[[database.MeetingAudio], None]] = None
+        on_upload_complete = None
         if auto_submit_minutes:
 
             def _on_upload_complete(uploaded_audio: database.MeetingAudio) -> None:
@@ -2292,12 +2382,7 @@ class VolcMeetingMinuteService:
             sess.source_audio_id = audio_record.id
         db.commit()
 
-        # 清理本地 part 片段文件
-        for p in part_paths:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("录音片段清理失败 path=%s", p)
+        self._cleanup_part_files(sessions)
 
         logger.info(
             "录音合并完成并已启动异步上传 "
@@ -2309,6 +2394,21 @@ class VolcMeetingMinuteService:
             len(sessions),
         )
         return audio_record
+
+    @staticmethod
+    def _cleanup_part_files(sessions: List[database.VolcAsrSession]) -> None:
+        """删除已合并的 ASR 会话的本地 part 片段文件。
+
+        只在所有 session 都已关联 source_audio_id 后调用（确保不会再被第二次合并需要），
+        避免 part 文件无限堆积。
+        """
+        for sess in sessions:
+            if sess.source_audio_id is not None and sess.audio_part_path:
+                p = Path(sess.audio_part_path)
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("录音片段清理失败 path=%s", p)
 
 class LiveVolcAsrHandler:
     # 核心职责：
@@ -3234,12 +3334,14 @@ class LiveVolcAsrHandler:
             sess.source_audio_id = audio_record.id
         self._db.commit()
 
-        # 6. 清理原始片段文件
-        for p in part_paths:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("录音片段清理失败 path=%s", p)
+        # 已合并的 session → 删除本地的 part 文件
+        for sess in sessions:
+            if sess.source_audio_id is not None and sess.audio_part_path:
+                p = Path(sess.audio_part_path)
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("录音片段清理失败 path=%s", p)
 
         return audio_record
 
