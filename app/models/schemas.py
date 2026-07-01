@@ -809,6 +809,7 @@ class VolcFinalizeAndGenerateResponse(BaseModel):
         "already_submitted",
         "failed_no_audio",
         "accepted",
+        "completed_empty",
     ]
     audio_id: Optional[int] = None
     job_id: Optional[int] = None
@@ -836,6 +837,7 @@ class LocalFinalizeAndGenerateResponse(BaseModel):
         "already_submitted",
         "failed_no_audio",
         "accepted",
+        "completed_empty",
     ]
     audio_id: Optional[int] = None
     asr_session_id: Optional[int] = None

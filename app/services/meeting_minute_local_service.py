@@ -800,14 +800,16 @@ class LocalMeetingMinuteService:
             if has_audio_id:
                 continue
 
-            if has_processing or has_audio_part:
-                return schemas.RecoverableRecordingInfo(
-                    provider="local",
-                    recording_session_id=recording_session_id,
-                    asr_session_id=session.id,
-                    status="active" if has_processing else "saved_part",
-                    has_audio_part=has_audio_part,
-                )
+            if not has_audio_part:
+                continue
+
+            return schemas.RecoverableRecordingInfo(
+                provider="local",
+                recording_session_id=recording_session_id,
+                asr_session_id=session.id,
+                status="active" if has_processing else "saved_part",
+                has_audio_part=True,
+            )
 
         return None
 
@@ -1125,6 +1127,45 @@ class LocalMeetingMinuteService:
         )
         return self.get_minutes(db, meeting_id)
 
+    def _create_empty_minutes_without_audio(
+        self,
+        db: Session,
+        meeting_id: int,
+        reason: Optional[str] = None,
+    ) -> schemas.LocalMeetingMinutesResponse:
+        db.query(database.LocalMeetingSummary).filter(
+            database.LocalMeetingSummary.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+        db.query(database.LocalMeetingTodo).filter(
+            database.LocalMeetingTodo.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+        db.flush()
+
+        db.add(
+            database.LocalMeetingSummary(
+                meeting_id=meeting_id,
+                source_audio_id=None,
+                title=_LOCAL_EMPTY_TRANSCRIPT_TITLE,
+                paragraph=_LOCAL_EMPTY_TRANSCRIPT_HINT,
+            )
+        )
+        db.flush()
+
+        self._create_minutes_session_snapshot(
+            db=db,
+            meeting_id=meeting_id,
+            source_audio_id=None,
+            stream_transcript_text="",
+        )
+
+        db.commit()
+        logger.info(
+            "本地会议无可用音频，已生成空纪要 meeting_id=%s reason=%s",
+            meeting_id,
+            reason,
+        )
+        return self.get_minutes(db, meeting_id)
+
     async def recover_and_finalize_async(
         self,
         db: Session,
@@ -1184,10 +1225,15 @@ class LocalMeetingMinuteService:
             )
 
             if not audio:
+                empty_minutes = self._create_empty_minutes_without_audio(
+                    db=db,
+                    meeting_id=meeting_id,
+                    reason="no_audio",
+                )
                 return {
-                    "status": "failed_no_audio",
+                    "status": "completed_empty",
                     "audio_id": None,
-                    "asr_session_id": None,
+                    "asr_session_id": getattr(empty_minutes, "asr_session_id", None),
                 }
 
             latest_session = (

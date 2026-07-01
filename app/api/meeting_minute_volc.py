@@ -242,6 +242,8 @@ async def finalize_and_generate(
         message = "录音和会议纪要任务已经完成收尾"
     elif status == "accepted":
         message = "录音正在上传，会议纪要将在上传完成后自动生成"
+    elif status == "completed_empty":
+        message = "本次录音未识别到有效发言内容"
     elif status == "failed_no_audio" and result.get("audio_id"):
         message = "录音上传失败，无法生成会议纪要"
     else:
@@ -322,6 +324,8 @@ async def recover_and_finalize(
         message = "会议纪要已提交，无需重复处理"
     elif status == "accepted":
         message = "异常录音正在上传，会议纪要将在上传完成后自动生成"
+    elif status == "completed_empty":
+        message = "本次录音未识别到有效发言内容"
     else:
         message = "未找到可用录音，无法生成会议纪要"
 

@@ -735,12 +735,11 @@ class VolcMeetingMinuteService:
             )
 
             if not audio:
-                return {
-                    "status": "failed_no_audio",
-                    "audio_id": None,
-                    "job_id": None,
-                    "job_status": None,
-                }
+                return self._create_empty_minutes_without_audio(
+                    db=db,
+                    meeting_id=meeting_id,
+                    reason="no_audio",
+                )
 
             # 同一个合并音频如果已经有未失败的妙记任务，
             # 直接返回原任务，不重复提交。
@@ -1224,6 +1223,55 @@ class VolcMeetingMinuteService:
         if not text:
             return False
         return any(keyword.lower() in text for keyword in _VOLC_EMPTY_TRANSCRIPT_ERROR_KEYWORDS)
+    
+    def _create_empty_minutes_without_audio(
+        self,
+        db: Session,
+        meeting_id: int,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        db.query(database.VolcMeetingSummary).filter(
+            database.VolcMeetingSummary.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+        db.add(
+            database.VolcMeetingSummary(
+                meeting_id=meeting_id,
+                source_audio_id=None,
+                title=_VOLC_EMPTY_TRANSCRIPT_TITLE,
+                paragraph=_VOLC_EMPTY_TRANSCRIPT_HINT,
+            )
+        )
+
+        db.query(database.VolcMeetingTodo).filter(
+            database.VolcMeetingTodo.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+
+        db.add(
+            database.VolcMeetingMinutesSession(
+                session_no=self._build_unique_session_no(db, meeting_id),
+                meeting_id=meeting_id,
+                source_audio_id=None,
+                stream_transcript_text="",
+                accurate_transcript_text="",
+                speaker_segments_json="[]",
+                summary_title=_VOLC_EMPTY_TRANSCRIPT_TITLE,
+                summary_paragraph=_VOLC_EMPTY_TRANSCRIPT_HINT,
+                todos_json="[]",
+            )
+        )
+
+        db.commit()
+        logger.info(
+            "火山会议无可用音频，已生成空纪要 meeting_id=%s reason=%s",
+            meeting_id,
+            reason,
+        )
+        return {
+            "status": "completed_empty",
+            "audio_id": None,
+            "job_id": None,
+            "job_status": "completed",
+        }
 
     def _create_empty_minutes_result(
         self,

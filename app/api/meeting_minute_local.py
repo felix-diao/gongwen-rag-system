@@ -180,10 +180,18 @@ async def finalize_and_generate(
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    status = str(result.get("status") or "")
+    if status == "completed_empty":
+        message = "本次录音未识别到有效发言内容"
+    elif status == "failed_no_audio":
+        message = "未找到可用录音，无法生成会议纪要"
+    else:
+        message = "本地录音正在上传，会议纪要将在上传完成后自动生成"
+
     return StandardResponse(
-        success=True,
+        success=status != "failed_no_audio",
         data=result,
-        message="本地录音正在上传，会议纪要将在上传完成后自动生成",
+        message=message,
     )
 
 
@@ -238,10 +246,18 @@ async def recover_and_finalize(
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    status = str(result.get("status") or "")
+    if status == "completed_empty":
+        message = "本次录音未识别到有效发言内容"
+    elif status == "failed_no_audio":
+        message = "未找到可用录音，无法生成会议纪要"
+    else:
+        message = "异常本地录音正在收尾，会议纪要将在录音处理完成后自动生成"
+
     return StandardResponse(
-        success=result.get("status") != "failed_no_audio",
+        success=status != "failed_no_audio",
         data=result,
-        message="异常本地录音正在收尾，会议纪要将在录音处理完成后自动生成",
+        message=message,
     )
 
 
