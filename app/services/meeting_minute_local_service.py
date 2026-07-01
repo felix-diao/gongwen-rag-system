@@ -60,6 +60,8 @@ from app.utils.logger import get_logger
 
 logger = get_logger("meeting_local_minutes_service")
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
+_LOCAL_EMPTY_TRANSCRIPT_TITLE = "无有效发言内容"
+_LOCAL_EMPTY_TRANSCRIPT_HINT = "本次录音未识别到有效发言内容"
 _LOCAL_AUDIO_TRANSCRIBE_SUBMIT_LOCK = threading.Lock()
 _LOCAL_ASR_ACTIVE_STATUS = {"pending", "processing", "running", "submitted"}
 _LOCAL_CANCELLED_STATUS = {"cancelled", "canceled"}
@@ -1058,6 +1060,51 @@ class LocalMeetingMinuteService:
             )
             .first()
         )
+    
+    def _create_empty_minutes_for_audio(
+        self,
+        db: Session,
+        meeting_id: int,
+        asr_session: database.LocalAsrSession,
+    ) -> schemas.LocalMeetingMinutesResponse:
+        source_audio_id = asr_session.source_audio_id
+        if source_audio_id is None:
+            latest_local_audio = self._latest_local_audio(db, meeting_id)
+            source_audio_id = latest_local_audio.id if latest_local_audio else None
+
+        db.query(database.LocalMeetingSummary).filter(
+            database.LocalMeetingSummary.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+        db.query(database.LocalMeetingTodo).filter(
+            database.LocalMeetingTodo.meeting_id == meeting_id
+        ).delete(synchronize_session=False)
+        db.flush()
+
+        db.add(
+            database.LocalMeetingSummary(
+                meeting_id=meeting_id,
+                source_audio_id=source_audio_id,
+                title=_LOCAL_EMPTY_TRANSCRIPT_TITLE,
+                paragraph=_LOCAL_EMPTY_TRANSCRIPT_HINT,
+            )
+        )
+        db.flush()
+
+        self._create_minutes_session_snapshot(
+            db=db,
+            meeting_id=meeting_id,
+            source_audio_id=source_audio_id,
+            stream_transcript_text=asr_session.stream_transcript_text or "",
+        )
+
+        db.commit()
+        logger.info(
+            "本地会议无有效转写，已生成空纪要 meeting_id=%s asr_session_id=%s source_audio_id=%s",
+            meeting_id,
+            asr_session.id,
+            source_audio_id,
+        )
+        return self.get_minutes(db, meeting_id)
 
     async def recover_and_finalize_async(
         self,
@@ -1435,12 +1482,27 @@ class LocalMeetingMinuteService:
             )
             if not asr_session:
                 raise ValueError("指定的转写会话不存在")
-            if not (asr_session.stream_transcript_text or "").strip():
-                raise ValueError("当前转写会话尚未生成有效文本")
+
         if asr_session is None:
             asr_session = self._latest_asr_session_with_transcript(db, meeting_id)
+
+        if asr_session is None:
+            latest_session = self._latest_asr_session(db, meeting_id)
+            if latest_session and latest_session.source_audio_id is not None:
+                asr_session = latest_session
+
         if not asr_session:
-            raise ValueError("当前会议尚无可用转写文本（请完成实时录音、HTTP 分段录音或已上传音频转写）")
+            raise ValueError("当前会议暂无可用转写文本，请先完成实时录音、HTTP 分段录音或上传音频转写")
+
+        if not (asr_session.stream_transcript_text or "").strip():
+            if asr_session.source_audio_id is not None or self._latest_local_audio(db, meeting_id):
+                return self._create_empty_minutes_for_audio(
+                    db=db,
+                    meeting_id=meeting_id,
+                    asr_session=asr_session,
+                )
+            raise ValueError("当前转写会话尚未生成有效文本")
+
         _mark_local_generate_active(asr_session.id)
         try:
             _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")

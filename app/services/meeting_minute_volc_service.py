@@ -52,7 +52,24 @@ MINUTES_FAILED_STATUS = {"failed", "error"}
 MINUTES_CANCELLED_STATUS = {"cancelled", "canceled"}
 MINUTES_CANCELABLE_STATUS = {"submitted", *MINUTES_RUNNING_STATUS}
 SESSION_NO_TIMEZONE = timezone(timedelta(hours=8))
-EMPTY_SUMMARY_HINT = "摘要为空，可能因录音内容较短或有效信息不足，暂未生成摘要。"
+EMPTY_SUMMARY_HINT = "摘要为空，可能是录音内容较短或有效信息不足，暂未生成摘要。"
+_VOLC_EMPTY_TRANSCRIPT_TITLE = "无有效发言内容"
+_VOLC_EMPTY_TRANSCRIPT_HINT = "本次录音未识别到有效发言内容"
+_VOLC_EMPTY_TRANSCRIPT_ERROR_KEYWORDS = (
+    "no speech",
+    "no valid speech",
+    "empty transcript",
+    "empty transcription",
+    "audio is empty",
+    "silent",
+    "silence",
+    "无有效语音",
+    "无有效发言",
+    "未识别到",
+    "转写为空",
+    "音频为空",
+    "静音",
+)
 
 _DEFAULT_MEETING_TITLE_RE = re.compile(r"^会议 \d{2}/\d{2} \d{2}:\d{2}(:\d{2})?$")
 # 与前端 MEETING_TITLE_MAX_LEN 保持一致（移动端会议名称限制 20 字符）。
@@ -1070,8 +1087,42 @@ class VolcMeetingMinuteService:
                     job.updated_at = datetime.utcnow()
                     db.commit()
                 elif status in MINUTES_FAILED_STATUS:
+                    error_msg = str(
+                        data.get("ErrMessage")
+                        or data.get("ErrorMessage")
+                        or data.get("Message")
+                        or ""
+                    )
+                    if audio and self._is_empty_transcript_error(error_msg):
+                        snapshot_payload = self._create_empty_minutes_result(
+                            db=db,
+                            audio=audio,
+                            reason=error_msg,
+                        )
+                        db.flush()
+                        job.status = "completed"
+                        job.error_msg = error_msg or _VOLC_EMPTY_TRANSCRIPT_HINT
+                        job.updated_at = datetime.utcnow()
+                        self._create_minutes_session_snapshot(
+                            db,
+                            audio,
+                            snapshot=snapshot_payload,
+                        )
+                        db.commit()
+                        meeting_ws_manager.notify_from_thread(
+                            job.meeting_id,
+                            {
+                                "type": "volc_minutes_completed",
+                                "meeting_id": job.meeting_id,
+                                "job_id": job.id,
+                                "audio_id": audio.id,
+                                "task_id": job.volc_task_id,
+                            },
+                        )
+                        break
+
                     job.status = "failed"
-                    job.error_msg = str(data.get("ErrMessage") or "")
+                    job.error_msg = error_msg
                     job.updated_at = datetime.utcnow()
                     db.commit()
                     meeting_ws_manager.notify_from_thread(
@@ -1148,6 +1199,61 @@ class VolcMeetingMinuteService:
                 if current is stop_flag:
                     self._poll_stop.pop(job_id, None)
 
+    @staticmethod
+    def _is_empty_transcript_error(error_msg: str) -> bool:
+        text = (error_msg or "").strip().lower()
+        if not text:
+            return False
+        return any(keyword.lower() in text for keyword in _VOLC_EMPTY_TRANSCRIPT_ERROR_KEYWORDS)
+
+    def _create_empty_minutes_result(
+        self,
+        db: Session,
+        audio: database.MeetingAudio,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        db.query(database.VolcAccurateTranscription).filter(
+            database.VolcAccurateTranscription.source_audio_id == audio.id,
+        ).delete(synchronize_session=False)
+        db.add(
+            database.VolcAccurateTranscription(
+                meeting_id=audio.meeting_id,
+                source_audio_id=audio.id,
+                accurate_transcript_text="",
+                speaker_segments_json="[]",
+            )
+        )
+
+        db.query(database.VolcMeetingSummary).filter(
+            database.VolcMeetingSummary.meeting_id == audio.meeting_id
+        ).delete(synchronize_session=False)
+        db.add(
+            database.VolcMeetingSummary(
+                meeting_id=audio.meeting_id,
+                source_audio_id=audio.id,
+                title=_VOLC_EMPTY_TRANSCRIPT_TITLE,
+                paragraph=_VOLC_EMPTY_TRANSCRIPT_HINT,
+            )
+        )
+
+        db.query(database.VolcMeetingTodo).filter(
+            database.VolcMeetingTodo.meeting_id == audio.meeting_id
+        ).delete(synchronize_session=False)
+
+        logger.info(
+            "火山会议无有效转写，已生成空纪要 meeting_id=%s audio_id=%s reason=%s",
+            audio.meeting_id,
+            audio.id,
+            reason,
+        )
+        return {
+            "transcript_text": "",
+            "speaker_segments_json": "[]",
+            "summary_title": _VOLC_EMPTY_TRANSCRIPT_TITLE,
+            "summary_paragraph": _VOLC_EMPTY_TRANSCRIPT_HINT,
+            "todos_json": "[]",
+        }
+
     def _consume_minutes_success_result(
         self,
         db: Session,
@@ -1183,6 +1289,13 @@ class VolcMeetingMinuteService:
         )
         transcript_text = self._normalize_transcript_text(transcript_payload)
         speaker_segments = self._normalize_speaker_segments(transcript_payload)
+        if not (transcript_text or "").strip():
+            return self._create_empty_minutes_result(
+                db=db,
+                audio=audio,
+                reason="empty transcript in success result",
+            )
+
         db.query(database.VolcAccurateTranscription).filter(
             database.VolcAccurateTranscription.source_audio_id == audio.id,
         ).delete(synchronize_session=False)
