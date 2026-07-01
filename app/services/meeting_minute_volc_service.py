@@ -958,6 +958,25 @@ class VolcMeetingMinuteService:
         db.commit()
         db.refresh(job)
 
+        try:
+            from app.services.token_tracker import token_tracker
+            meeting = (
+                db.query(database.Meeting)
+                .filter(database.Meeting.id == meeting_id)
+                .first()
+            )
+            token_tracker.record(
+                user_id=meeting.creator_id if meeting else None,
+                api_category="volc_miaoji",
+                api_endpoint=f"{self._minutes_api._base}{self._minutes_api._submit_path}",
+                total_tokens=0,
+                duration_ms=0,
+                status="success",
+                metadata_json=json.dumps({"meeting_id": meeting_id, "job_id": job.id}),
+            )
+        except Exception:
+            pass
+
         self._start_poller(job.id)
         return job
 
@@ -3315,6 +3334,25 @@ class LiveVolcAsrHandler:
         asr_session.stream_transcript_text = transcript
         asr_session.recording_session_id = recording_session_id
         asr_session.audio_part_path = str(wav_path)
+        
+        try:
+            from app.services.token_tracker import token_tracker
+            token_tracker.record(
+                api_category="volc_asr",
+                api_endpoint=ASR_WS_URL,
+                total_tokens=0,
+                request_chars=len(transcript or ""),
+                duration_ms=int(duration * 1000) if duration else 0,
+                status="success",
+                metadata_json=json.dumps({
+                    "meeting_id": self._meeting_id,
+                    "session_id": self._session_id,
+                    "recording_session_id": recording_session_id or "",
+                }),
+            )
+        except Exception:
+            pass
+        
         self._db.commit()
 
         # 兼容旧客户端：没有 recording_session_id 时，沿用单 session 老逻辑，直接合并上传

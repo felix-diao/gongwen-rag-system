@@ -157,6 +157,24 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
             row.source_audio_id = audio_id
             row.status = "processing"
             row.error_msg = None
+            
+            try:
+            from app.services.token_tracker import token_tracker
+            token_tracker.record(
+                api_category="qwen_asr",
+                api_endpoint=settings.QWEN_ASR_HTTP_CHAT_URL or "qwen_asr_http",
+                total_tokens=0,
+                request_chars=len(merged or ""),
+                duration_ms=int(duration * 1000) if duration else 0,
+                status="success",
+                metadata_json=json.dumps({
+                    "meeting_id": meeting_id,
+                    "asr_session_id": asr_id,
+                }),
+            )
+        except Exception:
+            pass
+            
             db.commit()
             logger.debug(
                 "本地音频分段转写进度 meeting_id=%s audio_id=%s asr_session_id=%s chunk=%s/%s len=%s",
@@ -2522,6 +2540,24 @@ class LiveLocalAsrHandler:
     async def _finalize_from_ws_transcript(self) -> None:
         transcript = "".join(self._final_parts)
         wav_path, pcm_duration = self._materialize_wav_path()
+        
+        try:
+                from app.services.token_tracker import token_tracker
+                token_tracker.record(
+                    api_category="qwen_asr",
+                    api_endpoint=chat_url or "qwen_asr_http",
+                    total_tokens=0,
+                    request_chars=len(merged_text or ""),
+                    duration_ms=int(pcm_duration * 1000) if pcm_duration else 0,
+                    status="success",
+                    metadata_json=json.dumps({
+                        "meeting_id": self._meeting_id,
+                        "session_id": self._session_id,
+                    }),
+                )
+            except Exception:
+                pass
+        
         await self._finalize_common(transcript, pcm_duration, wav_path)
 
     async def _push_incremental_merge_ws(self, old_merged: str, merged: str, chunk_idx: int) -> None:
