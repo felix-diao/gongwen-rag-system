@@ -56,11 +56,14 @@ EMPTY_SUMMARY_HINT = "摘要为空，可能是录音内容较短或有效信息�
 _VOLC_EMPTY_TRANSCRIPT_TITLE = "无有效发言内容"
 _VOLC_EMPTY_TRANSCRIPT_HINT = "本次录音未识别到有效发言内容"
 _VOLC_EMPTY_TRANSCRIPT_ERROR_KEYWORDS = (
-    "no speech",
-    "no valid speech",
+    "audio empty",
+    "empty audio",
+    "empty file",
+    "audio is empty",
     "empty transcript",
     "empty transcription",
-    "audio is empty",
+    "no speech",
+    "no valid speech",
     "silent",
     "silence",
     "无有效语音",
@@ -70,11 +73,6 @@ _VOLC_EMPTY_TRANSCRIPT_ERROR_KEYWORDS = (
     "音频为空",
     "静音",
 )
-
-_DEFAULT_MEETING_TITLE_RE = re.compile(r"^会议 \d{2}/\d{2} \d{2}:\d{2}(:\d{2})?$")
-# 与前端 MEETING_TITLE_MAX_LEN 保持一致（移动端会议名称限制 20 字符）。
-_MEETING_TITLE_MAX_LEN = 20
-
 class ProtocolVersion:
     V1 = 1
 
