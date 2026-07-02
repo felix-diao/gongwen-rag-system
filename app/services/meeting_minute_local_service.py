@@ -1586,6 +1586,7 @@ class LocalMeetingMinuteService:
                 asr_session.stream_transcript_text or "",
                 duration_seconds=asr_session.duration_seconds or 0,
                 user_id=creator_id,
+                meeting_id=meeting_id,
             )
             _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
 
@@ -1882,6 +1883,7 @@ class LocalMeetingMinuteService:
         transcript: str,
         duration_seconds: float = 0,
         user_id: Optional[str] = None,
+        meeting_id: Optional[int] = None,
     ) -> dict:
         from app.llm_client.generators import get_client
 
@@ -1899,6 +1901,7 @@ class LocalMeetingMinuteService:
                 temperature=0.2,
                 max_tokens=max_tokens,
                 user_id=user_id,
+                metadata_json=json.dumps({"meeting_id": meeting_id}) if meeting_id else None,
             )
             payload = self._parse_json_with_repair(
                 raw=raw,

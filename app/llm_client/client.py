@@ -26,7 +26,8 @@ class LLMClient:
              temperature: float = 0.6,
              max_tokens: int = 1000,
              retries: int = 2,
-             user_id: Optional[str] = None) -> str:
+             user_id: Optional[str] = None,
+             metadata_json: Optional[str] = None) -> str:
         url = f"{self.cfg.base_url.rstrip('/')}/chat/completions"
         model_name = model or self.cfg.model
         body = {
@@ -63,6 +64,7 @@ class LLMClient:
                         total_tokens=total_tokens,
                         request_chars=request_chars,
                         duration_ms=duration_ms,
+                        metadata_json=metadata_json,
                     )
                 except Exception:
                     pass  # 记录失败不影响主流程
@@ -86,6 +88,7 @@ class LLMClient:
                         duration_ms=duration_ms,
                         status="error",
                         error_msg=str(last_err)[:500],
+                        metadata_json=metadata_json,
                     )
                 except Exception:
                     pass

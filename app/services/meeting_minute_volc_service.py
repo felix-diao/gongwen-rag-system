@@ -1597,6 +1597,7 @@ class VolcMeetingMinuteService:
                 transcript=text_to_use,
                 duration_seconds=0,
                 user_id=creator_id,
+                meeting_id=meeting_id,
             )
             if isinstance(payload, dict):
                 return payload
