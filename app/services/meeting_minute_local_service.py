@@ -226,7 +226,12 @@ def _run_local_uploaded_audio_transcribe_job(task: Dict[str, int]) -> None:
         
         try:
             from app.services.token_tracker import token_tracker
+            creator_id = db.execute(
+                text("SELECT creator_id FROM meetings WHERE id = :id"),
+                {"id": meeting_id},
+            ).scalar()
             token_tracker.record(
+                user_id=creator_id,
                 api_category="qwen_asr",
                 api_endpoint=settings.QWEN_ASR_HTTP_CHAT_URL or "qwen_asr_http",
                 total_tokens=0,
@@ -2812,7 +2817,12 @@ class LiveLocalAsrHandler:
             wav_path, pcm_duration = self._materialize_wav_path()
             try:
                 from app.services.token_tracker import token_tracker
+                creator_id = self._db.execute(
+                    text("SELECT creator_id FROM meetings WHERE id = :id"),
+                    {"id": self._meeting_id},
+                ).scalar()
                 token_tracker.record(
+                    user_id=creator_id,
                     api_category="qwen_asr",
                     api_endpoint=chat_url or "qwen_asr_http",
                     total_tokens=0,

@@ -3383,7 +3383,13 @@ class LiveVolcAsrHandler:
         
         try:
             from app.services.token_tracker import token_tracker
+            # 【修改7-2】补充记录 user_id
+            creator_id = self._db.execute(
+                text("SELECT creator_id FROM meetings WHERE id = :id"),
+                {"id": self._meeting_id},
+            ).scalar()
             token_tracker.record(
+                user_id=creator_id,
                 api_category="volc_asr",
                 api_endpoint=ASR_WS_URL,
                 total_tokens=0,
