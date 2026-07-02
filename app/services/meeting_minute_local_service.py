@@ -1585,6 +1585,7 @@ class LocalMeetingMinuteService:
                 meeting_title,
                 asr_session.stream_transcript_text or "",
                 duration_seconds=asr_session.duration_seconds or 0,
+                user_id=creator_id,
             )
             _raise_if_local_cancel_requested(db, asr_session.id, "已取消当前会议纪要生成任务")
 
