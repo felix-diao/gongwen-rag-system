@@ -677,7 +677,12 @@ class VolcMeetingMinuteService:
         meeting_id: int,
         recording_session_id: str,
     ) -> Dict[str, Any]:
-        """用户回到列表/详情时，主动推进异常录音收尾。"""
+        """用户回到列表/详情时，主动推进异常录音收尾。
+
+        如果该 recording_session_id 下存在正在活跃（processing）的 ASR 会话，
+        说明当前仍有前端 WebSocket 在持续推流录音，不应强制收尾，
+        避免过早合并、生成不完整的纪要。
+        """
         if not recording_session_id:
             raise ValueError("recording_session_id 不能为空")
 
@@ -685,6 +690,54 @@ class VolcMeetingMinuteService:
             meeting_id=meeting_id,
             recording_session_id=recording_session_id,
         )
+
+        # 检查是否存在正在活跃的录音会话。
+        # 如果 DB 里是 processing 且内存中有活跃 handler，说明录音真正在进行中，
+        # 不应强制收尾；如果 DB 是 processing 但没有 handler（例如服务重启导致的
+        # 僵尸状态），则按异常恢复流程处理。
+        active_session = (
+            db.query(database.VolcAsrSession)
+            .filter(
+                database.VolcAsrSession.meeting_id == meeting_id,
+                database.VolcAsrSession.recording_session_id == recording_session_id,
+                database.VolcAsrSession.status == "processing",
+            )
+            .order_by(database.VolcAsrSession.id.desc())
+            .first()
+        )
+
+        if active_session:
+            handler_key = (meeting_id, recording_session_id)
+            has_live_handler = handler_key in self._active_live_handlers
+
+            if has_live_handler:
+                logger.info(
+                    "录音仍在进行中，跳过恢复收尾 "
+                    "meeting_id=%s recording_session_id=%s active_session_id=%s",
+                    meeting_id,
+                    recording_session_id,
+                    active_session.id,
+                )
+                return {
+                    "status": "skipped_recording_active",
+                    "audio_id": None,
+                    "job_id": None,
+                    "job_status": None,
+                }
+
+            # 僵尸状态：DB 中 processing 但 handler 已不在。
+            # 把 session 标记为 failed 以便后续合并能正常处理。
+            logger.warning(
+                "发现僵尸 ASR 会话（DB 显示 processing 但无活跃 handler），"
+                "标记为 failed 继续恢复 "
+                "meeting_id=%s recording_session_id=%s session_id=%s",
+                meeting_id,
+                recording_session_id,
+                active_session.id,
+            )
+            active_session.status = "failed"
+            active_session.error_msg = "recover-and-finalize detected stale processing session"
+            db.commit()
 
         active_requested = await self.request_active_recording_finalize(
             meeting_id=meeting_id,
