@@ -1588,6 +1588,10 @@ class VolcMeetingMinuteService:
                     pass
 
             # duration_seconds 给 0：local 的 prompt 会按转写字符数自动选档。
+            creator_id = _title_db.execute(
+                text("SELECT creator_id FROM meetings WHERE id = :id"),
+                {"id": meeting_id},
+            ).scalar()
             payload = local_meeting_minute_service._call_llm(
                 meeting_title=meeting_title_for_prompt,
                 transcript=text_to_use,
@@ -3383,7 +3387,6 @@ class LiveVolcAsrHandler:
         
         try:
             from app.services.token_tracker import token_tracker
-            # 【修改7-2】补充记录 user_id
             creator_id = self._db.execute(
                 text("SELECT creator_id FROM meetings WHERE id = :id"),
                 {"id": self._meeting_id},
