@@ -1015,12 +1015,16 @@ class VolcMeetingMinuteService:
                 .filter(database.Meeting.id == meeting_id)
                 .first()
             )
+            total_duration = db.execute(
+                text("SELECT COALESCE(SUM(duration_seconds), 0) FROM volc_asr_sessions WHERE meeting_id = :id"),
+                {"id": meeting_id},
+            ).scalar()
             token_tracker.record(
                 user_id=meeting.creator_id if meeting else None,
                 api_category="volc_miaoji",
                 api_endpoint=f"{self._minutes_api._base}{self._minutes_api._submit_path}",
                 total_tokens=0,
-                duration_ms=0,
+                duration_ms=int(float(total_duration) * 1000) if total_duration else 0,
                 status="success",
                 metadata_json=json.dumps({"meeting_id": meeting_id, "job_id": job.id}),
             )
