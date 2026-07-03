@@ -96,13 +96,6 @@ class MeetingService:
     ) -> schemas.MeetingInDB:
         data = meeting.model_dump()
         data["date"] = to_beijing_naive(data["date"])
-        if self._existing_same_title_and_date(
-            db,
-            creator_id=creator_id,
-            title=data["title"],
-            date_val=data["date"],
-        ):
-            raise DuplicateMeetingError()
         row = database.Meeting(creator_id=creator_id, **data)
         db.add(row)
         db.commit()
@@ -137,18 +130,6 @@ class MeetingService:
 
         if "date" in data:
             data["date"] = to_beijing_naive(data["date"])
-
-        if "title" in data or "date" in data:
-            eff_title = data["title"] if "title" in data else row.title
-            eff_date = data["date"] if "date" in data else row.date
-            if self._existing_same_title_and_date(
-                db,
-                creator_id=row.creator_id,
-                title=eff_title,
-                date_val=eff_date,
-                exclude_meeting_id=meeting_id,
-            ):
-                raise DuplicateMeetingError()
 
         for key, value in data.items():
             setattr(row, key, value)
