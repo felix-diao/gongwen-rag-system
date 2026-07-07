@@ -361,7 +361,7 @@ def _post_one_chunk(
         ],
         "max_tokens": max_tokens,
     }
-    r = session.post(chat_url, json=payload, timeout=timeout)
+    r = session.post(chat_url, json=payload, headers=headers, timeout=timeout)
     if not r.ok:
         logger.warning(
             "ASR HTTP 非成功 status=%s chunk_url=%s body_preview=%s",

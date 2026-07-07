@@ -12,7 +12,8 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 import requests
 
 # ================= 配置 =================
-API_URL = "http://14.103.157.248:40001/v1/chat/completions"
+API_URL = "http://172.17.32.228:11437/v1/chat/completions"
+API_KEY = "sk-x9y8z7w6v5u4t3s2r1q0p9o8n7m6l5k4j3i2h1g0f9e8d7c6b5a4"
 MODEL = "/app/model"
 
 AUDIO_URL = "https://meeting-record-temp2.tos-cn-beijing.volces.com/meetings/19/%E6%B6%88%E9%98%B2%E6%BC%94%E7%BB%83%E4%BC%9A%E8%AE%AE1.mp3"
@@ -276,7 +277,8 @@ def transcribe_chunks(chunks, texts_dir):
             }
 
             try:
-                response = session.post(API_URL, json=payload, timeout=120)
+                headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+                response = session.post(API_URL, json=payload, headers=headers, timeout=120)
                 response.raise_for_status()
                 data = response.json()
                 raw = data["choices"][0]["message"]["content"]
