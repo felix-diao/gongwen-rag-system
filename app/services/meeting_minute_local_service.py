@@ -876,6 +876,7 @@ class LocalMeetingMinuteService:
         self,
         meeting_id: int,
         recording_session_id: str,
+        disconnect_reason: Optional[str] = None,
     ) -> None:
         """WS 异常断开后延迟收尾，给前端自动重连留时间。"""
         if not recording_session_id:
@@ -890,6 +891,7 @@ class LocalMeetingMinuteService:
             self._delayed_finalize_recording(
                 meeting_id=meeting_id,
                 recording_session_id=recording_session_id,
+                disconnect_reason=disconnect_reason,
             )
         )
         self._pending_finalize_tasks[key] = task
@@ -904,6 +906,7 @@ class LocalMeetingMinuteService:
         self,
         meeting_id: int,
         recording_session_id: str,
+        disconnect_reason: Optional[str] = None,
     ) -> None:
         key = (meeting_id, recording_session_id)
         current_task = asyncio.current_task()
@@ -941,9 +944,10 @@ class LocalMeetingMinuteService:
                 )
                 logger.info(
                     "本地录音延迟收尾完成 "
-                    "meeting_id=%s recording_session_id=%s result=%s",
+                    "meeting_id=%s recording_session_id=%s disconnect_reason=%s result=%s",
                     meeting_id,
                     recording_session_id,
+                    disconnect_reason,
                     result,
                 )
             finally:
@@ -2227,6 +2231,7 @@ class LiveLocalAsrHandler:
         self._ws_alive = True
         self._client_disconnected = False
         self._recover_finalize_requested = False
+        self._disconnect_reason: Optional[str] = None
         # HTTP 滑窗分段时 merge_pair 的累计稿，异常收尾时写入 DB 便于排障
         self._live_http_merged: str = ""
 
@@ -2247,6 +2252,7 @@ class LiveLocalAsrHandler:
 
     async def request_recover_finalize(self) -> None:
         """由 HTTP 恢复入口主动关闭当前实时 WS，让 run() 尽快落盘。"""
+        self._disconnect_reason = "recover_finalize"
         self._recover_finalize_requested = True
         self._client_disconnected = False
         try:
@@ -2292,7 +2298,13 @@ class LiveLocalAsrHandler:
 
                 await self._finalize_from_ws_transcript()
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Local live ASR run failed meeting_id=%s session_id=%s", self._meeting_id, self._session_id)
+            self._disconnect_reason = "asr_failure"
+            logger.exception(
+                "Local live ASR run failed meeting_id=%s session_id=%s disconnect_reason=%s",
+                self._meeting_id,
+                self._session_id,
+                self._disconnect_reason,
+            )
             transcript = (self._live_http_merged or "").strip() or "".join(
                 self._final_parts
             )
@@ -2305,6 +2317,7 @@ class LiveLocalAsrHandler:
                 self._service.schedule_delayed_finalize(
                     meeting_id=self._meeting_id,
                     recording_session_id=self._recording_session_id,
+                    disconnect_reason=self._disconnect_reason,
                 )
                 await self._safe_send_json(
                     {
@@ -2344,6 +2357,7 @@ class LiveLocalAsrHandler:
                     self._session_id,
                     settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
                 )
+                self._disconnect_reason = "idle_timeout"
                 self._ws_alive = False
                 self._client_disconnected = True
                 stop_event.set()
@@ -2351,6 +2365,8 @@ class LiveLocalAsrHandler:
 
             msg_type = raw.get("type", "")
             if msg_type in {"websocket.disconnect", "websocket.close"}:
+                if not self._recover_finalize_requested:
+                    self._disconnect_reason = "ws_disconnect"
                 self._ws_alive = False
                 self._client_disconnected = (
                     not self._recover_finalize_requested
@@ -2361,6 +2377,7 @@ class LiveLocalAsrHandler:
                 ctrl = json.loads(raw["text"])
                 action = ctrl.get("action")
                 if action == "stop":
+                    self._disconnect_reason = "user_stop"
                     stop_event.set()
                     break
                 if action == "config":
@@ -2524,10 +2541,12 @@ class LiveLocalAsrHandler:
             asr_session.error_msg = None
             self._db.commit()
             logger.info(
-                "本地实时 ASR 片段完成 meeting_id=%s session_id=%s recording_session_id=%s duration=%.3f",
+                "本地实时 ASR 片段完成 meeting_id=%s session_id=%s recording_session_id=%s "
+                "disconnect_reason=%s duration=%.3f",
                 self._meeting_id,
                 self._session_id,
                 self._recording_session_id,
+                self._disconnect_reason,
                 duration,
             )
 
@@ -2535,6 +2554,7 @@ class LiveLocalAsrHandler:
                 self._service.schedule_delayed_finalize(
                     meeting_id=self._meeting_id,
                     recording_session_id=self._recording_session_id,
+                    disconnect_reason=self._disconnect_reason,
                 )
 
             await self._safe_send_json(
@@ -2727,12 +2747,15 @@ class LiveLocalAsrHandler:
                         self._session_id,
                         settings.VOLC_CLIENT_WS_IDLE_TIMEOUT_SECONDS,
                     )
+                    self._disconnect_reason = "idle_timeout"
                     self._ws_alive = False
                     self._client_disconnected = True
                     break
 
                 msg_type = raw.get("type", "")
                 if msg_type in {"websocket.disconnect", "websocket.close"}:
+                    if not self._recover_finalize_requested:
+                        self._disconnect_reason = "ws_disconnect"
                     self._ws_alive = False
                     self._client_disconnected = (
                         not self._recover_finalize_requested
@@ -2742,6 +2765,7 @@ class LiveLocalAsrHandler:
                     ctrl = json.loads(raw["text"])
                     action = ctrl.get("action")
                     if action == "stop":
+                        self._disconnect_reason = "user_stop"
                         break
                     if action == "config":
                         self._sample_rate = int(ctrl.get("rate", self._sample_rate))
