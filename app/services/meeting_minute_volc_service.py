@@ -568,6 +568,7 @@ class VolcMeetingMinuteService:
         self,
         meeting_id: int,
         recording_session_id: str,
+        disconnect_reason: Optional[str] = None,
     ) -> None:
         """WS 异常断开后，创建等待用户重连的延迟收尾任务。"""
         if not recording_session_id:
@@ -583,6 +584,7 @@ class VolcMeetingMinuteService:
             self._delayed_finalize_recording(
                 meeting_id=meeting_id,
                 recording_session_id=recording_session_id,
+                disconnect_reason=disconnect_reason,
             )
         )
         self._pending_finalize_tasks[key] = task
@@ -599,6 +601,7 @@ class VolcMeetingMinuteService:
         self,
         meeting_id: int,
         recording_session_id: str,
+        disconnect_reason: Optional[str] = None,
     ) -> None:
         """等待重连超时后，检查是否仍需自动收尾。"""
         key = (meeting_id, recording_session_id)
@@ -644,9 +647,10 @@ class VolcMeetingMinuteService:
 
                 logger.info(
                     "录音延迟收尾完成 "
-                    "meeting_id=%s recording_session_id=%s result=%s",
+                    "meeting_id=%s recording_session_id=%s disconnect_reason=%s result=%s",
                     meeting_id,
                     recording_session_id,
+                    disconnect_reason,
                     result,
                 )
             finally:
@@ -3038,14 +3042,17 @@ class LiveVolcAsrHandler:
                     recording_session_id=(
                         self._recording_session_id
                     ),
+                    disconnect_reason=self._disconnect_reason,
                 )
 
         except Exception as exc:  # noqa: BLE001
+            self._disconnect_reason = "asr_failure"
             logger.exception(
                 "Volc live ASR run failed "
-                "meeting_id=%s session_id=%s",
+                "meeting_id=%s session_id=%s disconnect_reason=%s",
                 self._meeting_id,
                 self._session_id,
+                self._disconnect_reason,
             )
 
             partial_audio_saved = False
@@ -3424,10 +3431,12 @@ class LiveVolcAsrHandler:
             wav_path = wav_dir / f"meeting_{self._meeting_id}_session_{self._session_id}.wav"
 
         logger.info(
-            "开始落盘火山实时录音 meeting_id=%s session_id=%s recording_session_id=%s wav_path=%s",
+            "开始落盘火山实时录音 meeting_id=%s session_id=%s recording_session_id=%s "
+            "disconnect_reason=%s wav_path=%s",
             self._meeting_id,
             self._session_id,
             recording_session_id,
+            self._disconnect_reason,
             wav_path,
         )
 
@@ -3497,10 +3506,11 @@ class LiveVolcAsrHandler:
         # 新客户端：只保存片段，合并由前端后续调用 finalize-recording 统一处理
         logger.info(
             "火山实时 ASR 片段已保存 meeting_id=%s session_id=%s recording_session_id=%s "
-            "等待结束录音时合并",
+            "disconnect_reason=%s 等待结束录音时合并",
             self._meeting_id,
             self._session_id,
             recording_session_id,
+            self._disconnect_reason,
         )
         await self._safe_send_json(
             {
